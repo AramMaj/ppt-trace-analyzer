@@ -60,11 +60,33 @@ class LogicalOp:
 
     @property
     def end(self) -> float:
+        """end time of this operation (start + duration)."""
         return self.ts + self.dur
 
     @property
+    def self_time_us(self) -> float:
+        """time spent in this op excluding child ops (also called "exclusive time")."""
+        child_time = sum(c.dur for c in self.children)
+        return max(0.0, self.dur - child_time)
+
+    @property
     def gpu_time_us(self) -> float:
+        """time spent on GPU operations."""
         return sum(k.dur for k in self.gpu_kernels)
+
+    @property
+    def depth(self) -> int:
+        """Depth of this node in the operation tree (root==0)."""
+        d = 0
+        node = self
+        while node.parent:
+            d += 1
+            node = node.parent
+        return d
+
+    def subtree_memory(self) -> int:
+        """Total memory allocated in this op and all its children"""
+        return self.memory_bytes + sum(c.subtree_memory() for c in self.children)
 
 
 # ---------------------------------------------------------------------------
@@ -94,8 +116,7 @@ class TraceParser:
             ev = RawEvent.from_dict(d)
             if ev:
                 self.raw_events.append(ev)
-        
-        print(f"Loaded {len(self.raw_events)} events.")
+
         return self
 
     def parse(self) -> "TraceParser":
@@ -121,8 +142,6 @@ class TraceParser:
         # 5. Attach GPU kernels to the innermost (most specific) enclosing cpu_op
         self._attach_kernels(gpu_events)
 
-        # Debug-output: number of parsed logical operations
-        print(f"Parsed {len(self._all_ops)} logical operations.")
         return self
 
     def _build_tree(self, events: List[RawEvent]) -> List[LogicalOp]:
@@ -164,20 +183,57 @@ class TraceParser:
 
     def _attach_kernels(self, gpu_events: List[RawEvent]):
         """Attach GPU kernels to the innermost (most specific) enclosing cpu_op."""
-        # Sort operations by duration (most specific first)
-        ops_by_specificity = sorted(self._all_ops, key=lambda o: o.dur)
+        # Sort operation by depth (most specific first)
+        ops_by_depth = sorted(self._all_ops, key=lambda o: -o.depth)
 
         for kernel in gpu_events:
-            for op in ops_by_specificity:
+            for op in ops_by_depth:
                 if op.ts <= kernel.ts and kernel.end <= op.end:
                     op.gpu_kernels.append(kernel)
                     break 
+
+    def summary(self) -> Dict:
+        """Return a structured summary of all metrics."""
+        result = {"ops": [], "bottlenecks": []}
+
+        # Recursive helper to summarize an op and its subtree
+        for root in self.roots:
+            result["ops"].append(self._op_summary(root))
+
+        # Bottleneck-analysis: Find the 5 ops with the worst GPU utilization (lowest %)
+        # that could indicate CPU overhead or memory bottlenecks
+        all_summaries = [s for s in result["ops"]] # simplefied: only top-level ops
+        all_summaries.sort(key=lambda s: s["gpu_utilization_pct"])
+        
+        result["bottlenecks"] = [
+            {"name": s["name"], "gpu_utilization_pct": s["gpu_utilization_pct"],
+             "wall_time_us": s["wall_time_us"]}
+            for s in all_summaries[:5] 
+        ]
+
+        return result
+
+    def _op_summary(self, op: LogicalOp) -> Dict:
+        """Help-method for creating a metrics dictonary for each operation."""
+        gpu_util = (op.gpu_time_us / op.dur * 100) if op.dur > 0 else 0
+        return {
+            "name": op.name,
+            "wall_time_us": round(op.dur, 2),
+            "self_time_us": round(op.self_time_us, 2),
+            "gpu_time_us": round(op.gpu_time_us, 2),
+            "gpu_utilization_pct": round(gpu_util, 1),
+            "memory_bytes": op.memory_bytes,
+            "subtree_memory_bytes": op.subtree_memory(),
+            "num_gpu_kernels": len(op.gpu_kernels),
+            "children": [self._op_summary(c) for c in op.children],
+        }
 
 if __name__ == "__main__":
     # Test-code: Load and parse a trace file, then print some debug info about the first few operations
     import sys
     if len(sys.argv) > 1:
         tp = TraceParser(sys.argv[1]).load().parse()
-        # Print the first few operations with their GPU time
-        for op in tp.roots[:5]:
-            print(f"Op: {op.name}, Wall: {op.dur}us, GPU-Time: {op.gpu_time_us}us")
+        s = tp.summary()
+        # Debug-output: Show the top bottleneck and its GPU utilization
+        print(f"Bottleneck #1: {s['bottlenecks'][0]['name']} "
+              f"({s['bottlenecks'][0]['gpu_utilization_pct']}% GPU util)")
