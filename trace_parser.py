@@ -1,13 +1,23 @@
 """
 trace_parser.py
-A simple parser for PyTorch trace files.
+Parses a PyTorch profiler trace (Chrome trace format JSON) and:
+  1. Reconstructs logical operations from raw events (via ts/dur nesting)
+  2. Extracts runtime, memory, and composition per logical operation
+
+Usage:
+    python trace_parser.py sample_trace.json             
+    python trace_parser.py sample_trace.json --json     # also writes sample_trace.summary.json
+    python trace_parser.py sample_trace.json --depth x  # limit tree printout to depth x (default 3)
 """
 
 from __future__ import annotations
+
 import json
+import argparse
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 from collections import defaultdict
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -15,13 +25,13 @@ from collections import defaultdict
 
 @dataclass
 class RawEvent:
-    name: str
-    cat: str
+    name: str       # event name, e.g. "aten::matmul"
+    cat: str        # category, e.g. "cpu_op", "kernel", "gpu_memcpy"
     ts: float       # start timestamp (µs)
     dur: float      # duration (µs)
-    tid: int
-    pid: int
-    args: dict
+    tid: int        # thread ID
+    pid: int        # process ID
+    args: dict      # additional info, e.g. input shapes, memory allocated, etc. 
 
     @property
     def end(self) -> float:
@@ -42,16 +52,17 @@ class RawEvent:
             args=d.get("args", {}),
         )
 
+
 @dataclass
 class LogicalOp:
-    """A logical (high-level) operation, from nested raw events."""
+    """A high-level operation reconstructed from nested raw events."""
     name: str
     ts: float
     dur: float
     input_shapes: List[str]
     memory_bytes: int
 
-    # Hierarchy
+     # Hierarchy
     parent: Optional["LogicalOp"] = field(default=None, repr=False)
     children: List["LogicalOp"] = field(default_factory=list, repr=False)
 
@@ -60,18 +71,18 @@ class LogicalOp:
 
     @property
     def end(self) -> float:
-        """end time of this operation (start + duration)."""
+        """End time of this operation (start + duration)."""
         return self.ts + self.dur
 
     @property
     def self_time_us(self) -> float:
-        """time spent in this op excluding child ops (also called "exclusive time")."""
+        """Wall time not covered by any direct child."""
         child_time = sum(c.dur for c in self.children)
         return max(0.0, self.dur - child_time)
 
     @property
     def gpu_time_us(self) -> float:
-        """time spent on GPU operations."""
+        """Time spent on GPU operations."""
         return sum(k.dur for k in self.gpu_kernels)
 
     @property
@@ -84,8 +95,11 @@ class LogicalOp:
             node = node.parent
         return d
 
+    def is_root(self) -> bool:
+        return self.parent is None
+
     def subtree_memory(self) -> int:
-        """Total memory allocated in this op and all its children"""
+        """Total memory allocated in this op and all its children."""
         return self.memory_bytes + sum(c.subtree_memory() for c in self.children)
 
 
@@ -103,7 +117,7 @@ class TraceParser:
         self.path = path
         self.raw_events: List[RawEvent] = []
         self.roots: List[LogicalOp] = []
-        self._all_ops: List[LogicalOp] = []
+        self._all_ops: List[LogicalOp] = []       
 
     def load(self) -> "TraceParser":
         """Load the trace file and extract raw events."""
@@ -114,9 +128,10 @@ class TraceParser:
 
         for d in raw:
             ev = RawEvent.from_dict(d)
-            if ev:
+            if ev is not None:
                 self.raw_events.append(ev)
 
+        print(f"Loaded {len(self.raw_events)} raw events from '{self.path}'")
         return self
 
     def parse(self) -> "TraceParser":
@@ -131,10 +146,13 @@ class TraceParser:
             by_thread[ev.tid].append(ev)
 
         # 3. Build trees per thread
+        per_thread_roots: List[LogicalOp] = []
         for tid, events in by_thread.items():
-            self.roots.extend(self._build_tree(events))
+            roots = self._build_tree(events)
+            per_thread_roots.extend(roots)
 
         # 4. Collect all operations for kernel attachment
+        self.roots = per_thread_roots
         self._all_ops = []
         for root in self.roots:
             self._dfs_collect(root)
@@ -192,25 +210,27 @@ class TraceParser:
                     op.gpu_kernels.append(kernel)
                     break 
 
+    # ------------------------------------------------------------------
+    #  Pretty Printing & CLI FEATURES
+    # ------------------------------------------------------------------
+
     def summary(self) -> Dict:
         """Return a structured summary of all metrics."""
         result = {"ops": [], "bottlenecks": []}
 
-        # Recursive helper to summarize an op and its subtree
+        # Recursively summarize an op and its subtree
         for root in self.roots:
             result["ops"].append(self._op_summary(root))
 
         # Bottleneck-analysis: Find the 5 ops with the worst GPU utilization (lowest %)
         # that could indicate CPU overhead or memory bottlenecks
-        all_summaries = [s for s in result["ops"]] # simplefied: only top-level ops
+        all_summaries = [s for s in result["ops"]] # simplified: only top-level ops
         all_summaries.sort(key=lambda s: s["gpu_utilization_pct"])
-        
         result["bottlenecks"] = [
             {"name": s["name"], "gpu_utilization_pct": s["gpu_utilization_pct"],
              "wall_time_us": s["wall_time_us"]}
-            for s in all_summaries[:5] 
+            for s in all_summaries[:5]   
         ]
-
         return result
 
     def _op_summary(self, op: LogicalOp) -> Dict:
@@ -228,12 +248,62 @@ class TraceParser:
             "children": [self._op_summary(c) for c in op.children],
         }
 
+    def print_tree(self, max_depth: int = 3):
+        """Pretty-print the logical operation tree to the console."""
+        print("\n" + "=" * 70)
+        print("LOGICAL OPERATION TREE")
+        print("=" * 70)
+        for root in self.roots:
+            self._print_node(root, depth=0, max_depth=max_depth)
+
+    def _print_node(self, op: LogicalOp, depth: int, max_depth: int):
+        """Helper method to print a single node and its subtree."""
+        if depth > max_depth: return
+        indent = "  " * depth
+        marker = "▶" if not op.children else "◆"
+        gpu_info = (f" | GPU {op.gpu_time_us:.0f}µs ({op.gpu_time_us/op.dur*100:.0f}%)" if op.dur > 0 else "")
+        mem_info = (f" | mem {op.memory_bytes/1024:.1f}KB" if op.memory_bytes > 0 else "")
+        print(f"{indent}{marker} {op.name:<40} wall={op.dur:>8.1f}µs{gpu_info}{mem_info}")
+        for child in op.children:
+            self._print_node(child, depth + 1, max_depth)
+
+    def print_summary(self):
+        """Print a summary of all operations and bottlenecks."""
+        s = self.summary()
+        print("\n" + "=" * 70)
+        print("PER-OP SUMMARY  (top-level ops)")
+        print("=" * 70)
+        print(f"{'Op':<35} {'Wall(µs)':>10} {'GPU(µs)':>10} {'GPU%':>6} {'Mem(KB)':>10} {'Kernels':>8}")
+        print("-" * 70)
+        for op in s["ops"]:
+            print(f"{op['name']:<35} {op['wall_time_us']:>10.1f} {op['gpu_time_us']:>10.1f} "
+                  f"{op['gpu_utilization_pct']:>5.1f}% {op['subtree_memory_bytes']/1024:>10.1f} {op['num_gpu_kernels']:>8}")
+
+        print("\n" + "=" * 70)
+        print("BOTTLENECKS  (lowest GPU utilisation)")
+        print("=" * 70)
+        for b in s["bottlenecks"]:
+            print(f"  {b['name']:<40}  GPU util: {b['gpu_utilization_pct']:>5.1f}%  wall: {b['wall_time_us']:.1f}µs")
+
+
+def main():
+    """CLI entry point."""
+    parser = argparse.ArgumentParser(description="Parse a PyTorch profiler trace.")
+    parser.add_argument("trace", help="Path to the trace JSON file")
+    parser.add_argument("--depth", type=int, default=3, help="Max depth for tree printout")
+    parser.add_argument("--json", action="store_true", help="Dump summary to JSON")
+    args = parser.parse_args()
+
+    tp = TraceParser(args.trace).load().parse()
+    tp.print_tree(max_depth=args.depth)
+    tp.print_summary()
+
+    if args.json:
+        out_path = args.trace.replace(".json", ".summary.json")
+        with open(out_path, "w") as f:
+            json.dump(tp.summary(), f, indent=2)
+        print(f"\nSummary written to {out_path}")
+
 if __name__ == "__main__":
-    # Test-code: Load and parse a trace file, then print some debug info about the first few operations
-    import sys
-    if len(sys.argv) > 1:
-        tp = TraceParser(sys.argv[1]).load().parse()
-        s = tp.summary()
-        # Debug-output: Show the top bottleneck and its GPU utilization
-        print(f"Bottleneck #1: {s['bottlenecks'][0]['name']} "
-              f"({s['bottlenecks'][0]['gpu_utilization_pct']}% GPU util)")
+    # Test-code: Load and parse a trace file
+    main()
