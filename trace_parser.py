@@ -166,6 +166,7 @@ class TraceParser:
     def _build_tree(self, events: List[RawEvent]) -> List[LogicalOp]:
         """Build a tree of logical operations from a list of raw events."""
         # Sort: earlier start first; for ties, longer duration first
+        # Side effect: Through sorting here External ID and Kernel get attributed to lowest hierachy event 
         events = sorted(events, key=lambda e: (e.ts, -e.dur))
 
         stack: List[LogicalOp] = []
