@@ -117,7 +117,8 @@ class TraceParser:
         self.path = path
         self.raw_events: List[RawEvent] = []
         self.roots: List[LogicalOp] = []
-        self._all_ops: List[LogicalOp] = []       
+        self._all_ops: List[LogicalOp] = []  
+        self.id_to_op: Dict[int, LogicalOp] = {}     
 
     def load(self) -> "TraceParser":
         """Load the trace file and extract raw events."""
@@ -179,6 +180,11 @@ class TraceParser:
                 memory_bytes=ev.args.get("Memory bytes allocated", 0),
             )
 
+            # Add logical operation to lookup table
+            external_id = ev.args.get("External id", None)
+            if external_id != None:
+                self.id_to_op[external_id] = op
+
             # Pop stack entries that have ended before this event starts
             while stack and stack[-1].end <= ev.ts:
                 stack.pop()
@@ -201,14 +207,18 @@ class TraceParser:
 
     def _attach_kernels(self, gpu_events: List[RawEvent]):
         """Attach GPU kernels to the innermost (most specific) enclosing cpu_op."""
-        # Sort operation by depth (most specific first)
         ops_by_depth = sorted(self._all_ops, key=lambda o: -o.depth)
 
         for kernel in gpu_events:
-            for op in ops_by_depth:
-                if op.ts <= kernel.ts and kernel.end <= op.end:
-                    op.gpu_kernels.append(kernel)
-                    break 
+            external_id = kernel.args.get("External id", None)
+            if external_id != None and external_id in self.id_to_op:
+                self.id_to_op[external_id].gpu_kernels.append(kernel)
+            # Keep time-based approach as fallback
+            else:
+                for op in ops_by_depth:
+                    if op.ts <= kernel.ts and kernel.end <= op.end:
+                        op.gpu_kernels.append(kernel)
+                        break
 
     # ------------------------------------------------------------------
     #  Pretty Printing & CLI FEATURES
