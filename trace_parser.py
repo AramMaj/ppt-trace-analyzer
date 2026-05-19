@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
+"""
+Trace parser for PyTorch Profiler JSON traces. (Focus: FSDP)
 
+usage:
+    Single trace analysis:
+        python final_trace_analyzer.py <trace.json> [--output report.txt]
+    
+    Benchmark (CSV comparison):
+        python final_trace_analyzer.py --compare trace1.json trace2.json --output comparison.csv [--op OPERATION_NAME]
+"""
 
 import json
 import sys
 import heapq
+import csv
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Tuple, Iterator
+from typing import Dict, List, Optional, Tuple, Set, Iterator
+
 
 
 # Helper function: iterate through the tree of logical operations
@@ -313,6 +325,98 @@ class TraceParser:
 
         return dict(agg)
 
+
+# FSDP specific analysis
+def extract_fsdp_phases_aggregated(roots: List[LogicalOperation]) -> Dict[str, Dict[str, float]]:
+    """
+    Returns a nested dict: unit -> { phase: total_gpu_us }
+    Propagates unit (layer) from parent to children.
+    Phases: "All-Gather (AG)", "Reduce-Scatter (RS)","Forward Comp (FWD)", "Backward Comp (BWD)"
+    """
+    agg = defaultdict(lambda: defaultdict(float))
+
+    def collect(node, current_unit=None):
+        # Determine unit from this node (if any)
+        match = re.search(r"model\.layers\.(\d+)", node.name)
+        if match:
+            current_unit = f"Layer {match.group(1)}"
+
+        phase = None
+        name_lower = node.name.lower()
+
+        # All-Gather
+        if "all_gather" in name_lower:
+            phase = "All-Gather (AG)"
+        # Reduce-Scatter
+        elif "reduce_scatter" in name_lower:
+            phase = "Reduce-Scatter (RS)"
+        elif node.raw_event and node.raw_event.get('args', {}).get('Collective name') == "_reduce_scatter_base":
+            phase = "Reduce-Scatter (RS)"
+        # Backward
+        elif "fsdp::pre_backward" in name_lower or "fsdp::backward_prefetch" in name_lower:
+            phase = "Backward Comp (BWD)"
+        # Forward: detect FSDP::pre_forward and compute forward compute time
+        elif "fsdp::pre_forward" in name_lower and current_unit:
+            # Forward compute time: sum GPU durations of children that are not collectives
+            forward_gpu = 0.0
+            for child in node.children:
+                child_name = child.name.lower()
+                if "all_gather" not in child_name and "reduce_scatter" not in child_name:
+                    forward_gpu += child.gpu_duration
+            if forward_gpu > 0:
+                agg[current_unit]["Forward Comp (FWD)"] += forward_gpu
+            else:
+                agg[current_unit]["Forward Comp (FWD)"] += node.gpu_duration
+            phase = None  # already handled
+        # Note: ProfilerStep is NOT treated as forward phase because it spans the whole step and it would massively inflate times.
+
+        if phase and current_unit:
+            agg[current_unit][phase] += node.gpu_duration
+
+        for child in node.children:
+            collect(child, current_unit)
+
+    for root in roots:
+        collect(root)
+    return agg
+
+def get_fsdp_timeline_aggregated_string(agg: Dict[str, Dict[str, float]]) -> str:
+    if not agg:
+        return "No FSDP phases found."
+    lines = []
+    lines.append("\n" + "="*90)
+    lines.append("FSDP Phase Summary (aggregated GPU time per layer)")
+    lines.append("="*90)
+    lines.append(f"{'Layer':<12} {'All-Gather (ms)':>18} {'Reduce-Scatter (ms)':>20} "
+                 f"{'Forward (ms)':>15} {'Backward (ms)':>15}")
+    lines.append("-"*90)
+
+    def layer_key(unit):
+        try:
+            return int(unit.split()[1])
+        except:
+            return 0
+
+    for unit in sorted(agg.keys(), key=layer_key):
+        data = agg[unit]
+        lines.append(f"{unit:<12} {data.get('All-Gather (AG)', 0)/1e3:>18.2f} "
+                     f"{data.get('Reduce-Scatter (RS)', 0)/1e3:>20.2f} "
+                     f"{data.get('Forward Comp (FWD)', 0)/1e3:>15.2f} "
+                     f"{data.get('Backward Comp (BWD)', 0)/1e3:>15.2f}")
+
+    total_ag = sum(d.get('All-Gather (AG)', 0) for d in agg.values())
+    total_rs = sum(d.get('Reduce-Scatter (RS)', 0) for d in agg.values())
+    total_fwd = sum(d.get('Forward Comp (FWD)', 0) for d in agg.values())
+    total_bwd = sum(d.get('Backward Comp (BWD)', 0) for d in agg.values())
+    lines.append("-"*90)
+    lines.append(f"{'TOTAL (all layers)':<12} {total_ag/1e3:>18.2f} {total_rs/1e3:>20.2f} "
+                 f"{total_fwd/1e3:>15.2f} {total_bwd/1e3:>15.2f}")
+    return "\n".join(lines)
+
+
+# TODO: bottleneck-detector
+# TODO: reporting
+# TODO: benchmarking
 
 #  Main
 def main():
