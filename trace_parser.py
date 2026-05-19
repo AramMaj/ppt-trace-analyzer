@@ -3,9 +3,10 @@
 
 import json
 import sys
+import heapq
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Iterator
 
 
 # Helper function: iterate through the tree of logical operations
@@ -108,29 +109,244 @@ class AsyncDependencyResolver:
 class TraceParser:
     def __init__(self, trace_file: str):
         self.trace_file = trace_file
-        self.events_by_pid_tid = defaultdict(list)
+        self.data = None
+        self.events_by_pid_tid: Dict[Tuple[int, int], List[Dict]] = defaultdict(list)
+        self.cpu_events: List[Dict] = []
+        self.gpu_events: List[Dict] = []
+        self.all_events: List[Dict] = []
+        self.memory_events: List[Dict] = []
+        self.distributed_info: Dict = {}
+        self.async_resolver = AsyncDependencyResolver()
 
     def load(self):
         with open(self.trace_file, 'r') as f:
-            data = json.load(f)
-        for ev in data.get('traceEvents', []):
-            if ev.get('ph') == 'X':
-                pid, tid = ev.get('pid', 0), ev.get('tid', 0)
+            self.data = json.load(f)
+        self.distributed_info = self.data.get('distributedInfo', {})
+        for ev in self.data.get('traceEvents', []):
+            self.all_events.append(ev)
+            pid, tid = ev.get('pid', 0), ev.get('tid', 0)
+            cat = ev.get('cat', '')
+            ph = ev.get('ph', '')
+            name = ev.get('name', '')
+
+            if ph == 'X' and cat in ('cpu_op', 'user_annotation'):
+                self.cpu_events.append(ev)
                 self.events_by_pid_tid[(pid, tid)].append(ev)
-    
+            elif ph == 'X' and self._is_gpu_event(cat):
+                self.gpu_events.append(ev)
+            elif ph in ('i', 'C') and ('memory' in cat.lower() or name == "[memory]"):
+                self.memory_events.append(ev)
+
+        self.async_resolver.resolve_dependencies(self.all_events)
+
+    @staticmethod
+    def _is_gpu_event(cat: str) -> bool:
+        GPU_CATEGORIES = {
+            'kernel',
+            'gpu_memcpy',
+            'gpu_memset',
+            'cuda_runtime',
+            'cuda_driver',
+            'gpu_user_annotation',
+        }
+        return cat in GPU_CATEGORIES or 'gpu' in cat.lower() or 'cuda' in cat.lower()
+
     def build_tree(self) -> List[LogicalOperation]:
         all_roots = []
         for (pid, tid), events in self.events_by_pid_tid.items():
             events_sorted = sorted(events, key=lambda e: e['ts'])
             stack = []
             for ev in events_sorted:
-                node = LogicalOperation(ev['name'], ev['ts'], ev['ts']+ev.get('dur',0), ev.get('dur',0))
-                while stack and stack[-1].end_time <= ev['ts']:
+                start = ev['ts']
+                dur = ev.get('dur', 0)
+                node = LogicalOperation(
+                    name=ev['name'],
+                    start_time=start,
+                    end_time=start + dur,
+                    cpu_duration=dur,
+                    raw_event=ev
+                )
+                ext_id = ev.get('args', {}).get('External id')
+                if ext_id is not None:
+                    node.external_ids.add(ext_id)
+
+                # Pop events that ended before this one starts
+                while stack and stack[-1][0]['ts'] + stack[-1][0].get('dur', 0) <= start:
                     stack.pop()
                 if stack:
-                    stack[-1].children.append(node)
+                    stack[-1][1].children.append(node)
                 else:
                     all_roots.append(node)
-                stack.append(node)
+                stack.append((ev, node))
         return all_roots
-    
+
+    def attribute_gpu_time_with_dependencies(self, roots: List[LogicalOperation]):
+        # Step 1: direct External id mapping
+        ext_to_gpu = defaultdict(float)
+        for gpu_ev in self.gpu_events:
+            ext_id = gpu_ev.get('args', {}).get('External id')
+            if ext_id is not None:
+                ext_to_gpu[ext_id] += gpu_ev.get('dur', 0)
+
+        # Step 2: collect all logical nodes using iterative traversal
+        all_nodes = list(iter_nodes(roots))
+        event_to_node = {id(node.raw_event): node for node in all_nodes if node.raw_event is not None}
+
+        # Step 3: find parent CPU event for each GPU event
+        gpu_parent_pairs = []
+
+        # GPU events with External id are handled exclusively via ext_to_gpu (step 5)
+        remaining_gpu = []
+        for gpu_ev in self.gpu_events:
+            ext_id = gpu_ev.get('args', {}).get('External id')
+            if ext_id is not None:
+                continue  # skip, handled in step 5
+
+            parent = self.async_resolver.get_parent_from_async_only(gpu_ev)
+            if parent is not None:
+                gpu_parent_pairs.append((gpu_ev, parent))
+            else:
+                remaining_gpu.append(gpu_ev)
+
+        # 3b: sweep for the rest
+        if remaining_gpu:
+            all_cpu = []
+            for evlist in self.events_by_pid_tid.values():
+                all_cpu.extend(evlist)
+            all_cpu.sort(key=lambda e: e['ts'])
+            remaining_gpu.sort(key=lambda e: e['ts'])
+
+            heap = []
+            cpu_idx = 0
+            n_cpu = len(all_cpu)
+
+            for gpu_ev in remaining_gpu:
+                ts = gpu_ev['ts']
+                while cpu_idx < n_cpu and all_cpu[cpu_idx]['ts'] <= ts:
+                    ce = all_cpu[cpu_idx]
+                    dur = ce.get('dur', 0)
+                    end = ce['ts'] + dur
+                    # Use negative start time to get the innermost (most recently started) active interval
+                    heapq.heappush(heap, (-ce['ts'], end, ce))
+                    cpu_idx += 1
+                while heap and heap[0][1] < ts:
+                    heapq.heappop(heap)
+                if heap:
+                    gpu_parent_pairs.append((gpu_ev, heap[0][2]))
+
+        # Step 4: attribute GPU time to nodes
+        for gpu_ev, parent_cpu in gpu_parent_pairs:
+            node = event_to_node.get(id(parent_cpu))
+            if node is not None:
+                node.direct_gpu_duration += gpu_ev.get('dur', 0)
+
+        # Step 5: add External id contributions (no double counting)
+        for node in all_nodes:
+            for ext_id in node.external_ids:
+                node.direct_gpu_duration += ext_to_gpu.get(ext_id, 0)
+
+        # Step 6: propagate GPU time upwards
+        def compute(node):
+            child_gpu = sum(compute(ch) for ch in node.children)
+            node.gpu_duration = node.direct_gpu_duration + child_gpu
+            return node.gpu_duration
+        for root in roots:
+            compute(root)
+
+    def attribute_memory(self, roots: List[LogicalOperation]):
+        if not self.memory_events:
+            print("Warning: No memory events found. Memory profiling may be disabled in the trace.")
+            return
+
+        all_nodes = list(iter_nodes(roots))
+        all_nodes.sort(key=lambda n: n.start_time)
+
+        mem_events_sorted = sorted(self.memory_events, key=lambda e: e['ts'])
+        heap = []
+        node_idx = 0
+        n_nodes = len(all_nodes)
+
+        for mem_ev in mem_events_sorted:
+            ts = mem_ev['ts']
+            while node_idx < n_nodes and all_nodes[node_idx].start_time <= ts:
+                node = all_nodes[node_idx]
+                # Use negative start time to get the innermost active node
+                heapq.heappush(heap, (-node.start_time, node.end_time, node))
+                node_idx += 1
+            while heap and heap[0][1] < ts:
+                heapq.heappop(heap)
+            if heap:
+                deepest = heap[0][2]
+                args = mem_ev.get('args', {})
+                size = args.get('Bytes', args.get('size', args.get('bytes', 0)))
+                device_type = args.get('Device Type', -1)
+                if device_type == 1:   # GPU memory only
+                    deepest.memory_delta += size
+
+        # Propagate memory deltas upward
+        def propagate(node):
+            total = node.memory_delta
+            for ch in node.children:
+                total += propagate(ch)
+            node.memory_delta = total
+            return total
+        for root in roots:
+            propagate(root)
+
+    def get_aggregated_metrics(self, roots: List[LogicalOperation], op_filter: Optional[str] = None) -> Dict[str, Dict]:
+        all_nodes = list(iter_nodes(roots))
+        agg = defaultdict(lambda: {'count': 0, 'total_cpu_us': 0.0, 'total_gpu_us': 0.0, 'total_mem_bytes': 0})
+
+        for node in all_nodes:
+            if op_filter and op_filter not in node.name:
+                continue
+            agg[node.name]['count'] += 1
+            agg[node.name]['total_cpu_us'] += node.cpu_duration
+            agg[node.name]['total_gpu_us'] += node.gpu_duration
+            agg[node.name]['total_mem_bytes'] += node.memory_delta
+
+        for name, data in agg.items():
+            c = data['count']
+            data['avg_cpu_us'] = data['total_cpu_us'] / c if c else 0
+            data['avg_gpu_us'] = data['total_gpu_us'] / c if c else 0
+            data['avg_mem_bytes'] = data['total_mem_bytes'] / c if c else 0
+
+        return dict(agg)
+
+
+#  Main
+def main():
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  Single trace analysis: python final_trace_analyzer.py <trace.json> [--output report.txt]")
+        print("  Benchmark (CSV comparison): python final_trace_analyzer.py --compare trace1.json trace2.json --output comparison.csv [--op OPERATION_NAME]")
+        sys.exit(1)
+
+# TODO: implement --compare
+
+    trace_file = sys.argv[1]
+    output_file = None
+    if len(sys.argv) >= 3 and sys.argv[2] == "--output":
+        output_file = sys.argv[3] if len(sys.argv) > 3 else None
+
+    print(f"Loading trace from {trace_file}...")
+    parser = TraceParser(trace_file)
+    parser.load()
+    print(f"Loaded {len(parser.cpu_events)} CPU events, {len(parser.gpu_events)} GPU events, {len(parser.memory_events)} memory events.")
+
+    print("Building logical operation tree...")
+    roots = parser.build_tree()
+
+    print("Performing full CUDA stream dependency walk...")
+    parser.attribute_gpu_time_with_dependencies(roots)
+
+    print("Attributing memory deltas...")
+    parser.attribute_memory(roots)
+
+    print("Generating report...")
+    # TODO: implement output report
+
+    print("Done.")
+
+if __name__ == "__main__":
+    main()
