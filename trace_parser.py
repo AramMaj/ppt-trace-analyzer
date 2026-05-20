@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Set, Iterator
 
 
-
+# ----------------------------------------------------------------------
 # Helper function: iterate through the tree of logical operations
 def iter_nodes(roots: List['LogicalOperation']) -> Iterator['LogicalOperation']:
     """Iterate over all nodes in the tree (depth-first, iterative)."""
@@ -31,6 +31,7 @@ def iter_nodes(roots: List['LogicalOperation']) -> Iterator['LogicalOperation']:
         stack.extend(node.children)
 
 
+# -----------------------------------------------------------------------
 # Data structure for a logical operation / node in the call tree
 @dataclass
 class LogicalOperation:
@@ -54,6 +55,7 @@ class LogicalOperation:
         return self.gpu_duration - sum(c.gpu_duration for c in self.children)
 
 
+# ------------------------------------------------------------------------
 # Async dependency resolver (CUDA events, stream wait, async intervals)
 class AsyncDependencyResolver:
     def __init__(self):
@@ -117,6 +119,7 @@ class AsyncDependencyResolver:
         return None
 
 
+# ------------------------------------------------------------------------
 # Trace parser class
 class TraceParser:
     def __init__(self, trace_file: str):
@@ -326,6 +329,7 @@ class TraceParser:
         return dict(agg)
 
 
+# ------------------------------------------------------------------------
 # FSDP specific analysis
 def extract_fsdp_phases_aggregated(roots: List[LogicalOperation]) -> Dict[str, Dict[str, float]]:
     """
@@ -414,10 +418,159 @@ def get_fsdp_timeline_aggregated_string(agg: Dict[str, Dict[str, float]]) -> str
     return "\n".join(lines)
 
 
-# TODO: bottleneck-detector
-# TODO: reporting
-# TODO: benchmarking
+# ------------------------------------------------------------------------
+# bottleneck detection and reporting
+class BottleneckDetector:
+    @staticmethod
+    def detect(node: LogicalOperation) -> List[str]:
+        bottlenecks = []
+        total = node.total_time
+        if total > 0:
+            if node.cpu_duration > 1.5 * node.gpu_duration and node.exclusive_cpu > 0.1 * total:
+                bottlenecks.append("CPU-bound (high CPU overhead)")
+            if node.gpu_duration < 0.5 * node.cpu_duration and node.gpu_duration > 0:
+                bottlenecks.append("GPU underutilization (GPU idle waiting)")
+            if abs(node.memory_delta) > 1024 * 1024 * 1024:
+                bottlenecks.append("High memory footprint")
+        for ch in node.children:
+            if "all_gather" in ch.name.lower() or "allgather" in ch.name.lower():
+                if ch.gpu_duration > 0.3 * node.gpu_duration:
+                    bottlenecks.append("Communication bottleneck (all-gather dominates)")
+        return bottlenecks
 
+def format_time(us: float) -> str:
+    if us < 1e3:
+        return f"{us:.2f} µs"
+    elif us < 1e6:
+        return f"{us/1e3:.2f} ms"
+    else:
+        return f"{us/1e6:.2f} s"
+
+def format_memory(bytes_: int) -> str:
+    ab = abs(bytes_)
+    if ab < 1024:
+        return f"{bytes_} B"
+    elif ab < 1024**2:
+        return f"{bytes_/1024:.2f} KB"
+    elif ab < 1024**3:
+        return f"{bytes_/1024**2:.2f} MB"
+    else:
+        return f"{bytes_/1024**3:.2f} GB"
+
+def get_top_k_string(roots: List[LogicalOperation], k: int = 10) -> str:
+    all_nodes = list(iter_nodes(roots))
+    all_nodes.sort(key=lambda n: n.total_time, reverse=True)
+    lines = []
+    lines.append(f"\n{'='*80}")
+    lines.append(f"TOP {k} MOST EXPENSIVE OPERATIONS (async dependencies resolved)")
+    lines.append(f"{'='*80}")
+    lines.append(f"{'Name':<50} {'CPU':>12} {'GPU':>12} {'Memory Δ':>12} {'Bottleneck'}")
+    lines.append(f"{'-'*80}")
+    for node in all_nodes[:k]:
+        bottle = BottleneckDetector.detect(node)
+        bottle_str = bottle[0] if bottle else "-"
+        lines.append(f"{node.name[:50]:<50} {format_time(node.cpu_duration):>12} "
+                     f"{format_time(node.gpu_duration):>12} {format_memory(node.memory_delta):>12} {bottle_str}")
+    return "\n".join(lines)
+
+def get_flame_like_string(roots: List[LogicalOperation], max_depth: int = 3, indent: int = 0) -> str:
+    lines = []
+    if indent == 0:
+        lines.append(f"\n{'='*80}")
+        lines.append("FLAME-GRAPH STYLE BREAKDOWN (async dependencies accounted)")
+        lines.append(f"{'='*80}")
+    for node in roots:
+        prefix = "  " * indent
+        bottle = BottleneckDetector.detect(node)
+        hint = f"  <-- {bottle[0]}" if bottle else ""
+        lines.append(f"{prefix}{node.name} : CPU {format_time(node.cpu_duration)}, "
+                     f"GPU {format_time(node.gpu_duration)}, "
+                     f"Mem {format_memory(node.memory_delta)}{hint}")
+        if indent < max_depth:
+            lines.append(get_flame_like_string(node.children, max_depth, indent+1))
+    return "\n".join(lines)
+
+def generate_report(roots: List[LogicalOperation], output_file: Optional[str] = None):
+    report_parts = []
+    report_parts.append("PyTorch Trace Analysis Report (Full Stream Dependency Walk)")
+    report_parts.append("==========================================================")
+    report_parts.append(get_top_k_string(roots))
+    report_parts.append(get_flame_like_string(roots))
+
+    agg_phases = extract_fsdp_phases_aggregated(roots)
+    report_parts.append(get_fsdp_timeline_aggregated_string(agg_phases))
+
+    full_report = "\n".join(report_parts)
+    print(full_report)
+    if output_file:
+        with open(output_file, 'w') as f:
+            f.write(full_report)
+
+
+# Benchmarking and comparing
+def compare_traces_to_csv(trace1_file, trace2_file, output_csv, op_filter=None):
+    print(f"Processing trace 1: {trace1_file}")
+    p1 = TraceParser(trace1_file)
+    p1.load()
+    roots1 = p1.build_tree()
+    p1.attribute_gpu_time_with_dependencies(roots1)
+    p1.attribute_memory(roots1)
+    metrics1 = p1.get_aggregated_metrics(roots1, op_filter)
+
+    print(f"Processing trace 2: {trace2_file}")
+    p2 = TraceParser(trace2_file)
+    p2.load()
+    roots2 = p2.build_tree()
+    p2.attribute_gpu_time_with_dependencies(roots2)
+    p2.attribute_memory(roots2)
+    metrics2 = p2.get_aggregated_metrics(roots2, op_filter)
+
+    all_ops = set(metrics1.keys()) | set(metrics2.keys())
+    rows = []
+    for op in sorted(all_ops):
+        m1 = metrics1.get(op, {})
+        m2 = metrics2.get(op, {})
+        row = {
+            'operation_name': op,
+            'count_trace1': m1.get('count', 0),
+            'count_trace2': m2.get('count', 0),
+            'total_cpu_us_trace1': m1.get('total_cpu_us', 0.0),
+            'total_cpu_us_trace2': m2.get('total_cpu_us', 0.0),
+            'avg_cpu_us_trace1': m1.get('avg_cpu_us', 0.0),
+            'avg_cpu_us_trace2': m2.get('avg_cpu_us', 0.0),
+            'total_gpu_us_trace1': m1.get('total_gpu_us', 0.0),
+            'total_gpu_us_trace2': m2.get('total_gpu_us', 0.0),
+            'avg_gpu_us_trace1': m1.get('avg_gpu_us', 0.0),
+            'avg_gpu_us_trace2': m2.get('avg_gpu_us', 0.0),
+            'total_mem_bytes_trace1': m1.get('total_mem_bytes', 0),
+            'total_mem_bytes_trace2': m2.get('total_mem_bytes', 0),
+            'avg_mem_bytes_trace1': m1.get('avg_mem_bytes', 0.0),
+            'avg_mem_bytes_trace2': m2.get('avg_mem_bytes', 0.0),
+        }
+        gpu1 = row['total_gpu_us_trace1']
+        gpu2 = row['total_gpu_us_trace2']
+        row['gpu_speedup_trace2_vs_trace1'] = gpu2 / gpu1 if gpu1 > 0 else float('inf')
+        rows.append(row)
+
+    fieldnames = [
+        'operation_name', 'count_trace1', 'count_trace2',
+        'total_cpu_us_trace1', 'total_cpu_us_trace2',
+        'avg_cpu_us_trace1', 'avg_cpu_us_trace2',
+        'total_gpu_us_trace1', 'total_gpu_us_trace2',
+        'avg_gpu_us_trace1', 'avg_gpu_us_trace2',
+        'total_mem_bytes_trace1', 'total_mem_bytes_trace2',
+        'avg_mem_bytes_trace1', 'avg_mem_bytes_trace2',
+        'gpu_speedup_trace2_vs_trace1'
+    ]
+    with open(output_csv, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Comparison CSV saved to {output_csv}")
+
+
+# ------------------------------------------------------------------------
 #  Main
 def main():
     if len(sys.argv) < 2:
@@ -426,7 +579,24 @@ def main():
         print("  Benchmark (CSV comparison): python final_trace_analyzer.py --compare trace1.json trace2.json --output comparison.csv [--op OPERATION_NAME]")
         sys.exit(1)
 
-# TODO: implement --compare
+    if sys.argv[1] == "--compare":
+        if len(sys.argv) < 4:
+            print("Error: --compare requires two trace files.")
+            sys.exit(1)
+        trace1 = sys.argv[2]
+        trace2 = sys.argv[3]
+        output_csv = None
+        op_filter = None
+        for i, arg in enumerate(sys.argv):
+            if arg == "--output" and i+1 < len(sys.argv):
+                output_csv = sys.argv[i+1]
+            if arg == "--op" and i+1 < len(sys.argv):
+                op_filter = sys.argv[i+1]
+        if not output_csv:
+            print("Error: Please specify --output comparison.csv")
+            sys.exit(1)
+        compare_traces_to_csv(trace1, trace2, output_csv, op_filter)
+        sys.exit(0)
 
     trace_file = sys.argv[1]
     output_file = None
@@ -448,8 +618,7 @@ def main():
     parser.attribute_memory(roots)
 
     print("Generating report...")
-    # TODO: implement output report
-
+    generate_report(roots, output_file)
     print("Done.")
 
 if __name__ == "__main__":
