@@ -1,0 +1,6 @@
+
+# Ignore all .txt files
+*.txt
+
+# Ignore all trace files
+*.trace.json

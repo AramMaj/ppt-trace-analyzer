@@ -421,6 +421,63 @@ def get_fsdp_timeline_aggregated_string(agg: Dict[str, Dict[str, float]]) -> str
                  f"{total_fwd/1e3:>15.2f} {total_bwd/1e3:>15.2f}")
     return "\n".join(lines)
 
+def get_fsdp_chronological_timeline(roots: List[LogicalOperation]) -> str:
+    timeline = []
+
+    def collect_timeline(node, current_unit=None, unit_idx=None):
+        # Layer-Nummer extrahieren (z.B. "0" aus "Layer 0")
+        match = re.search(r"model\.layers\.(\d+)", node.name)
+        if match:
+            unit_idx = match.group(1)
+            current_unit = f"Layer {unit_idx}"
+
+        name_lower = node.name.lower()
+        phase_label = None
+        
+        # Phasen-Erkennung mit Nummerierung
+        if unit_idx is not None:
+            if "all_gather" in name_lower:
+                phase_label = f"AG (Layer {unit_idx})"
+            elif "reduce_scatter" in name_lower or (node.raw_event and node.raw_event.get('args', {}).get('Collective name') == "_reduce_scatter_base"):
+                phase_label = f"RS (Layer {unit_idx})"
+            elif "fsdp::pre_backward" in name_lower or "fsdp::backward_prefetch" in name_lower:
+                phase_label = f"Backward {unit_idx}"
+            elif "fsdp::pre_forward" in name_lower:
+                phase_label = f"Forward {unit_idx}"
+
+        if phase_label:
+            timeline.append({
+                "ts": node.start_time,
+                "phase": phase_label,
+                "dur": node.gpu_duration
+            })
+
+        for child in node.children:
+            collect_timeline(child, current_unit, unit_idx)
+
+    for root in roots:
+        collect_timeline(root)
+
+    # Nach Zeit sortieren
+    timeline.sort(key=lambda x: x["ts"])
+
+    if not timeline:
+        return "No FSDP events found."
+
+    lines = []
+    lines.append("\n" + "="*95)
+    lines.append("CHRONOLOGICAL FSDP TIMELINE (With Layer Matching)")
+    lines.append("="*95)
+    lines.append(f"{'Relative Start (ms)':>20} | {'Phase / Operation':<40} | {'GPU Dur (ms)':>15}")
+    lines.append("-" * 95)
+
+    first_ts = timeline[0]["ts"]
+    for event in timeline:
+        rel_ts = (event["ts"] - first_ts) / 1000
+        lines.append(f"{rel_ts:>20.2f} | {event['phase']:<40} | {event['dur']/1000:>15.2f}")
+    
+    return "\n".join(lines)
+
 
 # ------------------------------------------------------------------------
 # bottleneck detection and reporting
@@ -503,6 +560,8 @@ def generate_report(roots: List[LogicalOperation], output_file: Optional[str] = 
 
     agg_phases = extract_fsdp_phases_aggregated(roots)
     report_parts.append(get_fsdp_timeline_aggregated_string(agg_phases))
+
+    report_parts.append(get_fsdp_chronological_timeline(roots))
 
     full_report = "\n".join(report_parts)
     print(full_report)
