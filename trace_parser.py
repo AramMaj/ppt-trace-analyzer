@@ -40,7 +40,11 @@ class LogicalOperation:
     end_time: float
     cpu_duration: float
     gpu_duration: float = 0.0
+    memory_delta: int = 0
     children: List['LogicalOperation'] = field(default_factory=list)
+    external_ids: Set[int] = field(default_factory=set)
+    direct_gpu_duration: float = 0.0
+    raw_event: Optional[Dict] = None
 
     @property
     def total_time(self) -> float:
