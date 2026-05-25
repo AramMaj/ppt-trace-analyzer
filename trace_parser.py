@@ -4,10 +4,10 @@ Trace parser for PyTorch Profiler JSON traces. (Focus: FSDP)
 
 usage:
     Single trace analysis:
-        python final_trace_analyzer.py <trace.json> [--output report.txt]
+        python trace_parser.py <trace.json> [--output report.txt]
     
     Benchmark (CSV comparison):
-        python final_trace_analyzer.py --compare trace1.json trace2.json --output comparison.csv [--op OPERATION_NAME]
+        python trace_parser.py --compare trace1.json trace2.json --output comparison.csv [--op OPERATION_NAME]
 """
 
 import json
@@ -158,9 +158,7 @@ class TraceParser:
 
         self.async_resolver.resolve_dependencies(self.all_events)
 
-    @staticmethod
-    def _is_gpu_event(cat: str) -> bool:
-        GPU_CATEGORIES = {
+    GPU_CATEGORIES = {
             'kernel',
             'gpu_memcpy',
             'gpu_memset',
@@ -168,7 +166,10 @@ class TraceParser:
             'cuda_driver',
             'gpu_user_annotation',
         }
-        return cat in GPU_CATEGORIES or 'gpu' in cat.lower() or 'cuda' in cat.lower()
+
+    @staticmethod
+    def _is_gpu_event(cat: str) -> bool:
+        return cat in TraceParser.GPU_CATEGORIES or 'gpu' in cat.lower() or 'cuda' in cat.lower()
 
     def build_tree(self) -> List[LogicalOperation]:
         all_roots = []
