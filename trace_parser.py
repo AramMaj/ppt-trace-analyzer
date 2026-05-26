@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple, Set, Iterator
 
 # ----------------------------------------------------------------------
 # Helper function: iterate through the tree of logical operations
-def iter_nodes(roots: List['LogicalOperation']) -> Iterator['LogicalOperation']:
+def iter_nodes(roots: List['OperationWrapper']) -> Iterator['OperationWrapper']:
     """Iterate over all nodes in the tree (depth-first, iterative)."""
     stack = list(roots)
     while stack:
@@ -34,14 +34,14 @@ def iter_nodes(roots: List['LogicalOperation']) -> Iterator['LogicalOperation']:
 # -----------------------------------------------------------------------
 # Data structure for a logical operation / node in the call tree
 @dataclass
-class LogicalOperation:
+class OperationWrapper:
     name: str
     start_time: float
     end_time: float
     cpu_duration: float
     gpu_duration: float = 0.0
     memory_delta: int = 0
-    children: List['LogicalOperation'] = field(default_factory=list)
+    children: List['OperationWrapper'] = field(default_factory=list)
     external_ids: Set[int] = field(default_factory=set)
     direct_gpu_duration: float = 0.0
     raw_event: Optional[Dict] = None
@@ -170,7 +170,7 @@ class TraceParser:
         }
         return cat in GPU_CATEGORIES or 'gpu' in cat.lower() or 'cuda' in cat.lower()
 
-    def build_tree(self) -> List[LogicalOperation]:
+    def build_tree(self) -> List[OperationWrapper]:
         all_roots = []
         for (pid, tid), events in self.events_by_pid_tid.items():
             events_sorted = sorted(events, key=lambda e: e['ts'])
@@ -178,7 +178,7 @@ class TraceParser:
             for ev in events_sorted:
                 start = ev['ts']
                 dur = ev.get('dur', 0)
-                node = LogicalOperation(
+                node = OperationWrapper(
                     name=ev['name'],
                     start_time=start,
                     end_time=start + dur,
@@ -199,7 +199,7 @@ class TraceParser:
                 stack.append((ev, node))
         return all_roots
 
-    def attribute_gpu_time_with_dependencies(self, roots: List[LogicalOperation]):
+    def attribute_gpu_time_with_dependencies(self, roots: List[OperationWrapper]):
         # Step 1: direct External id mapping
         ext_to_gpu = defaultdict(float)
         for gpu_ev in self.gpu_events:
@@ -229,6 +229,8 @@ class TraceParser:
 
         # 3b: sweep for the rest
         if remaining_gpu:
+            global count
+            count += 1 
             all_cpu = []
             for evlist in self.events_by_pid_tid.values():
                 all_cpu.extend(evlist)
@@ -272,7 +274,7 @@ class TraceParser:
         for root in roots:
             compute(root)
 
-    def attribute_memory(self, roots: List[LogicalOperation]):
+    def attribute_memory(self, roots: List[OperationWrapper]):
         if not self.memory_events:
             print("Warning: No memory events found. Memory profiling may be disabled in the trace.")
             return
@@ -312,7 +314,7 @@ class TraceParser:
         for root in roots:
             propagate(root)
 
-    def get_aggregated_metrics(self, roots: List[LogicalOperation], op_filter: Optional[str] = None) -> Dict[str, Dict]:
+    def get_aggregated_metrics(self, roots: List[OperationWrapper], op_filter: Optional[str] = None) -> Dict[str, Dict]:
         all_nodes = list(iter_nodes(roots))
         agg = defaultdict(lambda: {'count': 0, 'total_cpu_us': 0.0, 'total_gpu_us': 0.0, 'total_mem_bytes': 0})
 
@@ -332,10 +334,9 @@ class TraceParser:
 
         return dict(agg)
 
-
 # ------------------------------------------------------------------------
 # FSDP specific analysis
-def extract_fsdp_phases_aggregated(roots: List[LogicalOperation]) -> Dict[str, Dict[str, float]]:
+def extract_fsdp_phases_aggregated(roots: List[OperationWrapper]) -> Dict[str, Dict[str, float]]:
     """
     Returns a nested dict: unit -> { phase: total_gpu_us }
     Propagates unit (layer) from parent to children.
@@ -421,7 +422,7 @@ def get_fsdp_timeline_aggregated_string(agg: Dict[str, Dict[str, float]]) -> str
                  f"{total_fwd/1e3:>15.2f} {total_bwd/1e3:>15.2f}")
     return "\n".join(lines)
 
-def get_fsdp_chronological_timeline(roots: List[LogicalOperation]) -> str:
+def get_fsdp_chronological_timeline(roots: List[OperationWrapper]) -> str:
     timeline = []
 
     def collect_timeline(node, current_unit=None, unit_idx=None):
@@ -483,7 +484,7 @@ def get_fsdp_chronological_timeline(roots: List[LogicalOperation]) -> str:
 # bottleneck detection and reporting
 class BottleneckDetector:
     @staticmethod
-    def detect(node: LogicalOperation) -> List[str]:
+    def detect(node: OperationWrapper) -> List[str]:
         bottlenecks = []
         total = node.total_time
         if total > 0:
@@ -518,7 +519,7 @@ def format_memory(bytes_: int) -> str:
     else:
         return f"{bytes_/1024**3:.2f} GB"
 
-def get_top_k_string(roots: List[LogicalOperation], k: int = 10) -> str:
+def get_top_k_string(roots: List[OperationWrapper], k: int = 10) -> str:
     all_nodes = list(iter_nodes(roots))
     all_nodes.sort(key=lambda n: n.total_time, reverse=True)
     lines = []
@@ -534,7 +535,7 @@ def get_top_k_string(roots: List[LogicalOperation], k: int = 10) -> str:
                      f"{format_time(node.gpu_duration):>12} {format_memory(node.memory_delta):>12} {bottle_str}")
     return "\n".join(lines)
 
-def get_flame_like_string(roots: List[LogicalOperation], max_depth: int = 3, indent: int = 0) -> str:
+def get_flame_like_string(roots: List[OperationWrapper], max_depth: int = 3, indent: int = 0) -> str:
     lines = []
     if indent == 0:
         lines.append(f"\n{'='*80}")
@@ -551,7 +552,7 @@ def get_flame_like_string(roots: List[LogicalOperation], max_depth: int = 3, ind
             lines.append(get_flame_like_string(node.children, max_depth, indent+1))
     return "\n".join(lines)
 
-def generate_report(roots: List[LogicalOperation], output_file: Optional[str] = None):
+def generate_report(roots: List[OperationWrapper], output_file: Optional[str] = None):
     report_parts = []
     report_parts.append("PyTorch Trace Analysis Report (Full Stream Dependency Walk)")
     report_parts.append("==========================================================")
@@ -635,6 +636,7 @@ def compare_traces_to_csv(trace1_file, trace2_file, output_csv, op_filter=None):
 
 # ------------------------------------------------------------------------
 #  Main
+count = 0 
 def main():
     if len(sys.argv) < 2:
         print("Usage:")
@@ -683,6 +685,8 @@ def main():
     print("Generating report...")
     generate_report(roots, output_file)
     print("Done.")
+    global count
+    print(count)
 
 if __name__ == "__main__":
     main()
