@@ -45,6 +45,8 @@ class OperationWrapper:
     external_ids: Set[int] = field(default_factory=set)
     direct_gpu_duration: float = 0.0
     raw_event: Optional[Dict] = None
+    logicalOperation: str = "" 
+    gpu_children: List[Optional[Dict]] = field(default_factory=list)
 
     @property
     def total_time(self) -> float:
@@ -199,13 +201,17 @@ class TraceParser:
                 stack.append((ev, node))
         return all_roots
 
-    def attribute_gpu_time_with_dependencies(self, roots: List[OperationWrapper]):
+    def attribute_gpu_time_with_dependencies(self, roots: List[OperationWrapper], test_mode):
         # Step 1: direct External id mapping
         ext_to_gpu = defaultdict(float)
+        ext_to_gpu_node = defaultdict(list)
         for gpu_ev in self.gpu_events:
             ext_id = gpu_ev.get('args', {}).get('External id')
             if ext_id is not None:
                 ext_to_gpu[ext_id] += gpu_ev.get('dur', 0)
+                if test_mode: 
+                    ext_to_gpu_node[ext_id].append(gpu_ev)
+
 
         # Step 2: collect all logical nodes using iterative traversal
         all_nodes = list(iter_nodes(roots))
@@ -224,6 +230,7 @@ class TraceParser:
             parent = self.async_resolver.get_parent_from_async_only(gpu_ev)
             if parent is not None:
                 gpu_parent_pairs.append((gpu_ev, parent))
+
             else:
                 remaining_gpu.append(gpu_ev)
 
@@ -260,11 +267,15 @@ class TraceParser:
             node = event_to_node.get(id(parent_cpu))
             if node is not None:
                 node.direct_gpu_duration += gpu_ev.get('dur', 0)
+                if test_mode: 
+                    node.gpu_children.append(gpu_ev)
 
         # Step 5: add External id contributions (no double counting)
         for node in all_nodes:
             for ext_id in node.external_ids:
                 node.direct_gpu_duration += ext_to_gpu.get(ext_id, 0)
+                if test_mode and ext_to_gpu_node.get(ext_id, None) != None: 
+                    node.gpu_children.extend(ext_to_gpu_node.get(ext_id))
 
         # Step 6: propagate GPU time upwards
         def compute(node):
@@ -336,7 +347,7 @@ class TraceParser:
 
 # ------------------------------------------------------------------------
 # FSDP specific analysis
-def extract_fsdp_phases_aggregated(roots: List[OperationWrapper]) -> Dict[str, Dict[str, float]]:
+def extract_fsdp_phases_aggregated(roots: List[OperationWrapper], test_mode = False) -> Dict[str, Dict[str, float]]:
     """
     Returns a nested dict: unit -> { phase: total_gpu_us }
     Propagates unit (layer) from parent to children.
@@ -382,6 +393,9 @@ def extract_fsdp_phases_aggregated(roots: List[OperationWrapper]) -> Dict[str, D
         if phase and current_unit:
             agg[current_unit][phase] += node.gpu_duration
 
+        if test_mode: 
+            node.logicalOperation = f"Detected unit: {current_unit} & Detected Phase: {phase}"
+
         for child in node.children:
             collect(child, current_unit)
 
@@ -422,7 +436,7 @@ def get_fsdp_timeline_aggregated_string(agg: Dict[str, Dict[str, float]]) -> str
                  f"{total_fwd/1e3:>15.2f} {total_bwd/1e3:>15.2f}")
     return "\n".join(lines)
 
-def get_fsdp_chronological_timeline(roots: List[OperationWrapper]) -> str:
+def get_fsdp_chronological_timeline(roots: List[OperationWrapper], test_mode = False) -> str:
     timeline = []
 
     def collect_timeline(node, current_unit=None, unit_idx=None):
@@ -479,6 +493,40 @@ def get_fsdp_chronological_timeline(roots: List[OperationWrapper]) -> str:
     
     return "\n".join(lines)
 
+def get_fsdp_marked_json(roots: List[OperationWrapper], test_mode):
+    if not test_mode: 
+        return
+    else: 
+        event_json = []
+        all_nodes = list(iter_nodes(roots))
+        for node in all_nodes: 
+            if node.gpu_children != None: 
+                for gpu_event in node.gpu_children: 
+                    if "args" not in gpu_event or gpu_event["args"] is None:
+                        gpu_event["args"] = {}
+                    gpu_event["args"]["fsdp_tag"] = node.logicalOperation or "UNKNOWN"
+                    event_json.append(gpu_event)
+            
+            event = node.raw_event
+
+            if "args" not in event or event["args"] is None:
+                event["args"] = {}
+
+            event["args"]["fsdp_tag"] = node.logicalOperation or "UNKNOWN"
+            event["args"]["memory_delta"] = node.memory_delta
+            event["args"]["gpu_duration"] = node.gpu_duration
+
+            event_json.append(event)
+        
+        event_json.sort(key=lambda x: x.get("ts", 0))
+        
+        with open("tagged_output.json", 'w', encoding='utf-8') as f:
+            json.dump(event_json, f, indent=2)
+
+        sparse_event_list = [event for event in event_json if event["args"]["fsdp_tag"] != "Detected unit: None & Detected Phase: None" and event["args"]["fsdp_tag"] != "UNKNOWN"]
+        with open("tagged_output_sparse.json", 'w', encoding='utf-8') as f:
+            json.dump(sparse_event_list, f, indent=2)
+        
 
 # ------------------------------------------------------------------------
 # bottleneck detection and reporting
@@ -552,17 +600,19 @@ def get_flame_like_string(roots: List[OperationWrapper], max_depth: int = 3, ind
             lines.append(get_flame_like_string(node.children, max_depth, indent+1))
     return "\n".join(lines)
 
-def generate_report(roots: List[OperationWrapper], output_file: Optional[str] = None):
+def generate_report(roots: List[OperationWrapper], test_mode, output_file: Optional[str] = None):
     report_parts = []
     report_parts.append("PyTorch Trace Analysis Report (Full Stream Dependency Walk)")
     report_parts.append("==========================================================")
     report_parts.append(get_top_k_string(roots))
     report_parts.append(get_flame_like_string(roots))
 
-    agg_phases = extract_fsdp_phases_aggregated(roots)
+    agg_phases = extract_fsdp_phases_aggregated(roots, test_mode)
     report_parts.append(get_fsdp_timeline_aggregated_string(agg_phases))
 
     report_parts.append(get_fsdp_chronological_timeline(roots))
+
+    get_fsdp_marked_json(roots, test_mode)
 
     full_report = "\n".join(report_parts)
     print(full_report)
@@ -664,9 +714,15 @@ def main():
         sys.exit(0)
 
     trace_file = sys.argv[1]
-    output_file = None
     if len(sys.argv) >= 3 and sys.argv[2] == "--output":
         output_file = sys.argv[3] if len(sys.argv) > 3 else None
+
+    if sys.argv[2] != "--output": 
+        print("Error: Please specify --output file")
+
+    test_mode = False
+    if sys.argv[-1] == "--test": 
+        test_mode = True 
 
     print(f"Loading trace from {trace_file}...")
     parser = TraceParser(trace_file)
@@ -677,13 +733,13 @@ def main():
     roots = parser.build_tree()
 
     print("Performing full CUDA stream dependency walk...")
-    parser.attribute_gpu_time_with_dependencies(roots)
+    parser.attribute_gpu_time_with_dependencies(roots, test_mode)
 
     print("Attributing memory deltas...")
     parser.attribute_memory(roots)
 
     print("Generating report...")
-    generate_report(roots, output_file)
+    generate_report(roots, test_mode, output_file)
     print("Done.")
     global count
     print(count)
