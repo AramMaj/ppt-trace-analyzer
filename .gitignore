@@ -2,5 +2,14 @@
 # Ignore all .txt files
 *.txt
 
+# Ignore all .csv files
+*.csv
+
 # Ignore all trace files
-*.trace.json
+*.json
+
+# Ignore the lichtenberg folder itself
+!lichtenberg
+
+# Ignore all files in the lichtenberg folder
+lichtenberg/*
