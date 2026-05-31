@@ -45,6 +45,7 @@ class LogicalOperation:
     external_ids: Set[int] = field(default_factory=set)
     direct_gpu_duration: float = 0.0
     raw_event: Optional[Dict] = None
+    
 
     @property
     def total_time(self) -> float:
@@ -340,54 +341,96 @@ def extract_fsdp_phases_aggregated(roots: List[LogicalOperation]) -> Dict[str, D
     """
     Returns a nested dict: unit -> { phase: total_gpu_us }
     Propagates unit (layer) from parent to children.
-    Phases: "All-Gather (AG)", "Reduce-Scatter (RS)","Forward Comp (FWD)", "Backward Comp (BWD)"
+    Phases: "All-Gather (AG)", "Reduce-Scatter (RS)", "Forward Comp (FWD)", "Backward Comp (BWD)", "Parameter free"
     """
     agg = defaultdict(lambda: defaultdict(float))
+    all_nodes = list(iter_nodes(roots))
+    all_nodes.sort(key=lambda n: n.start_time)
 
-    def collect(node, current_unit=None):
-        # Determine unit from this node (if any)
-        match = re.search(r"model\.layers\.(\d+)", node.name)
-        if match:
-            current_unit = f"Layer {match.group(1)}"
+    def extract_unit(name: str) -> Optional[str]:
+        m = re.search(r'\((.*?)\)', name)
+        if m:
+            val = m.group(1).replace('model.', '')
+            if 'layers' in val or 'tok_embeddings' in val or 'norm' in val or 'head' in val:
+                return val
+        m = re.search(r'for\s+([a-zA-Z0-9_\.]+)', name)
+        if m:
+            val = m.group(1).replace('model.', '')
+            if 'layers' in val or 'tok_embeddings' in val or 'norm' in val or 'head' in val:
+                return val
+        return None
 
-        phase = None
-        name_lower = node.name.lower()
+    unit_events = defaultdict(list)
+    for n in all_nodes:
+        if 'FSDP::' in n.name:
+            unit = extract_unit(n.name)
+            if unit:
+                unit_events[unit].append(n)
 
-        # All-Gather
-        if "all_gather" in name_lower:
-            phase = "All-Gather (AG)"
-        # Reduce-Scatter
-        elif "reduce_scatter" in name_lower:
-            phase = "Reduce-Scatter (RS)"
-        elif node.raw_event and node.raw_event.get('args', {}).get('Collective name') == "_reduce_scatter_base":
-            phase = "Reduce-Scatter (RS)"
-        # Backward
-        elif "fsdp::pre_backward" in name_lower or "fsdp::backward_prefetch" in name_lower:
-            phase = "Backward Comp (BWD)"
-        # Forward: detect FSDP::pre_forward and compute forward compute time
-        elif "fsdp::pre_forward" in name_lower and current_unit:
-            # Forward compute time: sum GPU durations of children that are not collectives
-            forward_gpu = 0.0
-            for child in node.children:
-                child_name = child.name.lower()
-                if "all_gather" not in child_name and "reduce_scatter" not in child_name:
-                    forward_gpu += child.gpu_duration
-            if forward_gpu > 0:
-                agg[current_unit]["Forward Comp (FWD)"] += forward_gpu
+    def merge_intervals(intervals):
+        if not intervals: return []
+        intervals.sort(key=lambda x: x[0])
+        merged = [intervals[0]]
+        for cur in intervals[1:]:
+            prev = merged[-1]
+            if cur[0] <= prev[1]:
+                merged[-1] = (prev[0], max(prev[1], cur[1]))
             else:
-                agg[current_unit]["Forward Comp (FWD)"] += node.gpu_duration
-            phase = None  # already handled
-        # Note: ProfilerStep is NOT treated as forward phase because it spans the whole step and it would massively inflate times.
+                merged.append(cur)
+        return merged
 
-        if phase and current_unit:
-            agg[current_unit][phase] += node.gpu_duration
+    for unit, events in unit_events.items():
+        events.sort(key=lambda x: x.start_time)
+        
+        # AG
+        for ev in events:
+            name_lower = ev.name.lower()
+            if 'all_gather' in name_lower and 'copy_out' not in name_lower:
+                agg[unit]["All-Gather (AG)"] += ev.gpu_duration
+                
+        # RS
+        for ev in events:
+            name_lower = ev.name.lower()
+            if 'post_backward_reshard' in name_lower or 'post_backward_reduce' in name_lower or 'post_backward_rs_wait' in name_lower:
+                agg[unit]["Reduce-Scatter (RS)"] += ev.gpu_duration
 
-        for child in node.children:
-            collect(child, current_unit)
+        # FWD compute gaps
+        pre_fwds = [e for e in events if 'pre_forward' in e.name.lower() and 'root' not in e.name.lower()]
+        post_fwds = [e for e in events if 'post_forward' in e.name.lower() and 'root' not in e.name.lower()]
+        fwd_intervals = []
+        for post in post_fwds:
+            valid_pres = [p for p in pre_fwds if p.end_time <= post.start_time]
+            if valid_pres:
+                gap_start = valid_pres[-1].end_time
+                gap_end = post.start_time
+                if gap_end > gap_start:
+                    fwd_intervals.append((gap_start, gap_end))
+                    
+        for gap_start, gap_end in merge_intervals(fwd_intervals):
+            gpu_dur = sum(n.direct_gpu_duration for n in all_nodes if gap_start <= n.start_time < gap_end)
+            agg[unit]["Forward Comp (FWD)"] += gpu_dur
 
-    for root in roots:
-        collect(root)
-    return agg
+        # BWD compute gaps
+        pre_bwds = [e for e in events if 'pre_backward' in e.name.lower() and 'root' not in e.name.lower()]
+        post_accums = [e for e in events if 'post_backward_accumulate' in e.name.lower()]
+        bwd_intervals = []
+        for post in post_accums:
+            valid_pres = [p for p in pre_bwds if p.end_time <= post.start_time]
+            if valid_pres:
+                gap_start = valid_pres[-1].end_time
+                gap_end = post.start_time
+                if gap_end > gap_start:
+                    bwd_intervals.append((gap_start, gap_end))
+                    
+        for gap_start, gap_end in merge_intervals(bwd_intervals):
+            gpu_dur = sum(n.direct_gpu_duration for n in all_nodes if gap_start <= n.start_time < gap_end)
+            agg[unit]["Backward Comp (BWD)"] += gpu_dur
+
+        # Parameter free
+        if agg[unit]["All-Gather (AG)"] == 0 and agg[unit]["Reduce-Scatter (RS)"] == 0:
+            agg[unit]["Parameter free"] = agg[unit]["Forward Comp (FWD)"] + agg[unit]["Backward Comp (BWD)"]
+
+    return dict(agg)
 
 def get_fsdp_timeline_aggregated_string(agg: Dict[str, Dict[str, float]]) -> str:
     if not agg:
@@ -424,42 +467,81 @@ def get_fsdp_timeline_aggregated_string(agg: Dict[str, Dict[str, float]]) -> str
 
 def get_fsdp_chronological_timeline(roots: List[LogicalOperation]) -> str:
     timeline = []
+    all_nodes = list(iter_nodes(roots))
+    all_nodes.sort(key=lambda n: n.start_time)
 
-    def collect_timeline(node, current_unit=None, unit_idx=None):
-        # Layer-Nummer extrahieren (z.B. "0" aus "Layer 0")
-        match = re.search(r"model\.layers\.(\d+)", node.name)
-        if match:
-            unit_idx = match.group(1)
-            current_unit = f"Layer {unit_idx}"
+    def extract_unit(name: str) -> Optional[str]:
+        m = re.search(r'\((.*?)\)', name)
+        if m:
+            val = m.group(1).replace('model.', '')
+            if 'layers' in val or 'tok_embeddings' in val or 'norm' in val or 'head' in val:
+                return val
+        m = re.search(r'for\s+([a-zA-Z0-9_\.]+)', name)
+        if m:
+            val = m.group(1).replace('model.', '')
+            if 'layers' in val or 'tok_embeddings' in val or 'norm' in val or 'head' in val:
+                return val
+        return None
 
-        name_lower = node.name.lower()
-        phase_label = None
+    unit_events = defaultdict(list)
+    for n in all_nodes:
+        if 'FSDP::' in n.name:
+            unit = extract_unit(n.name)
+            if unit:
+                unit_events[unit].append(n)
+
+    def merge_intervals(intervals):
+        if not intervals: return []
+        intervals.sort(key=lambda x: x[0])
+        merged = [intervals[0]]
+        for cur in intervals[1:]:
+            prev = merged[-1]
+            if cur[0] <= prev[1]:
+                merged[-1] = (prev[0], max(prev[1], cur[1]))
+            else:
+                merged.append(cur)
+        return merged
+
+    for unit, events in unit_events.items():
+        events.sort(key=lambda x: x.start_time)
         
-        # Phasen-Erkennung mit Nummerierung
-        if unit_idx is not None:
-            if "all_gather" in name_lower:
-                phase_label = f"AG (Layer {unit_idx})"
-            elif "reduce_scatter" in name_lower or (node.raw_event and node.raw_event.get('args', {}).get('Collective name') == "_reduce_scatter_base"):
-                phase_label = f"RS (Layer {unit_idx})"
-            elif "fsdp::pre_backward" in name_lower or "fsdp::backward_prefetch" in name_lower:
-                phase_label = f"Backward {unit_idx}"
-            elif "fsdp::pre_forward" in name_lower:
-                phase_label = f"Forward {unit_idx}"
+        for ev in events:
+            name_lower = ev.name.lower()
+            if 'all_gather' in name_lower and 'copy_out' not in name_lower:
+                timeline.append({"ts": ev.start_time, "phase": f"AG ({unit})", "dur": ev.gpu_duration})
+            elif 'post_backward_reshard' in name_lower or 'post_backward_reduce' in name_lower or 'post_backward_rs_wait' in name_lower:
+                timeline.append({"ts": ev.start_time, "phase": f"RS ({unit})", "dur": ev.gpu_duration})
 
-        if phase_label:
-            timeline.append({
-                "ts": node.start_time,
-                "phase": phase_label,
-                "dur": node.gpu_duration
-            })
+        pre_fwds = [e for e in events if 'pre_forward' in e.name.lower() and 'root' not in e.name.lower()]
+        post_fwds = [e for e in events if 'post_forward' in e.name.lower() and 'root' not in e.name.lower()]
+        fwd_intervals = []
+        for post in post_fwds:
+            valid_pres = [p for p in pre_fwds if p.end_time <= post.start_time]
+            if valid_pres:
+                gap_start = valid_pres[-1].end_time
+                gap_end = post.start_time
+                if gap_end > gap_start:
+                    fwd_intervals.append((gap_start, gap_end))
+                    
+        for gap_start, gap_end in merge_intervals(fwd_intervals):
+            gpu_dur = sum(n.direct_gpu_duration for n in all_nodes if gap_start <= n.start_time < gap_end)
+            timeline.append({"ts": gap_start, "phase": f"Forward {unit}", "dur": gpu_dur})
 
-        for child in node.children:
-            collect_timeline(child, current_unit, unit_idx)
+        pre_bwds = [e for e in events if 'pre_backward' in e.name.lower() and 'root' not in e.name.lower()]
+        post_accums = [e for e in events if 'post_backward_accumulate' in e.name.lower()]
+        bwd_intervals = []
+        for post in post_accums:
+            valid_pres = [p for p in pre_bwds if p.end_time <= post.start_time]
+            if valid_pres:
+                gap_start = valid_pres[-1].end_time
+                gap_end = post.start_time
+                if gap_end > gap_start:
+                    bwd_intervals.append((gap_start, gap_end))
+                    
+        for gap_start, gap_end in merge_intervals(bwd_intervals):
+            gpu_dur = sum(n.direct_gpu_duration for n in all_nodes if gap_start <= n.start_time < gap_end)
+            timeline.append({"ts": gap_start, "phase": f"Backward {unit}", "dur": gpu_dur})
 
-    for root in roots:
-        collect_timeline(root)
-
-    # Nach Zeit sortieren
     timeline.sort(key=lambda x: x["ts"])
 
     if not timeline:

@@ -13,3 +13,7 @@
 
 # Ignore all files in the lichtenberg folder
 lichtenberg/*
+
+# Ignore pycache
+!__pycache__
+__pycache__/*
