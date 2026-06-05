@@ -35,7 +35,7 @@ class LogicalOperation:
     children: List['LogicalOperation'] = field(default_factory=list)
     external_ids: Set[int] = field(default_factory=set)
     direct_gpu_duration: float = 0.0   # exclusive GPU time (self)
-    direct_gpu_kernels: Optional[Dict[str, Any]] = field(default_factory=list)
+    direct_gpu_kernels: List[dict] = field(default_factory=list)
     raw_event: Optional[Dict[str, Any]] = None
 
     @property
@@ -65,8 +65,11 @@ Trace Parser
 
 """
 class TraceParser: 
-    GPU_CATEGORIES = {'kernel', 'gpu_memcpy', 'gpu_memset', 'cuda_runtime',
-                      'cuda_driver', 'gpu_user_annotation', 'gpu_op'}
+    GPU_CATEGORIES = {'kernel', 'gpu_memcpy', 'gpu_memset',
+                      'gpu_user_annotation', 'gpu_op'}
+
+    # Categories that represent actual GPU work (vs. profiler annotations wrapping work)
+    GPU_WORK_CATEGORIES = {'kernel', 'gpu_memcpy', 'gpu_memset'}
 
     def __init__(self, trace_file: str):
         self.trace_file = trace_file
@@ -94,16 +97,29 @@ class TraceParser:
             ph = ev.get('ph', '')
             name = ev.get('name', '')
             args = ev.get('args', {})
-            stream = args.get('stream', -1)
+            stream = args.get('stream', args.get('Stream', -1))
 
-            if ph == 'X' and cat in ('cpu_op', 'user_annotation'):
+            if ph == 'X' and cat in ('cpu_op', 'user_annotation', 'cuda_runtime', 'cuda_driver'):
                 self.cpu_events.append(ev)
-                self.cpu_events_by_pid_tid[(pid, tid)].append(ev)
-            elif stream != -1: 
+                if cat in ('cpu_op', 'user_annotation'):
+                    self.cpu_events_by_pid_tid[(pid, tid)].append(ev)
+            elif self._is_gpu_event(cat, name):
+                pg_desc = args.get('Process Group Description', '')
+                if pg_desc:
+                    ev['_pg_desc'] = pg_desc
+                coll_name = args.get('Collective name', '')
+                if coll_name:
+                    ev['_coll_name'] = coll_name
                 self.gpu_events.append(ev)
-                self.gpu_events_by_stream[stream] = ev
-            elif ph == 'X' and self._is_gpu_event(cat, name):
+            elif stream != -1 and cat not in ('cpu_op', 'user_annotation', 'cuda_runtime', 'cuda_driver'):
+                pg_desc = args.get('Process Group Description', '')
+                if pg_desc:
+                    ev['_pg_desc'] = pg_desc
+                coll_name = args.get('Collective name', '')
+                if coll_name:
+                    ev['_coll_name'] = coll_name
                 self.gpu_events.append(ev)
+                self.gpu_events_by_stream[stream].append(ev)
             elif ph in ('i', 'C') and ('memory' in cat.lower() or name == "[memory]"):
                 self.memory_events.append(ev)
 
@@ -112,7 +128,13 @@ class TraceParser:
 
     @classmethod
     def _is_gpu_event(cls, cat: str, name: str = "") -> bool:
-        return cat in cls.GPU_CATEGORIES or 'gpu' in cat.lower() or 'cuda' in cat.lower()
+        return cat in cls.GPU_CATEGORIES or ('gpu' in cat.lower() and cat not in ('cpu_op', 'user_annotation'))
+
+    @classmethod
+    def _is_gpu_work_event(cls, ev: dict) -> bool:
+        """True for GPU events that represent actual work (kernels, memcpys, memsets).
+        False for wrapper/profiler annotations (gpu_user_annotation, gpu_op)."""
+        return ev.get('cat') in cls.GPU_WORK_CATEGORIES
 
     def build_tree(self) -> List[LogicalOperation]:
         all_roots = []
@@ -129,11 +151,12 @@ class TraceParser:
                     cpu_duration=dur,
                     raw_event=ev
                 )
-                ext_id = ev.get('args', {}).get('External id')
+                args_ev = ev.get('args', {})
+                ext_id = args_ev.get('External id') or args_ev.get('external_id')
                 if ext_id is not None:
-                    node.external_ids.add(ext_id)
+                    node.external_ids.add(int(ext_id) if not isinstance(ext_id, int) else ext_id)
 
-                while stack and stack[-1][0]['ts'] + stack[-1][0].get('dur', 0) <= start:
+                while stack and stack[-1][1].end_time <= start:
                     stack.pop()
                 if stack:
                     stack[-1][1].children.append(node)
@@ -143,63 +166,50 @@ class TraceParser:
         return all_roots
 
     def attribute_gpu_kernel_with_logical_operation(self, roots: List[LogicalOperation]):
-        # Build external ID map
+        all_nodes = list(TraceParserHelper.iter_nodes(roots))
         ext_to_gpu = defaultdict(float)
         ext_to_gpu_node = defaultdict(list)
+
         for gpu_ev in self.gpu_events:
+            if not self._is_gpu_work_event(gpu_ev):
+                continue
             ext_id = gpu_ev.get('args', {}).get('External id')
             if ext_id is not None:
                 ext_to_gpu[ext_id] += gpu_ev.get('dur', 0)
                 ext_to_gpu_node[ext_id].append(gpu_ev)
-        
-        all_nodes = list(TraceParserHelper.iter_nodes(roots))
+
         event_to_node = {id(node.raw_event): node for node in all_nodes if node.raw_event}
+        all_cpu = [ev for evlist in self.cpu_events_by_pid_tid.values() for ev in evlist]
+        all_cpu.sort(key=lambda e: e['ts'])
+        gpu_non_ext = [ev for ev in self.gpu_events
+                       if ev.get('args', {}).get('External id') is None
+                       and self._is_gpu_work_event(ev)]
+        gpu_non_ext.sort(key=lambda e: e['ts'])
+        heap = []
+        cpu_idx = 0
+        n_cpu = len(all_cpu)
+        for gpu_ev in gpu_non_ext:
+            ts = gpu_ev['ts']
+            while cpu_idx < n_cpu and all_cpu[cpu_idx]['ts'] <= ts:
+                ce = all_cpu[cpu_idx]
+                heapq.heappush(heap, (-ce['ts'], ce['ts'] + ce.get('dur', 0), ce))
+                cpu_idx += 1
+            while heap and heap[0][1] < ts:
+                heapq.heappop(heap)
+            if heap:
+                node = event_to_node.get(id(heap[0][2]))
+                if node:
+                    node.direct_gpu_duration += gpu_ev.get('dur', 0)
+                    node.direct_gpu_kernels.append(gpu_ev)
 
-        # Match GPU events to CPU parents
-        gpu_parent_pairs = []
-        remaining_gpu = []
-        for gpu_ev in self.gpu_events:
-            ext_id = gpu_ev.get('args', {}).get('External id')
-            if ext_id is not None:
-                continue
-            parent = self.async_resolver.get_parent_from_async_only(gpu_ev)
-            if parent is not None:
-                gpu_parent_pairs.append((gpu_ev, parent))
-            else:
-                remaining_gpu.append(gpu_ev)
-        if remaining_gpu:
-            all_cpu = []
-            for evlist in self.cpu_events_by_pid_tid.values():
-                all_cpu.extend(evlist)
-            all_cpu.sort(key=lambda e: e['ts'])
-            remaining_gpu.sort(key=lambda e: e['ts'])
-            heap = []
-            cpu_idx = 0
-            n_cpu = len(all_cpu)
-            for gpu_ev in remaining_gpu:
-                ts = gpu_ev['ts']
-                while cpu_idx < n_cpu and all_cpu[cpu_idx]['ts'] <= ts:
-                    ce = all_cpu[cpu_idx]
-                    dur = ce.get('dur', 0)
-                    end = ce['ts'] + dur
-                    heapq.heappush(heap, (-ce['ts'], end, ce))
-                    cpu_idx += 1
-                while heap and heap[0][1] < ts:
-                    heapq.heappop(heap)
-                if heap:
-                    gpu_parent_pairs.append((gpu_ev, heap[0][2]))
-
-        for gpu_ev, parent_cpu in gpu_parent_pairs:
-            node = event_to_node.get(id(parent_cpu))
-            if node:
-                node.direct_gpu_duration += gpu_ev.get('dur', 0)
-                node.direct_gpu_kernels.append(gpu_ev)
-
-        for node in all_nodes:
-            if "cudalaunch" in node.name.lower() or "cudamemcpyasync" in node.name.lower(): 
-                for ext_id in node.external_ids:
-                    node.direct_gpu_duration += ext_to_gpu.get(ext_id, 0)
-                    node.direct_gpu_kernels.append(ext_to_gpu_node[ext_id])
+        # Attribute GPU time to the deepest node for each ext_id (avoid double-counting)
+        def subtree_size(n):
+            return 1 + sum(subtree_size(c) for c in n.children)
+        for node in sorted(all_nodes, key=lambda n: -subtree_size(n)):
+            for ext_id in list(node.external_ids):
+                if ext_id in ext_to_gpu:
+                    node.direct_gpu_duration += ext_to_gpu.pop(ext_id)
+                    node.direct_gpu_kernels.extend(ext_to_gpu_node.pop(ext_id))
 
         # Propagate GPU time upward
         def compute(node):
