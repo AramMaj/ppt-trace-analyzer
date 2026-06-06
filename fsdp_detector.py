@@ -205,8 +205,18 @@ def _iter_logical(node: LogicalOperation) -> Iterator[LogicalOperation]:
 
 
 def _extract_layer(name: str) -> str:
-    if '(' in name and name.endswith(')'):
-        return name[name.index('(') + 1:name.rindex(')')]
+    """Extract layer name from parens, handling nested parentheses."""
+    if '(' not in name or not name.endswith(')'):
+        return name
+    start = name.index('(')
+    depth = 0
+    for i in range(start, len(name)):
+        if name[i] == '(':
+            depth += 1
+        elif name[i] == ')':
+            depth -= 1
+            if depth == 0:
+                return name[start + 1:i]
     return name
 
 
@@ -260,7 +270,7 @@ class StandardFSDPDetector:
                     if ch not in unit.all_gather_bwd:
                         unit.all_gather_bwd.append(ch)
 
-    def _detect_fwd_cmp(self, roots: List[LogicalOperation], fsdp_units: FSDP):
+    def _detect_fwd_cmp(self, roots: List[LogicalOperation], fsdp_units: FSDP, profiler_tid: int = None):
         all_nodes = sorted(TraceParserHelper.iter_nodes(roots), key=lambda n: n.start_time)
         units = fsdp_units.units
 
@@ -304,12 +314,16 @@ class StandardFSDPDetector:
                     end_time = copy_out_end
 
             for n in all_nodes:
+                if profiler_tid is not None:
+                    n_tid = n.raw_event.get('tid') if n.raw_event else None
+                    if n_tid != profiler_tid:
+                        continue
                 if n.start_time >= copy_out_end and n.end_time <= end_time:
                     if _has_fsdp_prefix(n.name) or n.name.startswith('ProfilerStep') or n.name.startswith('Optimizer'):
                         continue
                     unit.fwd_compute.append(n)
 
-    def _detect_bwd_cmp(self, roots: List[LogicalOperation], fsdp_units: FSDP):
+    def _detect_bwd_cmp(self, roots: List[LogicalOperation], fsdp_units: FSDP, profiler_tid: int = None):
         all_nodes = sorted(TraceParserHelper.iter_nodes(roots), key=lambda n: n.start_time)
 
         for unit in fsdp_units.units:
@@ -340,6 +354,10 @@ class StandardFSDPDetector:
                 continue
 
             for n in all_nodes:
+                if profiler_tid is not None:
+                    n_tid = n.raw_event.get('tid') if n.raw_event else None
+                    if n_tid == profiler_tid:
+                        continue
                 if n.start_time >= all_gather_end and n.end_time <= rs_start:
                     if _has_fsdp_prefix(n.name) or n.name.startswith('ProfilerStep') or n.name.startswith('Optimizer'):
                         continue
@@ -383,6 +401,13 @@ class StandardFSDPDetector:
                 if rs_node not in unit.reduce_scatter:
                     unit.reduce_scatter.append(rs_node)
 
+    def _profiler_tid(self, roots: List[LogicalOperation]):
+        for root in roots:
+            raw = root.raw_event or {}
+            if raw.get("name", "").startswith("ProfilerStep#") and raw.get("ph") == "X":
+                return raw.get("tid")
+        return None
+
     def extract_fsdp_phases(self, roots: List[LogicalOperation]) -> FSDP:
         fsdp = FSDP()
         all_nodes = list(TraceParserHelper.iter_nodes(roots))
@@ -398,11 +423,13 @@ class StandardFSDPDetector:
                 seen.add(layer)
                 fsdp.units.append(FSDPUnit(layer))
 
+        profiler_tid = self._profiler_tid(roots)
+
         self._detect_all_gather_fwd(roots, fsdp)
-        self._detect_fwd_cmp(roots, fsdp)
+        self._detect_fwd_cmp(roots, fsdp, profiler_tid)
         self._detect_all_gather_bwd(roots, fsdp)
         self._detect_reduce_scatter(roots, fsdp)
-        self._detect_bwd_cmp(roots, fsdp)
+        self._detect_bwd_cmp(roots, fsdp, profiler_tid)
         self._detect_optimizer_step(roots, fsdp)
         self._detect_tp_gpu(fsdp)
 
