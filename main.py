@@ -1,4 +1,13 @@
-"""CLI entry point for PPT trace analysis."""
+"""CLI entry point.  Dispatches to four modes:
+
+  Default     — per-layer GPU time breakdown + bottleneck report
+  --timeline  — ASCII Gantt chart of FSDP2 pipeline stagger
+  --compare   — side-by-side benchmark table (2+ traces)
+  --annotate  — Chrome Trace JSON with phases, flows, counters, bottlenecks
+
+Each mode delegates to dedicated modules (pipeline.py, timeline.py,
+comparison.py, trace_annotator.py) — ``main.py`` only parses argv and prints.
+"""
 
 import sys
 import os
@@ -13,6 +22,9 @@ from comparison import compare_traces
 
 
 def main():
+    """Route to single-trace report, --timeline Gantt, --compare multi-trace, or --annotate chrome://tracing.
+    No argparse dependency — manual argv parsing keeps the import footprint small.
+    """
     if len(sys.argv) < 2:
         print("Usage:")
         print("  Analyze a single trace:     python main.py <trace.json> [--output report.txt]")
@@ -82,6 +94,7 @@ def main():
         compare_traces(trace_files, output_file)
         return
 
+    # Default: single-trace analysis
     trace_file = sys.argv[1]
     output_file = None
     if len(sys.argv) >= 3 and sys.argv[2] == "--output":

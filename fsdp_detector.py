@@ -1,31 +1,30 @@
-"""
-Main FSDP Recognition Logic
+"""FSDP2/TP/optimizer phase detection from the CPU event tree.
 
-=> Pre Forward (layer X) in der CPU finden => Alle GPU Kernel in FSDPUnit.all_gather einfügen
+Transforms the flat ``LogicalOperation`` tree into per-layer phases
+consumed by the bottleneck detector, timeline, and annotator.
 
-FSDP Trace phase pattern (ProfilerStep#X wraps everything):
-  Forward:
-    pre_forward (layers.X)
-      all_gather (layers.X)      -- NCCL all-gather (CPU + GPU kernels)
-        aten::empty, aten::split_with_sizes, fsdp::all_gather_copy_in, c10d::_allgather_base_
-        NCCL GPU kernels: ncclDevKernel_AllGather_RING_LL ...
-      all_gather_copy_out (layers.X)  -- copy-out after all-gather
-        fsdp::split_with_sizes_copy
-      RegisterPostBackwardFunction
-    ... forward compute ops (aten::linear, scaled_dot_product_attention, rms_norm ...)
-    post_forward (layers.X)
+Phase flow for one FSDP2 layer (ProfilerStep#X wrapper omitted):
+  pre_forward (layers.X)
+    all_gather (layers.X)           — mesh_fsdp NCCL all-gather (unshard)
+    all_gather_copy_out (layers.X)  — split_with_sizes_copy into flat param
+    RegisterPostBackwardFunction
+  fwd_compute                        — aten::linear, scaled_dot_product_attention, T5LayerNorm
+  post_forward (layers.X)
 
-  Backward (reverse order, layers.31 .. layers.0):
-    pre_backward (layers.X)
-      all_gather_copy_out (layers.X)  -- re-all-gather for backward
-      backward_prefetch for layers.X-1
-    ... autograd::engine::evaluate_function:* (backward compute)
-    post_backward_accumulate (layers.X)
-    post_backward_rs_wait (layers.X)
-    post_backward_reduce (layers.X)  -- reduce-scatter
-      fsdp::chunk_cat, c10d::_reduce_scatter_base_
-      NCCL GPU kernels: ncclDevKernel_ReduceScatter_RING_LL ...
-    post_backward_reshard (layers.X)
+  pre_backward (layers.X)
+    all_gather_copy_out (layers.X)  — re-gather after reshard_after_forward=True
+  bwd_compute                        — autograd::engine::evaluate_function (backward stream)
+  post_backward_reduce (layers.X)   — NCCL reduce-scatter (grad sync)
+  post_backward_reshard (layers.X)  — free shard
+
+Key validation traces (both live in traces/):
+  8B TP trace (rank0_trace_8b_tp.json):  3 ProfilerSteps, 34 layers, tid=24529
+    (fwd) + tid=24759 (bwd stream).  34 FSDP units.
+  async TP trace (async-tensor-parall/): single ProfilerStep#9, 8 units, TP on mesh_tp.
+
+Uses **conditional thread filtering**: when backward runs on a different
+CUDA stream thread (tid=24759) than forward (tid=24529), forward compute
+scans only the profiler thread and backward compute filters it out.
 """
 
 from typing import Dict, List, Optional, Tuple, Set, Iterator, Any
@@ -49,6 +48,9 @@ NCCL_COLLECTIVE_NAMES = {
 
 
 def _classify_nccl_kernel(ev: dict) -> str:
+    """Classify a GPU NCCL kernel as ``tp_all_gather`` / ``tp_reduce_scatter`` / ``tp_all_reduce``.
+    Uses ``_coll_name`` first, then name substring match, then ``'tp_other'``.
+    """
     coll = ev.get('_coll_name', '')
     if not coll:
         name = ev.get('name', '')
@@ -70,10 +72,17 @@ def _classify_nccl_kernel(ev: dict) -> str:
 
 
 def _has_fsdp_prefix(name: str) -> bool:
+    """Match ``FSDP::`` or ``FullyShardedDataParallel::`` — used to skip
+    FSDP-internal ops (all_gather, copy_out, pre_forward) when collecting
+    fwd_compute / bwd_compute nodes.
+    """
     return name.startswith(FSDP_PREFIXES)
 
 
 def _fsdp_phase_name(phase: str, layer: str = '') -> List[str]:
+    """Return both ``FSDP::`` and ``FullyShardedDataParallel::`` variants of a phase name
+    (e.g. ``['FSDP::pre_forward (layers.0)', 'FullyShardedDataParallel::pre_forward (layers.0)']``).
+    """
     names = []
     for p in FSDP_PREFIXES:
         name = f'{p}{phase}'
@@ -85,6 +94,10 @@ def _fsdp_phase_name(phase: str, layer: str = '') -> List[str]:
 
 
 class FSDP:
+    """Container for all detected phases: per-layer FSDPUnit list, optimizer
+    nodes, TP collectives, and computed aggregates.  Properties compute on the
+    fly so they stay consistent if nodes are added post-construction.
+    """
     def __init__(self):
         self.units: List["FSDPUnit"] = []
         self.optimizer_step: List[LogicalOperation] = []
@@ -95,30 +108,37 @@ class FSDP:
 
     @property
     def tp_all_gather_gpu(self) -> float:
+        """Total GPU wall time of TP all-gather kernels (µs)."""
         return sum(k.get('dur', 0) for k in self.tp_all_gather)
 
     @property
     def tp_reduce_scatter_gpu(self) -> float:
+        """Total GPU wall time of TP reduce-scatter kernels (µs)."""
         return sum(k.get('dur', 0) for k in self.tp_reduce_scatter)
 
     @property
     def tp_all_reduce_gpu(self) -> float:
+        """Total GPU wall time of TP all-reduce kernels (µs)."""
         return sum(k.get('dur', 0) for k in self.tp_all_reduce)
 
     @property
     def tp_total_gpu(self) -> float:
+        """Total GPU wall time of all TP collectives (µs)."""
         return self.tp_all_gather_gpu + self.tp_reduce_scatter_gpu + self.tp_all_reduce_gpu
 
     @property
     def optimizer_gpu(self) -> float:
+        """Total GPU duration attributed to Optimizer.step CPU nodes (µs)."""
         return sum(n.gpu_duration for n in self.optimizer_step)
 
     @property
     def optimizer_cpu(self) -> float:
+        """Total CPU duration of Optimizer.step nodes (µs)."""
         return sum(n.cpu_duration for n in self.optimizer_step)
 
     @property
     def optimizer_wall(self) -> float:
+        """Wall-clock span covering all optimizer-step nodes (µs)."""
         if not self.optimizer_step:
             return 0.0
         start = min(n.start_time for n in self.optimizer_step)
@@ -127,6 +147,7 @@ class FSDP:
 
     @property
     def optimizer_step_gpu_kernels(self) -> List[dict]:
+        """Collect all GPU kernel events under all Optimizer.step nodes (recursive)."""
         kernels = []
         for n in self.optimizer_step:
             kernels.extend(n.direct_gpu_kernels if isinstance(n.direct_gpu_kernels, list) else [])
@@ -137,6 +158,7 @@ class FSDP:
 
     @property
     def step_wall(self) -> float:
+        """Wall-clock span from earliest phase to latest (including optimizer)."""
         if not self.units:
             return 0.0
         all_units = []
@@ -156,6 +178,10 @@ class FSDP:
 
 
 class FSDPUnit:
+    """One FSDP2 layer — stores CPU nodes for each of the five phases plus
+    computed GPU kernel lists.  The core abstraction consumed by bottleneck
+    detection, timeline, and annotation.
+    """
     def __init__(self, layer_name: str):
         self.layer_name: str = layer_name
         self.all_gather_fwd: List[LogicalOperation] = []
@@ -166,6 +192,7 @@ class FSDPUnit:
 
     @property
     def all_gather_fwd_gpu_kernels(self) -> List[dict]:
+        """GPU kernel events under all ``all_gather_fwd`` CPU nodes."""
         kernels = []
         for n in self.all_gather_fwd:
             kernels.extend(n.direct_gpu_kernels if isinstance(n.direct_gpu_kernels, list) else [])
@@ -176,6 +203,7 @@ class FSDPUnit:
 
     @property
     def all_gather_bwd_gpu_kernels(self) -> List[dict]:
+        """GPU kernel events under all ``all_gather_bwd`` CPU nodes."""
         kernels = []
         for n in self.all_gather_bwd:
             kernels.extend(n.direct_gpu_kernels if isinstance(n.direct_gpu_kernels, list) else [])
@@ -186,6 +214,7 @@ class FSDPUnit:
 
     @property
     def reduce_scatter_gpu_kernels(self) -> List[dict]:
+        """GPU kernel events under all ``reduce_scatter`` CPU nodes."""
         kernels = []
         for n in self.reduce_scatter:
             kernels.extend(n.direct_gpu_kernels if isinstance(n.direct_gpu_kernels, list) else [])
@@ -196,6 +225,7 @@ class FSDPUnit:
 
 
 def _iter_logical(node: LogicalOperation) -> Iterator[LogicalOperation]:
+    """DFS pre-order traversal of a subtree — yields the node then its children recursively."""
     stack = [node]
     while stack:
         n = stack.pop()
@@ -204,7 +234,9 @@ def _iter_logical(node: LogicalOperation) -> Iterator[LogicalOperation]:
 
 
 def _extract_layer(name: str) -> str:
-    """Extract layer name from parens, handling nested parentheses."""
+    """Extract the layer name from a parenthetical suffix (handles nested parens).
+    ``'FSDP::pre_forward (layers.7)'`` → ``'layers.7'``.
+    """
     if '(' not in name or not name.endswith(')'):
         return name
     start = name.index('(')
@@ -220,11 +252,16 @@ def _extract_layer(name: str) -> str:
 
 
 def _pick_latest_with_allgather(nodes: List[LogicalOperation]) -> LogicalOperation:
+    """Pick the latest-starting node that has an ``FSDP::all_gather`` child.
+    Stale ``pre_forward`` nodes from earlier steps may still be in the tree;
+    this heuristic selects the one for the active step.
+    """
     picks = [n for n in nodes if any('all_gather' in ch.name and _has_fsdp_prefix(ch.name) for ch in n.children)]
     return max(picks, key=lambda n: n.start_time) if picks else max(nodes, key=lambda n: n.start_time)
 
 
 def _match_gpu_by_interval(gpu_events: List[dict], start: float, end: float) -> List[dict]:
+    """GPU events fully contained in [start, end].  Debugging helper, not used in the main pipeline."""
     out = []
     ts = start
     for ev in gpu_events:
@@ -236,10 +273,19 @@ def _match_gpu_by_interval(gpu_events: List[dict], start: float, end: float) -> 
 
 
 class StandardFSDPDetector:
+    """Orchestrates seven sub-detectors into ``extract_fsdp_phases(roots)``.
+    Each sub-detector is independently verifiable; the class manages
+    cross-cutting concerns like conditional thread filtering.
+    """
     def __init__(self, gpu_events: Optional[List[dict]] = None):
         self.gpu_events = gpu_events or []
 
     def _detect_all_gather_fwd(self, roots: List[LogicalOperation], fsdp_units: FSDP):
+        """FSDP2 forward unshard: ``FSDP::all_gather`` is a child of ``FSDP::pre_forward (layer.X)``.
+        This is the NCCL all-gather on ``mesh_fsdp`` that collects full parameters
+        from all shards onto this rank.  The ``all_gather_copy_out`` sibling then
+        memcpy-splits the result into contiguous flat parameters (split_with_sizes_copy).
+        """
         all_nodes = list(TraceParserHelper.iter_nodes(roots))
         for unit in fsdp_units.units:
             pre_fwd_list = []
@@ -255,6 +301,12 @@ class StandardFSDPDetector:
                         unit.all_gather_fwd.append(ch)
 
     def _detect_all_gather_bwd(self, roots: List[LogicalOperation], fsdp_units: FSDP):
+        """FSDP2 backward re-gather: ``FSDP::all_gather_copy_out`` child of ``FSDP::pre_backward (layer.X)``.
+        With ``reshard_after_forward=True`` (FSDP2 default), each layer's parameters
+        are freed after forward compute.  Autograd needs full parameters, so FSDP2
+        re-issues the all-gather here (split_with_sizes_copy into contiguous buffers
+        on the backward stream thread, tid=24759 in the 8B trace).
+        """
         all_nodes = list(TraceParserHelper.iter_nodes(roots))
         for unit in fsdp_units.units:
             pre_bwd_list = []
@@ -271,6 +323,10 @@ class StandardFSDPDetector:
 
     @staticmethod
     def _has_other_tids(all_nodes, profiler_tid):
+        """Check if any tree node lives on a thread other than *profiler_tid*.
+        The 8B TP trace uses tid=24529 for the main profiler thread and
+        tid=24759 for the backward CUDA stream — this heuristic detects that split.
+        """
         if profiler_tid is None:
             return False
         return any(
@@ -279,6 +335,19 @@ class StandardFSDPDetector:
         )
 
     def _detect_fwd_cmp(self, roots: List[LogicalOperation], fsdp_units: FSDP, profiler_tid: int = None):
+        """Forward compute: collect attn/MLP/norm ops between each layer's
+        ``all_gather_copy_out.end_time`` and the next layer's ``pre_forward.start``.
+
+        Skips FSDP-internal ops (all_gather, copy_out), ProfilerStep markers,
+        and Optimizer events.  When backward runs on a separate thread
+        (``has_other_tids``, as with tid=24759 in the 8B trace), only the
+        profiler thread (tid=24529) is matched — the backward-stream events
+        are reserved for ``_detect_bwd_cmp``.
+
+        NB: This relies on sequential-layer boundaries.  In a fully-overlapped
+        FSDP2 schedule where layer i+1 starts its all-gather before layer i's
+        compute finishes, the end_time boundary heuristic breaks.
+        """
         all_nodes = sorted(TraceParserHelper.iter_nodes(roots), key=lambda n: n.start_time)
         units = fsdp_units.units
         has_other_tids = self._has_other_tids(all_nodes, profiler_tid)
@@ -333,6 +402,15 @@ class StandardFSDPDetector:
                     unit.fwd_compute.append(n)
 
     def _detect_bwd_cmp(self, roots: List[LogicalOperation], fsdp_units: FSDP, profiler_tid: int = None):
+        """Backward compute: ``autograd::engine::evaluate_function`` ops on the
+        backward stream thread (tid=24759 in the 8B trace) between
+        ``pre_backward.end_time`` and ``reduce_scatter.start_time``.
+
+        Inverts the thread filter: when ``has_other_tids``, the profiler thread
+        is excluded — only the backward-stream thread is scanned.  Falls back
+        to ``post_backward_reduce`` name matching if the RS node was missed
+        (e.g. trace captured before the reduce-scatter completed).
+        """
         all_nodes = sorted(TraceParserHelper.iter_nodes(roots), key=lambda n: n.start_time)
         has_other_tids = self._has_other_tids(all_nodes, profiler_tid)
 
@@ -374,7 +452,11 @@ class StandardFSDPDetector:
                     unit.bwd_compute.append(n)
 
     def _detect_tp_gpu(self, fsdp: FSDP):
-        """Classify GPU NCCL kernels by process group into TP vs FSDP categories."""
+        """Classify GPU events with ``_pg_desc == 'mesh_tp'`` into TP collectives.
+        FSDP and TP collectives are distinguished here so per-layer metrics can
+        report ``tp_comm_ratio`` separately from ``fsdp_comm_ratio`` — critical
+        for diagnosing async TP overlap efficiency.
+        """
         if not self.gpu_events:
             return
 
@@ -391,6 +473,11 @@ class StandardFSDPDetector:
                 fsdp.tp_all_reduce.append(ev)
 
     def _detect_optimizer_step(self, roots: List[LogicalOperation], fsdp_units: FSDP):
+        """Collect ``Optimizer.step#N`` / ``Optimizer.zero_grad#N`` CPU nodes.
+        In the 8B TP trace, fused ADAMW kernels execute ~727ms after the CPU
+        ProfilerStep#3 ends — these nodes are collected but their GPU time may
+        fall outside the active step's time margin (handled in ``sanitize_optimizer``).
+        """
         all_nodes = list(TraceParserHelper.iter_nodes(roots))
         for n in all_nodes:
             if n.name.startswith('Optimizer.step#'):
@@ -401,6 +488,11 @@ class StandardFSDPDetector:
                     fsdp_units.optimizer_zero_grad.append(n)
 
     def _detect_reduce_scatter(self, roots: List[LogicalOperation], fsdp_units: FSDP):
+        """FSDP2 gradient sync: latest ``FSDP::post_backward_reduce (layer.X)`` node
+        per unit.  This is the NCCL reduce-scatter on ``mesh_fsdp`` that averages
+        gradients across the FSDP shard group.  In the 8B trace, these nodes appear
+        on the backward stream thread (tid=24759) interleaved with autograd.
+        """
         all_nodes = list(TraceParserHelper.iter_nodes(roots))
         for unit in fsdp_units.units:
             rs_list = []
@@ -412,6 +504,11 @@ class StandardFSDPDetector:
                     unit.reduce_scatter.append(rs_node)
 
     def _profiler_tid(self, roots: List[LogicalOperation]):
+        """Thread ID of the first ProfilerStep# event — used for conditional
+        thread filtering.  Returns ``24529`` for the 8B TP trace (matching the
+        profiler's main thread).  Falls back to ``None`` if no ProfilerStep
+        is found (single-step traces without the marker).
+        """
         for root in roots:
             raw = root.raw_event or {}
             if raw.get("name", "").startswith("ProfilerStep#") and raw.get("ph") == "X":
@@ -419,6 +516,20 @@ class StandardFSDPDetector:
         return None
 
     def extract_fsdp_phases(self, roots: List[LogicalOperation]) -> FSDP:
+        """Run all seven sub-detectors in dependency order and return the populated ``FSDP`` container.
+
+        Order matters:
+        1. ``_detect_all_gather_fwd`` — identifies layers (pre_forward → layer name)
+        2. ``_detect_fwd_cmp`` — needs all_gather_fwd populated for copy_out_end
+        3. ``_detect_all_gather_bwd`` — needs layer list from step 1
+        4. ``_detect_reduce_scatter`` — needed before bwd_cmp (provides rs_start)
+        5. ``_detect_bwd_cmp`` — needs pre_backward + reduce_scatter boundaries
+        6. ``_detect_optimizer_step`` — independent, collects Optimizer.step/zero_grad
+        7. ``_detect_tp_gpu`` — independent, classifies mesh_tp GPU kernels from gpu_events
+
+        This single call transforms the raw CPU tree into structured phases consumed
+        by the bottleneck detector, report, timeline, and annotator.
+        """
         fsdp = FSDP()
         all_nodes = list(TraceParserHelper.iter_nodes(roots))
 

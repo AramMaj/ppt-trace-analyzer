@@ -1,4 +1,17 @@
-"""ASCII Gantt-chart timeline output for PPT trace analysis."""
+"""ASCII Gantt-chart timeline — shows FSDP2 pipeline stagger and serial bubbles
+at a glance.  The text report gives precise per-phase GPU times, but the Gantt
+reveals which layers are serialised, where backward-phase starts, and where
+pipeline idle gaps / bottlenecks occur, without needing chrome://tracing.
+
+One row per layer (34 for 8B TP, 8 for async TP).  Phase characters:
+  A = all-gather forward (NCCL unshard)
+  F = forward compute (attn/MLP/norm)
+  a = all-gather backward (re-shard)
+  B = backward compute (autograd)
+  R = reduce-scatter (grad sync)
+  O = optimizer
+  ! = bottleneck marker at the longest phase midpoint
+"""
 
 from bottleneck_detector import Bottlenecks, _format_us, _phase_wall_span
 from trace_annotator import _get_phase_spans
@@ -10,12 +23,14 @@ TIMELINE_BAR_CHARS = {
 
 
 def print_timeline(fsdp, report):
-    """Print a compact ASCII Gantt chart showing detected phases per layer over time."""
+    """Compact ASCII Gantt chart — one row per layer, 80-char time-scaled bar, ``!`` marks bottlenecks.
+    """
     n_layers = len(fsdp.units)
     if n_layers == 0:
         print("  No FSDP units to show.")
         return
 
+    # Collect all phase intervals with their layer index, label, start, end
     intervals = []
     for idx, unit in enumerate(fsdp.units):
         for label, nodes in [
@@ -33,6 +48,7 @@ def print_timeline(fsdp, report):
         print("  No phase intervals found.")
         return
 
+    # Global time range for normalising the 80-col bar
     t_min = min(i[2] for i in intervals)
     t_max = max(i[3] for i in intervals)
     span_total = t_max - t_min
@@ -48,6 +64,7 @@ def print_timeline(fsdp, report):
     print("Phase Timeline (each character ≈ {:.1f}ms)".format(span_total / (BAR_WIDTH * 1000)))
     print("─" * (COL_WIDTH + BAR_WIDTH + 4))
 
+    # Scale tick labels at 5 evenly-spaced positions
     scale_lines = []
     num_ticks = 5
     for t in range(num_ticks + 1):
@@ -68,6 +85,7 @@ def print_timeline(fsdp, report):
         prev_end = pos
     print(" " * COL_WIDTH + scale_str)
 
+    # One row per layer — draw phase characters, then overlay bottleneck marker
     for idx, unit in enumerate(fsdp.units):
         name = unit.layer_name
         line_chars = [' '] * BAR_WIDTH
@@ -79,6 +97,7 @@ def print_timeline(fsdp, report):
             for c in range(col_start, min(col_end + 1, BAR_WIDTH)):
                 line_chars[c] = ch
 
+        # Overlay '!' at the midpoint of the longest phase if bottlenecked
         timeline_str = ''.join(line_chars)
         for m in report.metrics_list:
             if m.layer_name == unit.layer_name:

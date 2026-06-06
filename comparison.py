@@ -1,4 +1,12 @@
-"""Multi-trace benchmark comparison output (text table + CSV)."""
+"""Multi-trace benchmark comparison — side-by-side text table and CSV output.
+Lets you compare compute-vs-communication ratios, pipeline overlap, async TP
+efficiency, and bottleneck profiles across different model configurations
+(TP degree, FSDP sharding, batch size, GPU count) in a single table.
+
+Each row is one trace; columns include per-phase GPU time, utilisation,
+FSDP/TP communication breakdown, overlap metrics, and the top-3 bottlenecks.
+Also writes CSV for spreadsheet import.
+"""
 
 import csv
 import os
@@ -9,7 +17,9 @@ from bottleneck_detector import Bottlenecks, _format_us
 
 
 def _format_bottleneck_summary(metrics_list, aggregated) -> str:
-    """Short one-line bottleneck summary for a trace."""
+    """One-line bottleneck summary (top 3 issues by prevalence) for the comparison table.
+    ``; ``-separated for compact display — avoids multi-line wraps in the terminal table.
+    """
     all_issues = defaultdict(list)
     for m in metrics_list:
         issues = Bottlenecks.detect(m)
@@ -35,20 +45,21 @@ def compare_traces(trace_files, output_file=None):
     """
     from pipeline import process_trace
 
-    results = []
+    trace_results = []
     for tf in trace_files:
         label = os.path.basename(tf)
         print(f"Processing {label}...", file=sys.stderr)
-        r = process_trace(tf)
-        if r is None:
+        result = process_trace(tf)
+        if result is None:
             print(f"  FAILED to load {tf}", file=sys.stderr)
             continue
-        results.append((label, r))
+        trace_results.append((label, result))
 
-    if not results:
+    if not trace_results:
         print("No traces processed successfully.")
         sys.exit(1)
 
+    # Build the comparison table row by row
     rows = []
     headers = [
         "Trace", "Layers",
@@ -61,7 +72,7 @@ def compare_traces(trace_files, output_file=None):
         "Bottlenecks",
     ]
 
-    for label, (agg, metrics_list, fsdp, report, text) in results:
+    for label, (agg, metrics_list, fsdp, report, text) in trace_results:
         num_units = len(metrics_list)
         step_wall = agg.get("step_wall", 0)
 

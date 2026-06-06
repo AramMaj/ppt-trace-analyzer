@@ -1,15 +1,14 @@
 """
-Bottleneck und Metriken
+Per-layer FSDP2/TP metrics, bottleneck classification, and text report generation.
 
-Rückgabe
-=> Vorherige JSON + Erweiterungen über User Annotations und Bottlenecks
-=> Textueller Report
-    < Bottleneck Freitext Report >
-    => Metriken für gesamte Unit
-    => Metriken pro Unit
-    => Unit Auflistung
-    => Chronlogical
-
+Six sections:
+1. Low-level helpers (GPU kernel collection, NCCL vs copy vs compute classification)
+2. Overlap/pipeline decomposition (sweep-line across layer wall spans)
+3. Memory collection from ``[memory]`` trace events
+4. Metrics class — per-FSDP-shard-group computed values (GPU time, comm ratio, overlap, etc.)
+5. Bottlenecks class — threshold-based detection of 12+ bottleneck types (compute-bound,
+   comm-bound, copy-heavy all-gather, async TP overlap asymmetry, host-bound, etc.)
+6. Report class — aggregation, formatting, JSON markers
 """
 
 import json
@@ -19,20 +18,72 @@ from collections import defaultdict
 from trace_parser import LogicalOperation
 from fsdp_detector import FSDP, FSDPUnit, FSDP_PREFIXES
 
+# NB: Own DFS in _collect_gpu_kernels rather than reusing _iter_logical from fsdp_detector.
+
+
+# ---------------------------------------------------------------------------
+# Low-level helpers
+# ---------------------------------------------------------------------------
+
+def _collect_gpu_kernels(nodes):
+    """DFS-collect all ``direct_gpu_kernels`` (CUDA kernels, NCCL collectives,
+    memcpy ops) from a list of LogicalOperation nodes and their subtrees.
+    Uses an explicit stack to avoid Python recursion limits on deep FSDP trees.
+    Only populated after ``attribute_gpu_kernel_with_logical_operation``.
+    """
+    kernels = []
+    stack = list(nodes)
+    while stack:
+        n = stack.pop()
+        if n.direct_gpu_kernels:
+            kernels.extend(n.direct_gpu_kernels)
+        stack.extend(n.children)
+    return kernels
+
+
+def _classify_kernel(name: str) -> str:
+    """Substring-based classification: ``nccl`` / ``copy`` / ``compute``.
+    NCCL patterns checked first to avoid false-positive "copy" classification on NCCL names.
+    """
+    lower = name.lower()
+    if any(p in lower for p in ('nccl', 'allgather', 'all_gather', 'allreduce',
+                                 'all_reduce', 'reducescatter', 'reduce_scatter')):
+        return 'nccl'
+    if any(p in lower for p in ('copy', 'memcpy', 'memset')):
+        return 'copy'
+    return 'compute'
+
 
 def _is_fsdp_name(name: str) -> bool:
+    """Check whether a node name matches one of the known FSDP name prefixes."""
     return name.startswith(FSDP_PREFIXES)
 
 
+# ---------------------------------------------------------------------------
+# Timing helpers
+# ---------------------------------------------------------------------------
+
 def _phase_gpu_time(nodes: List[LogicalOperation]) -> float:
+    """Sum of inclusive GPU duration across nodes (aggregate CUDA kernel time,
+    NCCL collective time, memcpy).  ``gpu_duration`` is already the inclusive
+    sum per node, so this is not a unioned time range.
+    """
     return sum(n.gpu_duration for n in nodes)
 
 
 def _phase_cpu_time(nodes: List[LogicalOperation]) -> float:
+    """Sum of inclusive CPU dispatch duration (µs).  Same caveat: not a union."""
     return sum(n.cpu_duration for n in nodes)
 
 
 def _phase_wall_time(nodes: List[LogicalOperation]) -> float:
+    """Union wall-clock span — earliest ``start_time`` to latest ``end_time``
+    across *nodes*.  Gaps between phases (e.g. pipeline bubbles between
+    reduce-scatter and the next all-gather) are included.
+
+    Used for ``layer_span`` (how long this FSDP shard group is live on the
+    host timeline) and for the CPU-span-to-GPU ratio (host-bound detection).
+    """
     if not nodes:
         return 0.0
     start = min(n.start_time for n in nodes)
@@ -41,6 +92,11 @@ def _phase_wall_time(nodes: List[LogicalOperation]) -> float:
 
 
 def _phase_wall_span(nodes):
+    """``(start, end)`` tuple version of ``_phase_wall_time``.  Used by the
+    annotator for Chrome Trace flow-event boundaries between consecutive
+    FSDP phases (e.g. all-gather→fwd compute).
+    Returns ``None`` for empty input.
+    """
     if not nodes:
         return None
     start = min(n.start_time for n in nodes)
@@ -48,8 +104,17 @@ def _phase_wall_span(nodes):
     return (start, end)
 
 
+# ---------------------------------------------------------------------------
+# Overlap / pipeline decomposition
+# ---------------------------------------------------------------------------
+
 def _compute_overlap_metrics(units: List['FSDPUnit']) -> dict:
-    """Compute overlap and serial execution efficiency from layer wall spans."""
+    """Sweep-line decomposition of the FSDP2 pipeline step into serial / overlap
+    / idle time.  Each layer's wall interval (all-gather→compute→RS) is one
+    span; counter=0 → pipeline bubble, =1 → serial (only one shard group active),
+    ≥2 → overlap (FSDP2 pipelining working).  This is the single most important
+    efficiency metric for pipelined schedules (FSDP2 + TP).
+    """
     start_end_pairs = []
     for unit in units:
         all_events = (unit.all_gather_fwd + unit.fwd_compute + unit.all_gather_bwd
@@ -102,9 +167,10 @@ def _compute_overlap_metrics(units: List['FSDPUnit']) -> dict:
 
 
 def _collect_memory(unit: 'FSDPUnit', metrics: 'Metrics'):
-    """Collect memory metrics from the unit's tree nodes.
-    memory_delta is cumulative (includes children) after attribute_memory propagation,
-    so we only sum the top-level phase nodes for each unit.
+    """Sum ``memory_delta`` (activation memory, parameter memory, gradient buffers)
+    across all FSDP phase nodes.  Peak is max(allocated, freed), approximating
+    ``torch.cuda.max_memory_allocated`` per layer.  Only meaningful when
+    ``profile_memory=True`` in ``torch.profiler`` — guarded by ``memory_has_data``.
     """
     all_nodes = (unit.all_gather_fwd + unit.fwd_compute + unit.all_gather_bwd
                  + unit.bwd_compute + unit.reduce_scatter)
@@ -124,11 +190,26 @@ def _collect_memory(unit: 'FSDPUnit', metrics: 'Metrics'):
 
 
 class Metrics:
-    def __init__(self, unit: FSDPUnit, global_optimizer_gpu: float = 0.0, global_optimizer_cpu: float = 0.0,
-                 num_units: int = 1, global_tp_ag_gpu: float = 0.0, global_tp_rs_gpu: float = 0.0,
-                 global_tp_ar_gpu: float = 0.0, tp_kernels: Optional[List[dict]] = None):
+    """Per-layer computed metrics — all derived quantities for a single FSDP unit.
+
+    One ``Metrics`` per layer: 34 for the 8B TP trace, 8 for async TP.
+    The constructor pre-computes everything from the raw ``FSDPUnit`` and global
+    aggregates so ``Bottlenecks.detect()`` has all numbers without re-traversal.
+
+    ``total_gpu`` covers FSDP NCCL collectives + aten compute + optimizer (even split).
+    ``tp_total_gpu`` is additive — the full picture for FSDP+TP models is
+    ``total_gpu + tp_total_gpu``.
+    """
+
+    def __init__(self, unit: FSDPUnit, global_optimizer_gpu: float = 0.0,
+                 global_optimizer_cpu: float = 0.0,
+                 num_units: int = 1, global_tp_ag_gpu: float = 0.0,
+                 global_tp_rs_gpu: float = 0.0,
+                 global_tp_ar_gpu: float = 0.0,
+                 tp_kernels: Optional[List[dict]] = None):
         self.layer_name = unit.layer_name
 
+        # --- Phase raw times — these are the building blocks for everything ---
         self.ag_fwd_gpu = _phase_gpu_time(unit.all_gather_fwd)
         self.ag_fwd_cpu = _phase_cpu_time(unit.all_gather_fwd)
         self.ag_fwd_wall = _phase_wall_time(unit.all_gather_fwd)
@@ -149,35 +230,54 @@ class Metrics:
         self.rs_cpu = _phase_cpu_time(unit.reduce_scatter)
         self.rs_wall = _phase_wall_time(unit.reduce_scatter)
 
+        # --- Optimizer (evenly split across layers) ---
+        # ADAMW step runs once per training step.  Dividing evenly over the
+        # FSDP shard groups is a simplification — the fused ADAMW kernel
+        # executes under its own CUDA graph, not inside any layer's span.
         self.optimizer_gpu = global_optimizer_gpu / num_units if num_units > 0 else 0.0
         self.optimizer_cpu = global_optimizer_cpu / num_units if num_units > 0 else 0.0
 
-        self.total_gpu = self.ag_fwd_gpu + self.fwd_cmp_gpu + self.ag_bwd_gpu + self.bwd_cmp_gpu + self.rs_gpu + self.optimizer_gpu
-        self.total_cpu = self.ag_fwd_cpu + self.fwd_cmp_cpu + self.ag_bwd_cpu + self.bwd_cmp_cpu + self.rs_cpu + self.optimizer_cpu
+        # --- Totals (all FSDP phases) ---
+        self.total_gpu = (self.ag_fwd_gpu + self.fwd_cmp_gpu + self.ag_bwd_gpu
+                          + self.bwd_cmp_gpu + self.rs_gpu + self.optimizer_gpu)
+        self.total_cpu = (self.ag_fwd_cpu + self.fwd_cmp_cpu + self.ag_bwd_cpu
+                          + self.bwd_cmp_cpu + self.rs_cpu + self.optimizer_cpu)
 
-        comm_gpu = self.ag_fwd_gpu + self.ag_bwd_gpu + self.rs_gpu
-        comp_gpu = self.fwd_cmp_gpu + self.bwd_cmp_gpu
+        # --- Communication vs compute ratio ---
+        comm_gpu = self.ag_fwd_gpu + self.ag_bwd_gpu + self.rs_gpu  # FSDP NCCL
+        comp_gpu = self.fwd_cmp_gpu + self.bwd_cmp_gpu  # attn/MLP/norm
         self.comm_ratio = comm_gpu / self.total_gpu if self.total_gpu > 0 else 0.0
         self.comp_ratio = comp_gpu / self.total_gpu if self.total_gpu > 0 else 0.0
 
         self.optimizer_ratio = self.optimizer_gpu / self.total_gpu if self.total_gpu > 0 else 0.0
 
-        # Layer wall span: time from first phase start to last phase end for this unit
+        # --- Layer wall span + GPU utilisation ---
+        # ``gpu_util > 1.0`` = this layer's total GPU time exceeds its CPU span
+        # (compute and NCCL on different streams → FSDP2 pipeline working).
         all_events = (unit.all_gather_fwd + unit.fwd_compute + unit.all_gather_bwd
                       + unit.bwd_compute + unit.reduce_scatter)
         self.layer_span = _phase_wall_time(all_events) if all_events else 0.0
         self.gpu_util = self.total_gpu / self.layer_span if self.layer_span > 0 else 0.0
 
+        # --- TP metrics (evenly split across layers) ---
+        # TP collectives run on their own communicator (mesh_tp) parallel to FSDP.
+        # Splitting evenly is a heuristic — the actual GPU time is per-collective,
+        # not per-layer.
         self.tp_ag_gpu = global_tp_ag_gpu / num_units if num_units > 0 else 0.0
         self.tp_rs_gpu = global_tp_rs_gpu / num_units if num_units > 0 else 0.0
         self.tp_ar_gpu = global_tp_ar_gpu / num_units if num_units > 0 else 0.0
         self.tp_total_gpu = self.tp_ag_gpu + self.tp_rs_gpu + self.tp_ar_gpu
 
+        # --- Kernel counts per phase (small-kernel detection) ---
+        # ``all_gather_copy_out`` in the 8B trace launches 300+ <4µs split kernels.
         self.ag_fwd_count = len(unit.all_gather_fwd_gpu_kernels)
         self.ag_bwd_count = len(unit.all_gather_bwd_gpu_kernels)
         self.rs_count = len(unit.reduce_scatter_gpu_kernels)
 
-        # Per-layer compute-communication overlap (TP kernels overlapping compute phases)
+        # --- Per-layer async TP overlap ---
+        # ``fwd_comp_comm_overlap`` = fraction of fwd_compute wall where TP
+        # kernels are executing.  In the async TP trace this should be 50-80%;
+        # the 8B trace has no async TP so these stay at 0.
         self.fwd_comp_comm_overlap = 0.0
         self.bwd_comp_comm_overlap = 0.0
         self.pipeline_overlap_ratio = 0.0
@@ -189,31 +289,97 @@ class Metrics:
             fwd_wall = fwd_end - fwd_start
             bwd_wall = bwd_end - bwd_start
             fwd_tp = sum(k.get('dur', 0) for k in tp_kernels
-                         if k.get('ts', 0) >= fwd_start and k.get('ts', 0) + k.get('dur', 0) <= fwd_end)
+                         if k.get('ts', 0) >= fwd_start
+                         and k.get('ts', 0) + k.get('dur', 0) <= fwd_end)
             bwd_tp = sum(k.get('dur', 0) for k in tp_kernels
-                         if k.get('ts', 0) >= bwd_start and k.get('ts', 0) + k.get('dur', 0) <= bwd_end)
+                         if k.get('ts', 0) >= bwd_start
+                         and k.get('ts', 0) + k.get('dur', 0) <= bwd_end)
             self.fwd_comp_comm_overlap = fwd_tp / fwd_wall if fwd_wall > 0 else 0.0
             self.bwd_comp_comm_overlap = bwd_tp / bwd_wall if bwd_wall > 0 else 0.0
 
-        # Memory — from tree nodes if available
+        # --- Memory (unused in both reference traces — profiling disabled) ---
         self.memory_peak = 0
         self.memory_allocated = 0
         self.memory_freed = 0
         self.memory_has_data = False
         _collect_memory(unit, self)
 
-        # Overlap — global metrics shared across units
+        # --- Overlap (backfilled by Report._compute_aggregated after all units seen) ---
         self.overlap_ratio = 0.0
         self.serial_exec_efficiency = 1.0
         self.idle_ratio = 0.0
         self.step_wall = 0.0
 
-        # True communication ratio (FSDP + TP comm / total GPU)
+        # --- Communication ratio including TP ---
         total_gpu = self.total_gpu + self.tp_total_gpu
         fsdp_comm = self.ag_fwd_gpu + self.ag_bwd_gpu + self.rs_gpu
         self.fsdp_comm_ratio = fsdp_comm / total_gpu if total_gpu > 0 else 0.0
         self.tp_comm_ratio = self.tp_total_gpu / total_gpu if total_gpu > 0 else 0.0
         self.comm_ratio = (fsdp_comm + self.tp_total_gpu) / total_gpu if total_gpu > 0 else 0.0
+
+        # --- Bottleneck sub-metrics ---
+        self._compute_kernel_metrics(unit)
+        self._compute_copy_vs_nccl_metrics(unit)
+        self._compute_wall_metrics(unit)
+
+    # ------------------------------------------------------------------
+    # Sub-metric computation (called from ``__init__``)
+    # ------------------------------------------------------------------
+
+    def _compute_kernel_metrics(self, unit):
+        """Count GPU kernels across all phases for this layer.
+        The 8B trace's ``all_gather_copy_out`` produces 300+ split_with_sizes_copy
+        kernels averaging <4µs — this is the main small-kernel hotspot.  The
+        detector fires when count ≥ 100 and average <5µs.
+        """
+        all_kernels = _collect_gpu_kernels(
+            unit.all_gather_fwd + unit.fwd_compute
+        ) + _collect_gpu_kernels(
+            unit.all_gather_bwd + unit.bwd_compute + unit.reduce_scatter
+        )
+        self.kernel_count = len(all_kernels)
+        total_dur = sum(k.get('dur', 0) for k in all_kernels)
+        self.avg_kernel_dur_us = total_dur / self.kernel_count if self.kernel_count > 0 else 0.0
+
+    def _compute_copy_vs_nccl_metrics(self, unit):
+        """Decompose all-gather GPU time into NCCL collective vs data-movement.
+        Each GPU kernel under all-gather nodes is classified by name:
+          - ``ncclKernel_*``, ``ncclDevice*`` → NCCL (wire time)
+          - ``split_with_sizes_copy``, ``aten::copy_`` → copy (host-device memcpy)
+        When copy exceeds 50% of the sum, the ``copy-heavy`` bottleneck fires.
+        This is common for small FSDP buffer sizes where memcpy overhead is
+        comparable to NCCL latency.
+        """
+        nccl_dur = 0.0
+        copy_dur = 0.0
+        for ag_node in unit.all_gather_fwd + unit.all_gather_bwd:
+            for kernel in _collect_gpu_kernels([ag_node]):
+                cat = _classify_kernel(kernel.get('name', ''))
+                dur = kernel.get('dur', 0)
+                if cat == 'nccl':
+                    nccl_dur += dur
+                elif cat == 'copy':
+                    copy_dur += dur
+        self.nccl_comm_gpu_us = nccl_dur
+        self.copy_data_movement_gpu_us = copy_dur
+
+    def _compute_wall_metrics(self, unit):
+        """CPU wall span across all phases for this layer, and its ratio to GPU time.
+        A ratio >1.5× flags host-boundness — either pipeline serialisation (CPU
+        submits this layer, moves on, returns later) or CUDA dispatch overhead.
+        Early/late layers in the 8B trace naturally have ratios of 3-10× due to
+        pipeline stagger — not necessarily pathological.
+        """
+        all_events = (unit.all_gather_fwd + unit.fwd_compute + unit.all_gather_bwd
+                      + unit.bwd_compute + unit.reduce_scatter)
+        if all_events:
+            cpu_start = min(n.start_time for n in all_events)
+            cpu_end = max(n.end_time for n in all_events)
+            self.cpu_wall_us = cpu_end - cpu_start
+            self.cpu_wall_to_gpu_ratio = self.cpu_wall_us / self.total_gpu if self.total_gpu > 0 else 0.0
+        else:
+            self.cpu_wall_us = 0.0
+            self.cpu_wall_to_gpu_ratio = 0.0
 
     def to_dict(self) -> Dict[str, float]:
         return {
@@ -245,10 +411,19 @@ class Metrics:
             "fwd_comp_comm_overlap": self.fwd_comp_comm_overlap,
             "bwd_comp_comm_overlap": self.bwd_comp_comm_overlap,
             "pipeline_overlap_ratio": self.pipeline_overlap_ratio,
+            "kernel_count": self.kernel_count,
+            "avg_kernel_dur_us": self.avg_kernel_dur_us,
+            "nccl_comm_gpu_us": self.nccl_comm_gpu_us,
+            "copy_data_movement_gpu_us": self.copy_data_movement_gpu_us,
+            "cpu_wall_us": self.cpu_wall_us,
+            "cpu_wall_to_gpu_ratio": self.cpu_wall_to_gpu_ratio,
         }
 
 
 def _format_us(v: float) -> str:
+    """Human-readable time: µs / ms / s.  Thresholds at 1000 and 1,000,000.
+    NB: May need minutes/hours for very long training steps.
+    """
     if v >= 1_000_000:
         return f"{v / 1_000_000:.2f}s"
     if v >= 1_000:
@@ -257,6 +432,12 @@ def _format_us(v: float) -> str:
 
 
 class Bottlenecks:
+    """Threshold-based bottleneck classification.  Each class attribute is a
+    tunable heuristic derived from FSDP2 + TP workloads.  Should be revisited
+    for different architectures or hardware.
+    """
+
+    # --- Classical bottleneck thresholds ---
     COMP_HEAVY_THRESHOLD = 0.70
     COMM_HEAVY_THRESHOLD = 0.40
     IO_HEAVY_THRESHOLD = 0.15
@@ -266,27 +447,50 @@ class Bottlenecks:
     OPTIMIZER_HEAVY_THRESHOLD = 0.15
     UTIL_LOW_THRESHOLD = 0.50
 
+    # --- FSDP2 / TP / async TP specific thresholds ---
+    SMALL_KERNEL_AVG_DUR_US = 5.0
+    SMALL_KERNEL_COUNT = 100
+    ASYNC_TP_OVERLAP_LOW = 0.30
+    OVERLAP_ASYMMETRY_DIFF = 0.40
+    HOST_BOUND_RATIO = 1.5
+    COPY_HEAVY_RATIO = 0.50
+    FWD_BWD_IMBALANCE = 0.30
+    SERIAL_EXEC_HIGH = 0.85
+
     @classmethod
     def detect(cls, metrics: Metrics) -> List[str]:
+        """All bottleneck checks → list of descriptive labels (empty = no bottleneck).
+        Additive: a single layer can have multiple issues.  Section A = classic
+        (compute/comm/IO/phase-dominates), Section B = FSDP2/TP-specific
+        (small-kernel, pipeline, async TP, host-bound, copy-heavy, fwd-bwd asymmetry).
+        """
         issues = []
         total_gpu = metrics.total_gpu + metrics.tp_total_gpu
         if total_gpu == 0:
             return issues
 
-        # ----- bottleneck types: compute, i/o, gpu rank -----
-        # Compute-bound
+        # ================================================================
+        # Section A — Classic bottlenecks
+        # ================================================================
+
+        # --- Compute-bound ---
+        # attn/MLP/norm (fwd_cmp + bwd_cmp) dominates total GPU.
         comp_gpu = metrics.fwd_cmp_gpu + metrics.bwd_cmp_gpu
         comp_ratio = comp_gpu / total_gpu if total_gpu > 0 else 0.0
         if comp_ratio >= cls.COMP_HEAVY_THRESHOLD:
             issues.append(f"compute-bound (comp={comp_ratio:.1%})")
 
-        # I/O-bound: significant idle time between GPU activities
+        # --- Pipeline bubble (idle between layers) ---
+        # Sweep-line found wall time where NO FSDP shard group was active —
+        # a pipeline bubble, data-loading stall, or synchronisation point.
         if metrics.idle_ratio >= cls.IO_HEAVY_THRESHOLD:
-            issues.append(f"I/O-bound ({metrics.idle_ratio:.1%} idle)")
+            issues.append(f"I/O or pipeline bubble ({metrics.idle_ratio:.1%} idle)")
 
-        # GPU-rank bottleneck: which phase dominates and limits throughput
+        # --- Communication-bound (FSDP NCCL + TP) ---
         if metrics.comm_ratio >= cls.COMM_HEAVY_THRESHOLD:
             issues.append(f"comm-bound (comm={metrics.comm_ratio:.1%})")
+
+        # --- All-gather / reduce-scatter heavy within FSDP comm ---
         fsdp_comm = metrics.ag_fwd_gpu + metrics.ag_bwd_gpu + metrics.rs_gpu
         if fsdp_comm > 0:
             ag_ratio = (metrics.ag_fwd_gpu + metrics.ag_bwd_gpu) / fsdp_comm
@@ -296,14 +500,17 @@ class Bottlenecks:
             if rs_ratio >= cls.RS_HEAVY_THRESHOLD:
                 issues.append(f"reduce-scatter-heavy ({rs_ratio:.1%} of FSDP comm)")
 
+        # --- TP-heavy (mesh_tp collectives dominate GPU) ---
         tp_total = metrics.tp_ag_gpu + metrics.tp_rs_gpu + metrics.tp_ar_gpu
         if tp_total > 0 and tp_total / total_gpu >= cls.TP_HEAVY_THRESHOLD:
             issues.append(f"TP-heavy ({tp_total/total_gpu:.1%} of total GPU)")
 
+        # --- Optimizer-heavy (ADAMW step dominates GPU) ---
         if metrics.optimizer_gpu > 0 and metrics.optimizer_ratio >= cls.OPTIMIZER_HEAVY_THRESHOLD:
             issues.append(f"optimizer-heavy ({metrics.optimizer_ratio:.1%} of total GPU)")
 
-        # GPU-rank: which phase dominates total GPU time
+        # --- Dominant phase (>35% of GPU) ---
+        # First phase exceeding 35% of total GPU time gets flagged.
         phases = [("AG fwd", metrics.ag_fwd_gpu), ("AG bwd", metrics.ag_bwd_gpu),
                   ("RS", metrics.rs_gpu), ("Fwd cmp", metrics.fwd_cmp_gpu),
                   ("Bwd cmp", metrics.bwd_cmp_gpu), ("Optimizer", metrics.optimizer_gpu),
@@ -311,19 +518,93 @@ class Bottlenecks:
         for name, val in phases:
             if total_gpu > 0 and val / total_gpu > 0.35:
                 issues.append(f"{name} dominates ({val/total_gpu:.1%} of total GPU)")
-                break  # only report the top phase
+                break
 
-        # GPU utilization
+        # --- GPU utilisation ---
         if 0 < metrics.gpu_util < cls.UTIL_LOW_THRESHOLD:
             issues.append(f"low GPU utilization ({metrics.gpu_util:.1%})")
         if metrics.gpu_util > 1.0:
             issues.append(f"high compute-comm overlap ({metrics.gpu_util:.1%} util)")
 
+        # ================================================================
+        # Section B — FSDP2 / TP / async TP specific bottlenecks
+        # ================================================================
+
+        # 1. Small-kernel bound (CUDA launch latency)
+        # FSDP2's all_gather_copy_in launches 300+ split_with_sizes / aten::empty
+        # kernels averaging <4µs — the dominant cost is CUDA driver launch latency,
+        # not GPU execution.  Fires when count ≥ 100 and average <5µs.
+        if metrics.kernel_count >= cls.SMALL_KERNEL_COUNT and metrics.avg_kernel_dur_us < cls.SMALL_KERNEL_AVG_DUR_US:
+            issues.append(f"small-kernel-bound ({metrics.kernel_count} kernels, avg {metrics.avg_kernel_dur_us:.1f}us)")
+
+        # 2. Serial pipeline (FSDP2 shard groups not overlapping)
+        # High serial_exec_efficiency (≥85%) means layers run sequentially
+        # with little overlap — GPU under-utilised.  In a well-pipelined
+        # FSDP2 step, most time should be in the overlap region.
+        if metrics.serial_exec_efficiency >= cls.SERIAL_EXEC_HIGH:
+            issues.append(f"serial pipeline ({metrics.serial_exec_efficiency:.1%} serial)")
+
+        # 3. Async TP overlap gap
+        # Only meaningful when TP is configured (mesh_tp).  Low
+        # fwd_comp_comm_overlap or bwd_comp_comm_overlap means the
+        # async TP all-gather/reduce-scatter is NOT hiding behind compute,
+        # defeating the purpose of async TP.
+        if tp_total > 0:
+            if 0 < metrics.fwd_comp_comm_overlap < cls.ASYNC_TP_OVERLAP_LOW:
+                issues.append(f"low async TP overlap (fwd: {metrics.fwd_comp_comm_overlap:.1%})")
+            if 0 < metrics.bwd_comp_comm_overlap < cls.ASYNC_TP_OVERLAP_LOW:
+                issues.append(f"low async TP overlap (bwd: {metrics.bwd_comp_comm_overlap:.1%})")
+
+            # Fwd vs bwd overlap asymmetry ≥40pp → pipeline unevenly utilised.
+            if metrics.fwd_comp_comm_overlap > 0 and metrics.bwd_comp_comm_overlap > 0:
+                diff = abs(metrics.fwd_comp_comm_overlap - metrics.bwd_comp_comm_overlap)
+                if diff >= cls.OVERLAP_ASYMMETRY_DIFF:
+                    issues.append(f"async TP asymmetry (fwd={metrics.fwd_comp_comm_overlap:.1%} vs bwd={metrics.bwd_comp_comm_overlap:.1%})")
+
+        # 4. Host-bound (CPU dispatch overhead / pipeline serialisation)
+        # CPU wall span > 1.5× GPU time indicates either:
+        # (a) pipeline serialisation — CPU submits this layer, starts the
+        #     next, and only returns much later, or
+        # (b) genuine CPU dispatch overhead (CUDA kernel launch latency).
+        # In fully-pipelined FSDP2, early/late layers naturally have wide
+        # spans (3-10×), so this is a conservative threshold.
+        if metrics.cpu_wall_to_gpu_ratio >= cls.HOST_BOUND_RATIO:
+            issues.append(f"host-bound (CPU wall {metrics.cpu_wall_to_gpu_ratio:.1f}x GPU time)")
+
+        # 5. Copy-heavy all-gather
+        # Data-movement kernels (copy_in/copy_out from fsdp::split_with_sizes_copy)
+        # exceed NCCL all-gather time inside the AG phase.  Common when the
+        # all-gather buffer is small — memcpy dominates over network latency.
+        total_copy_nccl = metrics.copy_data_movement_gpu_us + metrics.nccl_comm_gpu_us
+        if total_copy_nccl > 0:
+            copy_ratio = metrics.copy_data_movement_gpu_us / total_copy_nccl
+            if copy_ratio >= cls.COPY_HEAVY_RATIO:
+                issues.append(f"copy-heavy all-gather ({copy_ratio:.1%} copy vs NCCL)")
+
+        # 6. Fwd / Bwd compute imbalance
+        # Compares total forward (AG fwd + fwd cmp) vs backward
+        # (AG bwd + bwd cmp + RS).  Imbalance >30% may indicate gradient
+        # checkpointing, uneven activation memory, or TP async asymmetry.
+        fwd_total = metrics.ag_fwd_gpu + metrics.fwd_cmp_gpu
+        bwd_total = metrics.ag_bwd_gpu + metrics.bwd_cmp_gpu + metrics.rs_gpu
+        max_gpu = max(fwd_total, bwd_total)
+        if max_gpu > 0:
+            imbalance = abs(fwd_total - bwd_total) / max_gpu
+            if imbalance >= cls.FWD_BWD_IMBALANCE:
+                heavier = "fwd" if fwd_total > bwd_total else "bwd"
+                issues.append(f"fwd-bwd imbalance ({heavier}={imbalance:.1%} heavier)")
+
         return issues
 
 
 class Report:
-    def __init__(self, fsdp: FSDP, root_nodes: List[LogicalOperation], output_path: Optional[str] = None):
+    """Aggregates per-layer metrics into a human-readable text report and JSON markers.
+    Builds Metrics objects, computes overlap/pipeline decomposition, formats the report,
+    and serialises per-unit data + bottlenecks.
+    """
+
+    def __init__(self, fsdp: FSDP, root_nodes: List[LogicalOperation],
+                 output_path: Optional[str] = None):
         self.fsdp = fsdp
         self.root_nodes = root_nodes
         self.output_path = output_path
@@ -331,6 +612,9 @@ class Report:
         self.aggregated: Dict[str, float] = {}
 
     def generate_report(self):
+        """Build metrics, compute aggregates, format text + JSON, write to file if configured.
+        Returns ``(report_text, markers_list)``.
+        """
         num_units = len(self.fsdp.units)
         opt_gpu = self.fsdp.optimizer_gpu
         opt_cpu = self.fsdp.optimizer_cpu
@@ -359,6 +643,10 @@ class Report:
         return report, markers
 
     def _compute_aggregated(self):
+        """Cross-unit aggregates: sweep-line overlap decomposition + per-phase averages.
+        Averages are stored in ``self.aggregated`` AND back-propagated to each ``Metrics``
+        instance so bottleneck classification can use global overlap/step_wall values.
+        """
         keys = ["ag_fwd_gpu_us", "fwd_cmp_gpu_us", "ag_bwd_gpu_us", "bwd_cmp_gpu_us",
                 "rs_gpu_us", "optimizer_gpu_us", "tp_ag_gpu_us", "tp_rs_gpu_us",
                 "tp_ar_gpu_us", "tp_total_gpu_us",
@@ -395,6 +683,10 @@ class Report:
         self.aggregated["serial_time"] = ov['serial_time']
 
     def _build_report_text(self) -> str:
+        """Assemble the text report: step summary → phase metrics → efficiency →
+        overlap & pipeline → memory → per-unit table → bottleneck summary → timelines.
+        Simple string concatenation, zero templating dependencies.
+        """
         lines = []
         lines.append("=" * 70)
         lines.append("FSDP Trace Analysis Report")
@@ -495,7 +787,8 @@ class Report:
         header = (f"{'Layer':25s} {'AG fwd':>10s} {'Fwd cmp':>10s} {'TP AG':>9s} {'TP RS':>9s} "
                   f"{'TP AR':>9s} {'AG bwd':>10s} {'Bwd cmp':>10s} {'RS':>10s} "
                   f"{'Opt':>10s} {'Total':>10s} "
-                  f"{'Util':>7s}{'Span':>9s}{'F-Ovl':>8s}{'B-Ovl':>8s}{mem_col:>10s}  {'Bottleneck'}")
+                  f"{'Util':>7s}{'Span':>9s}{'F-Ovl':>8s}{'B-Ovl':>8s} "
+                  f"{'K#':>7s}{'AvgK':>7s}{mem_col:>10s}  {'Bottleneck'}")
         lines.append(header)
         lines.append("-" * len(header))
         for m in self.metrics_list:
@@ -523,6 +816,8 @@ class Report:
                 f"{_format_us(d['layer_span_us']):>9s}"
                 f"{d['fwd_comp_comm_overlap']:>7.1%} "
                 f"{d['bwd_comp_comm_overlap']:>7.1%} "
+                f"{d['kernel_count']:>7d} "
+                f"{d['avg_kernel_dur_us']:>5.1f}us "
                 f"{mem_str:>10s}  "
                 f"{label}"
             )
@@ -556,6 +851,8 @@ class Report:
         return "\n".join(lines)
 
     def _build_json_markers(self) -> List[dict]:
+        """One dict per layer: metrics + bottleneck labels for ``_markers.json`` output.
+        """
         markers = []
         for m in self.metrics_list:
             d = m.to_dict()
@@ -569,6 +866,8 @@ class Report:
 
     @staticmethod
     def get_fsdp_timeline_aggregated_string(agg: Dict[str, float]) -> str:
+        """One-line summary of average phase GPU times + overlap ratio, appended to the report.
+        """
         parts = []
         for key in ["ag_fwd_gpu_us", "fwd_cmp_gpu_us", "ag_bwd_gpu_us", "bwd_cmp_gpu_us",
                      "rs_gpu_us", "optimizer_gpu_us"]:
@@ -580,6 +879,9 @@ class Report:
 
     @staticmethod
     def get_fsdp_chronological_timeline(roots: List[LogicalOperation]) -> str:
+        """First 80 FSDP events sorted by CPU start time with offsets, for debugging
+        phase boundaries.  Skips ``backward_prefetch`` noise.
+        """
         import heapq
         from trace_parser import TraceParserHelper
 
