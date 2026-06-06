@@ -28,7 +28,7 @@ def main():
     if len(sys.argv) < 2:
         print("Usage:")
         print("  Analyze a single trace:     python main.py <trace.json> [--output report.txt]")
-        print("  Compare multiple traces:    python main.py --compare trace1.json trace2.json [--output comparison.csv]")
+        print("  Compare multiple traces:    python main.py --compare trace1.json trace2.json (etc.) [--output comparison.csv]")
         print("  Annotate trace with phases: python main.py --annotate <trace.json> [--output annotated.json]")
         print("  Text phase timeline:        python main.py --timeline <trace.json>")
         sys.exit(1)
