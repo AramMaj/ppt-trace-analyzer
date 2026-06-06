@@ -6,13 +6,11 @@ and bottleneck markers as Chrome Trace user events.
 """
 
 import json
-import os
-from collections import defaultdict
 from typing import List, Dict, Optional, Tuple
 
-from trace_parser import TraceParser, TraceParserHelper
+from trace_parser import TraceParser
 from fsdp_detector import StandardFSDPDetector
-from bottleneck_detector import Report, Bottlenecks, _phase_gpu_time
+from bottleneck_detector import Report, Bottlenecks, _phase_gpu_time, _phase_wall_span
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -38,14 +36,6 @@ PHASE_LABELS = ["AG fwd", "Fwd cmp", "AG bwd", "Bwd cmp", "RS"]
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _phase_wall_span(nodes):
-    if not nodes:
-        return None
-    start = min(n.start_time for n in nodes)
-    end = max(n.end_time for n in nodes)
-    return (start, end)
-
 
 def _get_phase_spans(unit):
     phases = []

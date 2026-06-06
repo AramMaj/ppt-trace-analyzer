@@ -29,7 +29,6 @@ FSDP Trace phase pattern (ProfilerStep#X wraps everything):
 """
 
 from typing import Dict, List, Optional, Tuple, Set, Iterator, Any
-from enum import Enum
 
 from trace_parser import LogicalOperation, TraceParserHelper
 
@@ -270,9 +269,19 @@ class StandardFSDPDetector:
                     if ch not in unit.all_gather_bwd:
                         unit.all_gather_bwd.append(ch)
 
+    @staticmethod
+    def _has_other_tids(all_nodes, profiler_tid):
+        if profiler_tid is None:
+            return False
+        return any(
+            n.raw_event and n.raw_event.get('tid') != profiler_tid
+            for n in all_nodes if n.raw_event
+        )
+
     def _detect_fwd_cmp(self, roots: List[LogicalOperation], fsdp_units: FSDP, profiler_tid: int = None):
         all_nodes = sorted(TraceParserHelper.iter_nodes(roots), key=lambda n: n.start_time)
         units = fsdp_units.units
+        has_other_tids = self._has_other_tids(all_nodes, profiler_tid)
 
         all_pre_fwd = {}
         for n in all_nodes:
@@ -314,7 +323,7 @@ class StandardFSDPDetector:
                     end_time = copy_out_end
 
             for n in all_nodes:
-                if profiler_tid is not None:
+                if has_other_tids and profiler_tid is not None:
                     n_tid = n.raw_event.get('tid') if n.raw_event else None
                     if n_tid != profiler_tid:
                         continue
@@ -325,6 +334,7 @@ class StandardFSDPDetector:
 
     def _detect_bwd_cmp(self, roots: List[LogicalOperation], fsdp_units: FSDP, profiler_tid: int = None):
         all_nodes = sorted(TraceParserHelper.iter_nodes(roots), key=lambda n: n.start_time)
+        has_other_tids = self._has_other_tids(all_nodes, profiler_tid)
 
         for unit in fsdp_units.units:
             all_pre_bwd = []
@@ -354,7 +364,7 @@ class StandardFSDPDetector:
                 continue
 
             for n in all_nodes:
-                if profiler_tid is not None:
+                if has_other_tids and profiler_tid is not None:
                     n_tid = n.raw_event.get('tid') if n.raw_event else None
                     if n_tid == profiler_tid:
                         continue

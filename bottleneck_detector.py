@@ -13,9 +13,8 @@ Rückgabe
 """
 
 import json
-from typing import Dict, List, Optional, Tuple, Set, Iterator, Any
+from typing import Dict, List, Optional, Set, Iterator, Any
 from collections import defaultdict
-from dataclasses import dataclass, field
 
 from trace_parser import LogicalOperation
 from fsdp_detector import FSDP, FSDPUnit, FSDP_PREFIXES
@@ -39,6 +38,14 @@ def _phase_wall_time(nodes: List[LogicalOperation]) -> float:
     start = min(n.start_time for n in nodes)
     end = max(n.end_time for n in nodes)
     return end - start
+
+
+def _phase_wall_span(nodes):
+    if not nodes:
+        return None
+    start = min(n.start_time for n in nodes)
+    end = max(n.end_time for n in nodes)
+    return (start, end)
 
 
 def _compute_overlap_metrics(units: List['FSDPUnit']) -> dict:
