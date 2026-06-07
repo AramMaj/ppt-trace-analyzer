@@ -5,10 +5,13 @@ Six sections:
 1. Low-level helpers (GPU kernel collection, NCCL vs copy vs compute classification)
 2. Overlap/pipeline decomposition (sweep-line across layer wall spans)
 3. Memory collection from ``[memory]`` trace events
-4. Metrics class — per-FSDP-shard-group computed values (GPU time, comm ratio, overlap, etc.)
-5. Bottlenecks class — threshold-based detection of 12+ bottleneck types (compute-bound,
-   comm-bound, copy-heavy all-gather, async TP overlap asymmetry, host-bound, etc.)
-6. Report class — aggregation, formatting, JSON markers
+4. ModelConfig dataclass — stores model hyperparameters and computes estimated FLOPs
+5. Metrics class — per-FSDP-shard-group computed values (GPU time, comm ratio, overlap,
+   compute-to-comm ratio, overlap efficiency, MFU/HFU, tokens/sec/GPU, etc.)
+6. Bottlenecks class — threshold-based detection of 16+ bottleneck types (compute-bound,
+   comm-bound, copy-heavy all-gather, async TP overlap asymmetry, host-bound,
+   inter-node BW, HBM bandwidth, sync TP on critical path, NVLink saturation, etc.)
+7. Report class — aggregation, formatting, JSON markers
 """
 
 import json
@@ -192,6 +195,101 @@ def _collect_memory(unit: 'FSDPUnit', metrics: 'Metrics'):
         metrics.memory_peak = max(total_alloc, total_free)
 
 
+# ---------------------------------------------------------------------------
+# Model configuration — FLOP accounting for MFU/HFU/tokens-per-second
+# ---------------------------------------------------------------------------
+
+class ModelConfig:
+    """Model hyperparameters for FLOP-count estimation and throughput metrics.
+
+    All dimensions can be left at zero / None — in that case MFU, HFU, and
+    tokens/sec are omitted from the report (``compute_throughput_metrics``
+    returns zeros).
+
+    ``num_gpus`` affects per-GPU throughput scaling.  ``activation_checkpointing``
+    is a fraction (0..1) of layers using checkpointing, or ``None`` if unknown.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 0,
+        num_layers: int = 0,
+        num_heads: int = 0,
+        seq_len: int = 0,
+        vocab_size: int = 0,
+        batch_size: int = 0,
+        num_gpus: int = 1,
+        activation_checkpointing: Optional[float] = None,
+        precision_bits: int = 16,
+        gpu_peak_tflops: float = 989.0,   # H100-SXM bf16
+        gpu_hbm_bw_gbps: float = 3350.0,   # H100-SXM HBM bandwidth GB/s
+        intermediate_dim: Optional[int] = None,
+        num_kv_heads: Optional[int] = None,
+    ):
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.seq_len = seq_len
+        self.vocab_size = vocab_size
+        self.batch_size = batch_size
+        self.num_gpus = num_gpus
+        self.activation_checkpointing = activation_checkpointing
+        self.precision_bits = precision_bits
+        self.gpu_peak_tflops = gpu_peak_tflops
+        self.gpu_hbm_bw_gbps = gpu_hbm_bw_gbps
+        self.intermediate_dim = intermediate_dim or 4 * hidden_dim
+        self.num_kv_heads = num_kv_heads or num_heads
+
+    @property
+    def is_configured(self) -> bool:
+        return self.hidden_dim > 0 and self.num_layers > 0 and self.batch_size > 0
+
+    def estimate_flops_per_step(self) -> float:
+        """Estimated FLOPs for one training step (forward + backward).
+
+        Based on the standard transformer FLOP formula from Kaplan et al.:
+        forward ≈ 2 * num_layers * (2 * hidden_dim * seq_len * batch_size * (
+            4 * hidden_dim  [attention QKV proj + output]
+            + 3 * intermediate_dim * hidden_dim * 2  [MLP gate+up+down]
+        ))
+
+        Backward is ~2× forward.  Total = 3 × forward for no checkpointing,
+        or (2 + activation_checkpointing) × forward when checkpointing is used.
+
+        Returns 0.0 when not configured.
+        """
+        if not self.is_configured:
+            return 0.0
+        h = self.hidden_dim
+        s = self.seq_len
+        b = self.batch_size
+        n = self.num_layers
+        ffn = self.intermediate_dim
+
+        # Per-token, per-layer FLOPs
+        attn_flops = 4 * h * h          # QKV projection + output projection (ignoring heads)
+        mlp_flops = 3 * 2 * h * ffn     # gate_proj + up_proj + down_proj (×2 for FWD)
+        per_layer_flops = attn_flops + mlp_flops
+
+        # Embedding + LM head (if vocab_size > 0)
+        embed_flops = 2 * h * self.vocab_size if self.vocab_size > 0 else 0
+
+        forward_flops = b * s * (n * per_layer_flops + embed_flops)
+        backward_mult = 3.0 if self.activation_checkpointing is None else 2.0 + self.activation_checkpointing
+        return forward_flops * backward_mult
+
+    def estimate_tokens_per_step(self) -> int:
+        return self.batch_size * self.seq_len if self.batch_size and self.seq_len else 0
+
+    @property
+    def gpu_peak_flops(self) -> float:
+        return self.gpu_peak_tflops * 1e12
+
+    @property
+    def gpu_hbm_bw_bytes_per_sec(self) -> float:
+        return self.gpu_hbm_bw_gbps * 1e9
+
+
 class Metrics:
     """Per-layer computed metrics — all derived quantities for a single FSDP unit.
 
@@ -234,9 +332,6 @@ class Metrics:
         self.rs_wall = _phase_wall_time(unit.reduce_scatter)
 
         # --- Optimizer (evenly split across layers) ---
-        # ADAMW step runs once per training step.  Dividing evenly over the
-        # FSDP shard groups is a simplification — the fused ADAMW kernel
-        # executes under its own CUDA graph, not inside any layer's span.
         self.optimizer_gpu = global_optimizer_gpu / num_units if num_units > 0 else 0.0
         self.optimizer_cpu = global_optimizer_cpu / num_units if num_units > 0 else 0.0
 
@@ -254,33 +349,38 @@ class Metrics:
 
         self.optimizer_ratio = self.optimizer_gpu / self.total_gpu if self.total_gpu > 0 else 0.0
 
+        # --- Per-phase overlap efficiency ---
+        # How well each collective is hidden behind compute:
+        #   GPU time / CPU wall span → 1.0 = fully exposed (no overlap),
+        #   << 1.0 = well hidden (GPU execution overlaps with other work).
+        self.ag_fwd_overlap_efficiency = (
+            self.ag_fwd_gpu / self.ag_fwd_wall if self.ag_fwd_wall > 0 else 0.0
+        )
+        self.rs_overlap_efficiency = (
+            self.rs_gpu / self.rs_wall if self.rs_wall > 0 else 0.0
+        )
+        self.ag_bwd_overlap_efficiency = (
+            self.ag_bwd_gpu / self.ag_bwd_wall if self.ag_bwd_wall > 0 else 0.0
+        )
+
         # --- Layer wall span + GPU utilisation ---
-        # ``gpu_util > 1.0`` = this layer's total GPU time exceeds its CPU span
-        # (compute and NCCL on different streams → FSDP2 pipeline working).
         all_events = (unit.all_gather_fwd + unit.fwd_compute + unit.all_gather_bwd
                       + unit.bwd_compute + unit.reduce_scatter)
         self.layer_span = _phase_wall_time(all_events) if all_events else 0.0
         self.gpu_util = self.total_gpu / self.layer_span if self.layer_span > 0 else 0.0
 
         # --- TP metrics (evenly split across layers) ---
-        # TP collectives run on their own communicator (mesh_tp) parallel to FSDP.
-        # Splitting evenly is a heuristic — the actual GPU time is per-collective,
-        # not per-layer.
         self.tp_ag_gpu = global_tp_ag_gpu / num_units if num_units > 0 else 0.0
         self.tp_rs_gpu = global_tp_rs_gpu / num_units if num_units > 0 else 0.0
         self.tp_ar_gpu = global_tp_ar_gpu / num_units if num_units > 0 else 0.0
         self.tp_total_gpu = self.tp_ag_gpu + self.tp_rs_gpu + self.tp_ar_gpu
 
         # --- Kernel counts per phase (small-kernel detection) ---
-        # ``all_gather_copy_out`` in the 8B trace launches 300+ <4µs split kernels.
         self.ag_fwd_count = len(unit.all_gather_fwd_gpu_kernels)
         self.ag_bwd_count = len(unit.all_gather_bwd_gpu_kernels)
         self.rs_count = len(unit.reduce_scatter_gpu_kernels)
 
         # --- Per-layer async TP overlap ---
-        # ``fwd_comp_comm_overlap`` = fraction of fwd_compute wall where TP
-        # kernels are executing.  In the async TP trace this should be 50-80%;
-        # the 8B trace has no async TP so these stay at 0.
         self.fwd_comp_comm_overlap = 0.0
         self.bwd_comp_comm_overlap = 0.0
         self.pipeline_overlap_ratio = 0.0
@@ -300,14 +400,14 @@ class Metrics:
             self.fwd_comp_comm_overlap = fwd_tp / fwd_wall if fwd_wall > 0 else 0.0
             self.bwd_comp_comm_overlap = bwd_tp / bwd_wall if bwd_wall > 0 else 0.0
 
-        # --- Memory (unused in both reference traces — profiling disabled) ---
+        # --- Memory ---
         self.memory_peak = 0
         self.memory_allocated = 0
         self.memory_freed = 0
         self.memory_has_data = False
         _collect_memory(unit, self)
 
-        # --- Overlap (backfilled by Report._compute_aggregated after all units seen) ---
+        # --- Overlap (backfilled by Report._compute_aggregated) ---
         self.overlap_ratio = 0.0
         self.serial_exec_efficiency = 1.0
         self.idle_ratio = 0.0
@@ -320,10 +420,70 @@ class Metrics:
         self.tp_comm_ratio = self.tp_total_gpu / total_gpu if total_gpu > 0 else 0.0
         self.comm_ratio = (fsdp_comm + self.tp_total_gpu) / total_gpu if total_gpu > 0 else 0.0
 
+        # --- Compute-to-communicate ratio ---
+        # Arithmetic intensity proxy: compute GPU time ÷ all comm GPU time.
+        # Higher = more compute-heavy; <1.0 = comm-dominated.
+        all_comm = fsdp_comm + self.tp_total_gpu
+        comp = self.fwd_cmp_gpu + self.bwd_cmp_gpu
+        self.compute_to_comm_ratio = comp / all_comm if all_comm > 0 else float('inf')
+
+        # --- Exposed communication fraction ---
+        # Fraction of FSDP communication that is NOT hidden behind compute.
+        # Computed from overlap efficiency: if AG runs in 100µs but spans 900µs
+        # of wall time, only 100/900 = 11% is "exposed" (the rest overlaps
+        # with other streams / compute).  Exposed = 1 - efficiency.
+        # Higher exposed_comm → worse overlap → more pipeline bubble.
+        self.exposed_comm_fraction = 0.0
+        effs = [self.ag_fwd_overlap_efficiency, self.rs_overlap_efficiency,
+                self.ag_bwd_overlap_efficiency]
+        valid = [e for e in effs if e > 0]
+        if valid:
+            self.exposed_comm_fraction = sum(valid) / len(valid)
+
         # --- Bottleneck sub-metrics ---
         self._compute_kernel_metrics(unit)
         self._compute_copy_vs_nccl_metrics(unit)
         self._compute_wall_metrics(unit)
+        self._compute_gpu_kernel_classification(unit)
+
+    def compute_throughput_metrics(self, model_config: ModelConfig):
+        """Populate MFU, HFU, tokens/sec/GPU from model config.
+
+        Call this after ``__init__`` and after ``overlap_ratio / step_wall``
+        have been backfilled by ``Report._compute_aggregated``.  Metrics are
+        stored as attributes on ``self`` for downstream use.
+        """
+        self.tokens_per_second_per_gpu = 0.0
+        self.mfu = 0.0
+        self.hfu = 0.0
+        self.estimated_flops_per_step = 0.0
+
+        if not model_config.is_configured:
+            return
+
+        step_wall_us = self.step_wall if self.step_wall > 0 else self.layer_span
+        if step_wall_us <= 0:
+            return
+
+        step_wall_s = step_wall_us / 1_000_000
+        tokens_per_step = model_config.estimate_tokens_per_step()
+        num_gpus = model_config.num_gpus
+
+        self.tokens_per_second_per_gpu = tokens_per_step / step_wall_s / num_gpus
+
+        flops = model_config.estimate_flops_per_step()
+        self.estimated_flops_per_step = flops
+        observed_flops = flops / step_wall_s
+        self.mfu = observed_flops / model_config.gpu_peak_flops / num_gpus
+
+        if model_config.activation_checkpointing is not None:
+            # HFU accounts for recompute: with activation checkpointing,
+            # backward re-computes the forward activations.  The multiplier is
+            # (2 + c) / 3 where c is the checkpointing fraction.
+            checkpoint_mult = (2.0 + model_config.activation_checkpointing) / 3.0
+            self.hfu = self.mfu / checkpoint_mult if checkpoint_mult > 0 else 0.0
+        else:
+            self.hfu = self.mfu
 
     # ------------------------------------------------------------------
     # Sub-metric computation (called from ``__init__``)
@@ -384,6 +544,31 @@ class Metrics:
             self.cpu_wall_us = 0.0
             self.cpu_wall_to_gpu_ratio = 0.0
 
+    def _compute_gpu_kernel_classification(self, unit):
+        """Classify all GPU kernels across compute phases (fwd+bwd) into
+        compute vs NCCL vs copy, and track their count and mean duration.
+
+        These are used for HBM-bandwidth-bound detection: if compute kernels
+        have low average duration (< 5µs) they are likely launch-latency-bound
+        rather than arithmetic-bound, indicating HBM BW may be the limiter.
+        """
+        comp_kernels = _collect_gpu_kernels(unit.fwd_compute + unit.bwd_compute)
+        self.comp_kernel_count = len(comp_kernels)
+        self.comp_kernel_avg_dur_us = (
+            sum(k.get('dur', 0) for k in comp_kernels) / self.comp_kernel_count
+            if self.comp_kernel_count > 0 else 0.0
+        )
+        # Count NCCL and copy kernels in compute phases
+        self.nccl_in_comp_count = sum(
+            1 for k in comp_kernels if 'nccl' in k.get('name', '').lower()
+        )
+        self.copy_in_comp_count = sum(
+            1 for k in comp_kernels
+            if any(p in k.get('name', '').lower() for p in ('copy', 'memcpy', 'memset'))
+        )
+        # Total bytes estimate: assume ~2 bytes per FLOP for bf16 matmul
+        self.estimated_bytes_moved = self.comp_kernel_count * self.comp_kernel_avg_dur_us * 2e9 / 1e6  # rough
+
     def to_dict(self) -> Dict[str, float]:
         return {
             "ag_fwd_gpu_us": self.ag_fwd_gpu,
@@ -420,6 +605,21 @@ class Metrics:
             "copy_data_movement_gpu_us": self.copy_data_movement_gpu_us,
             "cpu_wall_us": self.cpu_wall_us,
             "cpu_wall_to_gpu_ratio": self.cpu_wall_to_gpu_ratio,
+            # New universal metrics
+            "compute_to_comm_ratio": self.compute_to_comm_ratio,
+            "ag_fwd_overlap_efficiency": self.ag_fwd_overlap_efficiency,
+            "rs_overlap_efficiency": self.rs_overlap_efficiency,
+            "ag_bwd_overlap_efficiency": self.ag_bwd_overlap_efficiency,
+            "exposed_comm_fraction": self.exposed_comm_fraction,
+            "comp_kernel_count": self.comp_kernel_count,
+            "comp_kernel_avg_dur_us": self.comp_kernel_avg_dur_us,
+            "nccl_in_comp_count": self.nccl_in_comp_count,
+            "copy_in_comp_count": self.copy_in_comp_count,
+            # Throughput (populated by compute_throughput_metrics)
+            "tokens_per_second_per_gpu": getattr(self, 'tokens_per_second_per_gpu', 0.0),
+            "mfu": getattr(self, 'mfu', 0.0),
+            "hfu": getattr(self, 'hfu', 0.0),
+            "estimated_flops_per_step": getattr(self, 'estimated_flops_per_step', 0.0),
         }
 
 
@@ -459,6 +659,24 @@ class Bottlenecks:
     COPY_HEAVY_RATIO = 0.50
     FWD_BWD_IMBALANCE = 0.30
     SERIAL_EXEC_HIGH = 0.85
+
+    # --- New FSDP2 communication bottleneck thresholds ---
+    # Inter-node bandwidth: AG fwd GPU time ≥ 80% of fwd compute → BW-limited
+    AG_LATENCY_EXPOSED_RATIO = 0.80
+    # HBM bandwidth: compute kernels avg < 8µs and GPU util < 50%
+    # suggests memory-bandwidth-bound (kernels too short to be arithmetic-heavy)
+    HBM_BOUND_AVG_KERNEL_US = 8.0
+    HBM_BOUND_GPU_UTIL = 0.50
+    # Gradient accumulation / injection pressure: RS not hidden behind compute,
+    # RS overlap efficiency ≥ 0.70 means RS GPU time dominates its wall span
+    RS_EXPOSED_THRESHOLD = 0.70
+    # Synchronous TP: TP GPU time ≥ 10% of compute, but TP overlap < 0.20
+    # (TP collectives block on critical path, defeating async TP)
+    TP_ON_CRITICAL_PATH_RATIO = 0.10
+    TP_ON_CRITICAL_PATH_OVERLAP = 0.20
+    # NVLink saturation: many (≥ 50) small (< 10µs avg) TP kernels
+    NVLINK_SAT_COUNT = 50
+    NVLINK_SAT_AVG_US = 10.0
 
     @classmethod
     def detect(cls, metrics: Metrics) -> List[str]:
@@ -585,9 +803,6 @@ class Bottlenecks:
                 issues.append(f"copy-heavy all-gather ({copy_ratio:.1%} copy vs NCCL)")
 
         # 6. Fwd / Bwd compute imbalance
-        # Compares total forward (AG fwd + fwd cmp) vs backward
-        # (AG bwd + bwd cmp + RS).  Imbalance >30% may indicate gradient
-        # checkpointing, uneven activation memory, or TP async asymmetry.
         fwd_total = metrics.ag_fwd_gpu + metrics.fwd_cmp_gpu
         bwd_total = metrics.ag_bwd_gpu + metrics.bwd_cmp_gpu + metrics.rs_gpu
         max_gpu = max(fwd_total, bwd_total)
@@ -596,6 +811,72 @@ class Bottlenecks:
             if imbalance >= cls.FWD_BWD_IMBALANCE:
                 heavier = "fwd" if fwd_total > bwd_total else "bwd"
                 issues.append(f"fwd-bwd imbalance ({heavier}={imbalance:.1%} heavier)")
+
+        # ================================================================
+        # Section C — Communication-hiding / BW bottlenecks (new)
+        # ================================================================
+
+        # 7. Inter-node bandwidth (all-gather not hidden behind compute)
+        # If AG fwd GPU time ≥ 80% of fwd compute GPU, the all-gather is
+        # mostly exposed — the GPU stalls waiting for AG to finish before
+        # compute can start.  This is the classic inter-node BW bottleneck.
+        if metrics.fwd_cmp_gpu > 0:
+            ag_exposed = metrics.ag_fwd_gpu / metrics.fwd_cmp_gpu
+            if ag_exposed >= cls.AG_LATENCY_EXPOSED_RATIO:
+                issues.append(f"inter-node BW (AG={ag_exposed:.1%} of fwd compute)")
+
+        # 8. HBM bandwidth bound
+        # Low GPU utilisation despite a compute-heavy profile suggests the
+        # compute kernels themselves are memory-bandwidth-limited (short
+        # kernels hitting HBM BW ceiling rather than compute-bound).
+        if (metrics.comp_ratio >= cls.COMP_HEAVY_THRESHOLD
+                and metrics.gpu_util < cls.HBM_BOUND_GPU_UTIL
+                and metrics.comp_kernel_avg_dur_us < cls.HBM_BOUND_AVG_KERNEL_US):
+            issues.append(f"HBM bandwidth-bound "
+                          f"(comp kernels avg {metrics.comp_kernel_avg_dur_us:.1f}us, "
+                          f"util {metrics.gpu_util:.1%})")
+
+        # 9. Gradient accumulation / injection bandwidth pressure
+        # Reduce-scatter is not hidden behind backward compute → RS GPU time
+        # dominates its wall span.  High RS overlap efficiency means RS is
+        # exposed on the critical path rather than overlapping with bwd compute.
+        if metrics.rs_overlap_efficiency >= cls.RS_EXPOSED_THRESHOLD:
+            issues.append(f"RS injection pressure "
+                          f"(RS overlap efficiency={metrics.rs_overlap_efficiency:.1%})")
+
+        # 10. Synchronous TP on critical path
+        # TP collectives exist but have low overlap with compute → they block
+        # the critical path (defeating async TP's purpose).
+        if metrics.tp_total_gpu > 0 and metrics.fwd_cmp_gpu > 0:
+            tp_over_fwd = metrics.tp_total_gpu / metrics.fwd_cmp_gpu
+            if (tp_over_fwd >= cls.TP_ON_CRITICAL_PATH_RATIO
+                    and metrics.fwd_comp_comm_overlap < cls.TP_ON_CRITICAL_PATH_OVERLAP):
+                issues.append(f"synchronous TP on critical path "
+                              f"(TP/fwd={tp_over_fwd:.1%}, overlap={metrics.fwd_comp_comm_overlap:.1%})")
+
+        # 11. NVLink saturation (TP kernel spray)
+        # High count of very small TP kernels suggests NVLink bandwidth
+        # fragmentation — too many small messages, not saturating NVLink.
+        tp_kernel_count = getattr(metrics, 'tp_kernel_count', metrics.nccl_in_comp_count)
+        tp_avg_us = getattr(metrics, 'tp_avg_kernel_us', metrics.comp_kernel_avg_dur_us)
+        if (metrics.tp_total_gpu > 0
+                and tp_kernel_count >= cls.NVLINK_SAT_COUNT
+                and tp_avg_us < cls.NVLINK_SAT_AVG_US):
+            issues.append(f"NVLink saturation "
+                          f"({tp_kernel_count} small TP kernels, avg {tp_avg_us:.1f}us)")
+
+        # 12. No comm/compute overlap (FSDP2 pipeline idle)
+        # AG fwd overlap efficiency close to 1.0 means the all-gather runs
+        # entirely serially with no overlap → classic FSDP2 pipeline bubble.
+        if metrics.ag_fwd_overlap_efficiency > 0 and metrics.ag_fwd_overlap_efficiency >= 0.85:
+            issues.append(f"no comm/compute overlap "
+                          f"(AG overlap efficiency={metrics.ag_fwd_overlap_efficiency:.1%})")
+
+        # 13. Exposed communication (general overlap quality)
+        # Composite metric across all comm phases.  >50% exposed → poor hiding.
+        if metrics.exposed_comm_fraction > 0.50:
+            issues.append(f"exposed communication "
+                          f"(comm hiding efficiency={1-metrics.exposed_comm_fraction:.1%})")
 
         return issues
 
@@ -607,12 +888,15 @@ class Report:
     """
 
     def __init__(self, fsdp: FSDP, root_nodes: List[LogicalOperation],
-                 output_path: Optional[str] = None):
+                 output_path: Optional[str] = None,
+                 model_config: Optional[ModelConfig] = None):
         self.fsdp = fsdp
         self.root_nodes = root_nodes
         self.output_path = output_path
+        self.model_config = model_config
         self.metrics_list: List[Metrics] = []
         self.aggregated: Dict[str, float] = {}
+        self.throughput_metrics: Dict[str, float] = {}
 
     def generate_report(self):
         """Build metrics, compute aggregates, format text + JSON, write to file if configured.
@@ -624,13 +908,13 @@ class Report:
         tp_ag = self.fsdp.tp_all_gather_gpu
         tp_rs = self.fsdp.tp_reduce_scatter_gpu
         tp_ar = self.fsdp.tp_all_reduce_gpu
-        # Collect all TP kernel events for per-layer overlap attribution
         tp_kernels = list(self.fsdp.tp_all_gather + self.fsdp.tp_reduce_scatter + self.fsdp.tp_all_reduce)
         for unit in self.fsdp.units:
             self.metrics_list.append(Metrics(unit, opt_gpu, opt_cpu, num_units,
                                              tp_ag, tp_rs, tp_ar, tp_kernels=tp_kernels))
 
         self._compute_aggregated()
+        self._compute_throughput()
         report = self._build_report_text()
 
         if self.output_path:
@@ -685,6 +969,42 @@ class Report:
         self.aggregated["overlap_time"] = ov['overlap_time']
         self.aggregated["serial_time"] = ov['serial_time']
 
+    def _compute_throughput(self):
+        """Compute MFU / HFU / tokens-per-second from model config and step wall.
+
+        Populates ``self.throughput_metrics`` dict and calls
+        ``compute_throughput_metrics`` on each per-layer Metrics instance.
+        """
+        cfg = self.model_config
+        self.throughput_metrics = {
+            'tokens_per_second_per_gpu': 0.0,
+            'mfu': 0.0,
+            'hfu': 0.0,
+            'estimated_flops_per_step': 0.0,
+        }
+        if cfg is None or not cfg.is_configured:
+            return
+
+        step_wall_us = self.aggregated.get('step_wall', 0.0)
+        if step_wall_us <= 0:
+            return
+
+        for m in self.metrics_list:
+            m.compute_throughput_metrics(cfg)
+
+        tps = sum(getattr(m, 'tokens_per_second_per_gpu', 0.0) for m in self.metrics_list)
+        avg_tps = tps / len(self.metrics_list) if self.metrics_list else 0.0
+        avg_mfu = sum(getattr(m, 'mfu', 0.0) for m in self.metrics_list) / len(self.metrics_list) if self.metrics_list else 0.0
+        avg_hfu = sum(getattr(m, 'hfu', 0.0) for m in self.metrics_list) / len(self.metrics_list) if self.metrics_list else 0.0
+        flops = self.metrics_list[0].estimated_flops_per_step if self.metrics_list else 0.0
+
+        self.throughput_metrics = {
+            'tokens_per_second_per_gpu': avg_tps,
+            'mfu': avg_mfu,
+            'hfu': avg_hfu,
+            'estimated_flops_per_step': flops,
+        }
+
     def _build_report_text(self) -> str:
         """Assemble the text report: step summary → phase metrics → efficiency →
         overlap & pipeline → memory → per-unit table → bottleneck summary → timelines.
@@ -737,14 +1057,26 @@ class Report:
         lines.append(f"  {'Total CPU':25s} {_format_us(self.aggregated.get('total_cpu_us', 0)):>10s}")
         lines.append("")
 
+        # Throughput (MFU / HFU / tokens/sec) — requires ModelConfig
+        tp = self.throughput_metrics
+        if tp.get('mfu', 0) > 0:
+            lines.append("--- Throughput ---")
+            lines.append(f"  MFU:                   {tp['mfu']:.1%}")
+            if tp.get('hfu', 0) > 0 and abs(tp['hfu'] - tp['mfu']) > 0.001:
+                lines.append(f"  HFU:                   {tp['hfu']:.1%} (w/ activation checkpointing)")
+            lines.append(f"  Tokens/sec/GPU:        {tp['tokens_per_second_per_gpu']:.1f}")
+            lines.append(f"  Estimated FLOPs/step:  {tp['estimated_flops_per_step']:.2e}")
+            lines.append(f"  Step wall:             {_format_us(self.aggregated.get('step_wall', 0))}")
+            lines.append("")
+
         # Efficiency metrics
         lines.append("--- Efficiency ---")
         comp_gpu = self.aggregated.get("fwd_cmp_gpu_us", 0) + self.aggregated.get("bwd_cmp_gpu_us", 0)
         tp_total = self.aggregated.get("tp_total_gpu_us", 0)
         fsdp_comm = self.aggregated.get("ag_fwd_gpu_us", 0) + self.aggregated.get("ag_bwd_gpu_us", 0) + self.aggregated.get("rs_gpu_us", 0)
         opt_ratio = self.aggregated.get('optimizer_ratio', 0)
-        true_comp = comp_gpu - tp_total  # TP kernels are counted inside comp GPU time
-        total = total_gpu + tp_total  # include TP in total for true ratio
+        true_comp = comp_gpu - tp_total
+        total = total_gpu + tp_total
         lines.append(f"  True compute:         {true_comp / total:.1%} (ex-TP)")
         lines.append(f"  TP communication:     {tp_total / total:.1%}")
         lines.append(f"  FSDP communication:   {fsdp_comm / total:.1%}")
@@ -754,6 +1086,27 @@ class Report:
         max_span = max(m.layer_span for m in self.metrics_list) if self.metrics_list else 0.0
         min_span = min(m.layer_span for m in self.metrics_list if m.layer_span > 0) or max_span
         lines.append(f"  Layer span imbalance: {max_span / min_span:.1f}x (max/min layer span ratio)")
+
+        # Compute-to-communicate ratio
+        avg_ctc = sum(m.compute_to_comm_ratio for m in self.metrics_list) / len(self.metrics_list) if self.metrics_list else 0.0
+        lines.append(f"  Compute-to-comm:      {avg_ctc:.2f}× (compute GPU / comm GPU)")
+        lines.append("")
+
+        # Per-phase overlap efficiency
+        lines.append("--- Comm Overlap Efficiency ---")
+        lines.append(f"  {'Phase':25s} {'Avg eff':>10s} {'Min':>10s} {'Max':>10s} {'Interpretation':>35s}")
+        lines.append(f"  {'-----':25s} {'--------':>10s} {'---':>10s} {'---':>10s} {'---------------':>35s}")
+        for label, attr in [("AG fwd", "ag_fwd_overlap_efficiency"),
+                            ("AG bwd", "ag_bwd_overlap_efficiency"),
+                            ("RS", "rs_overlap_efficiency")]:
+            vals = [getattr(m, attr) for m in self.metrics_list]
+            avg = sum(vals) / len(vals) if vals else 0.0
+            mn = min(vals) if vals else 0.0
+            mx = max(vals) if vals else 0.0
+            interp = "exposed" if avg >= 0.7 else "hidden" if avg < 0.3 else "partial"
+            lines.append(f"  {label:25s} {avg:>9.1%} {mn:>9.1%} {mx:>9.1%}  {interp:>35s}")
+        exp = sum(m.exposed_comm_fraction for m in self.metrics_list) / len(self.metrics_list) if self.metrics_list else 0.0
+        lines.append(f"  {'Exposed comm (avg)':25s} {exp:>9.1%}")
         lines.append("")
 
         # Overlap / Serial Execution Efficiency
@@ -790,7 +1143,8 @@ class Report:
         header = (f"{'Layer':25s} {'AG fwd':>10s} {'Fwd cmp':>10s} {'TP AG':>9s} {'TP RS':>9s} "
                   f"{'TP AR':>9s} {'AG bwd':>10s} {'Bwd cmp':>10s} {'RS':>10s} "
                   f"{'Opt':>10s} {'Total':>10s} "
-                  f"{'Util':>7s}{'Span':>9s}{'F-Ovl':>8s}{'B-Ovl':>8s} "
+                  f"{'Util':>6s}{'CtC':>6s}{'ExpC':>6s}"
+                  f"{'Span':>9s}{'F-Ovl':>8s}{'B-Ovl':>8s} "
                   f"{'K#':>7s}{'AvgK':>7s}{mem_col:>10s}  {'Bottleneck'}")
         lines.append(header)
         lines.append("-" * len(header))
@@ -803,6 +1157,9 @@ class Report:
                 mem_str = f"{d['memory_peak']/(1024**3):>9.1f}G"
             elif mem_available:
                 mem_str = f"{'N/A':>9s}"
+            ctc = d.get('compute_to_comm_ratio', 0)
+            ctc_str = f"{ctc:.1f}x" if ctc != float('inf') else "inf"
+            exp_comm = d.get('exposed_comm_fraction', 0)
             lines.append(
                 f"{m.layer_name:25s} "
                 f"{_format_us(d['ag_fwd_gpu_us']):>10s} "
@@ -815,7 +1172,9 @@ class Report:
                 f"{_format_us(d['rs_gpu_us']):>10s} "
                 f"{_format_us(d['optimizer_gpu_us']):>10s} "
                 f"{_format_us(d['total_gpu_us']):>10s} "
-                f"{d['gpu_util']:>6.1%} "
+                f"{d['gpu_util']:>5.1%} "
+                f"{ctc_str:>5s} "
+                f"{exp_comm:>5.1%} "
                 f"{_format_us(d['layer_span_us']):>9s}"
                 f"{d['fwd_comp_comm_overlap']:>7.1%} "
                 f"{d['bwd_comp_comm_overlap']:>7.1%} "
@@ -855,16 +1214,27 @@ class Report:
 
     def _build_json_markers(self) -> List[dict]:
         """One dict per layer: metrics + bottleneck labels for ``_markers.json`` output.
+        Includes aggregated throughput metrics (MFU, HFU, TPS) in the first entry.
         """
         markers = []
-        for m in self.metrics_list:
+        for i, m in enumerate(self.metrics_list):
             d = m.to_dict()
             issues = Bottlenecks.detect(m)
-            markers.append({
+            entry = {
                 "layer": m.layer_name,
                 "metrics": d,
                 "bottlenecks": issues,
-            })
+            }
+            if i == 0 and self.throughput_metrics.get('mfu', 0) > 0:
+                entry["throughput"] = {
+                    "mfu": self.throughput_metrics['mfu'],
+                    "hfu": self.throughput_metrics['hfu'],
+                    "tokens_per_second_per_gpu": self.throughput_metrics['tokens_per_second_per_gpu'],
+                    "estimated_flops_per_step": self.throughput_metrics['estimated_flops_per_step'],
+                }
+                entry["aggregated"] = {k: v for k, v in self.aggregated.items()
+                                       if isinstance(v, (int, float))}
+            markers.append(entry)
         return markers
 
     @staticmethod

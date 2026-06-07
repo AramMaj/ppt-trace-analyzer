@@ -20,7 +20,7 @@ from typing import List, Dict, Optional, Tuple
 
 from trace_parser import TraceParser
 from fsdp_detector import StandardFSDPDetector
-from bottleneck_detector import Report, Bottlenecks, _phase_gpu_time, _phase_wall_span
+from bottleneck_detector import Report, Bottlenecks, ModelConfig, _phase_gpu_time, _phase_wall_span
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -379,9 +379,12 @@ def _analyze_step(
     step_name: str,
     step_start: int,
     step_end: int,
+    model_config: Optional[ModelConfig] = None,
 ):
-    """Full pipeline for one ProfilerStep — re-implemented here (instead of importing from pipeline.py)
-    to avoid circular imports.  Returns ``(fsdp, report, roots)`` or ``(None, None, None)``.
+    """Full pipeline for one ProfilerStep.
+
+    Accepts an optional ``ModelConfig`` for MFU/HFU/tokens-per-second computation.
+    Returns ``(fsdp, report, roots)`` or ``(None, None, None)``.
     """
     parser = TraceParser(trace_file)
     if not parser.load():
@@ -405,7 +408,7 @@ def _analyze_step(
         if step_start <= n.start_time <= step_end
     ]
 
-    report = Report(fsdp, roots, output_path=None)
+    report = Report(fsdp, roots, output_path=None, model_config=model_config)
     report.generate_report()
 
     return fsdp, report, roots
@@ -415,10 +418,15 @@ def _analyze_step(
 # Cross-step annotation generation (one TID per layer, steps go right)
 # ---------------------------------------------------------------------------
 
-def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0):
+def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0,
+                   model_config: Optional[ModelConfig] = None):
     """Analyse each ProfilerStep and append phase/flow/counter/bottleneck events
     to the Chrome Trace JSON.  All steps share PID=9999; each layer gets its
     own TID with phases from all steps flowing rightward on the same row.
+
+    ``model_config`` enables MFU/HFU/tokens-per-second computation and adds
+    ``compute_to_comm``, ``exposed_comm``, ``ag_overlap_eff`` to bottleneck
+    marker args.  Leave as ``None`` to skip throughput metrics.
 
     Validated against both reference traces:
     - 8B TP: 3 steps, 34 layers → ~680 phases, ~540 flows, 2 TP, 3 opt, 34 bneck
@@ -462,7 +470,7 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0):
     for step_name, step_start, step_end, _ in steps:
         sname = step_name.replace("ProfilerStep#", "Step#")
         print(f"  Analysing {sname} …")
-        fsdp, report, roots = _analyze_step(trace_file, step_name, step_start, step_end)
+        fsdp, report, roots = _analyze_step(trace_file, step_name, step_start, step_end, model_config=model_config)
         if fsdp is None:
             continue
         step_analyses.append((step_name, fsdp, report, roots))
@@ -696,6 +704,8 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0):
                     short.append(iss.split("(")[0].strip())
                 else:
                     short.append(iss)
+            ctc = metric.compute_to_comm_ratio
+            ctc_str = f"{ctc:.1f}x" if ctc != float('inf') else "inf"
             annotations.append({
                 "ph": "i", "pid": pid, "tid": bneck_tid,
                 "ts": ts, "cat": PPT_CAT,
@@ -708,6 +718,10 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0):
                     "gpu_util": round(metric.gpu_util, 3),
                     "comm_ratio_pct": f"{metric.comm_ratio:.1%}",
                     "comp_ratio_pct": f"{metric.comp_ratio:.1%}",
+                    "compute_to_comm": ctc_str,
+                    "exposed_comm": round(metric.exposed_comm_fraction, 3),
+                    "ag_overlap_eff": round(metric.ag_fwd_overlap_efficiency, 3),
+                    "rs_overlap_eff": round(metric.rs_overlap_efficiency, 3),
                     "step": step_name,
                 },
                 "s": "t", "cname": "#FF5722",
