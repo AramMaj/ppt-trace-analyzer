@@ -47,19 +47,65 @@ PHASE_LABELS = ["AG fwd", "Fwd cmp", "AG bwd", "Bwd cmp", "RS"]
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _gpu_kernel_span(nodes):
+    """GPU-domain span covering compute-only GPU events in *nodes*.
+
+    NCCL collective kernels and all-gather copy-out operations
+    (``_foreach_copy_``, ``all_gather_copy_in``) are excluded so
+    communication / data-movement time does not inflate the compute bar.
+
+    Returns ``(gpu_start, gpu_end)`` using raw GPU timestamps from
+    ``direct_gpu_kernels``, or ``None`` when no kernel data is available.
+    """
+    if not nodes:
+        return None
+    spans = []
+    for n in nodes:
+        node_name = n.name.lower()
+        if 'foreach_copy' in node_name or 'all_gather_copy_in' in node_name:
+            continue
+        for gpu in n.direct_gpu_kernels:
+            ts = gpu.get('ts', 0)
+            if 'nccl' in gpu.get('name', '').lower():
+                continue
+            spans.append((ts, ts + gpu.get('dur', 0)))
+    if not spans:
+        return None
+    return (min(s[0] for s in spans), max(s[1] for s in spans))
+
+
+def _get_gpu_kernel_spans(unit):
+    """GPU-domain phase spans for compute phases only.
+
+    Used on the dedicated GPU compute TID so the bars visually overlap
+    GPU kernel events.  AG / RS phases have no GPU compute span.
+    """
+    phases = []
+    for label, node_list in [("Fwd cmp", unit.fwd_compute), ("Bwd cmp", unit.bwd_compute)]:
+        span = _gpu_kernel_span(node_list)
+        if span is not None:
+            phases.append((label, span[0], span[1], node_list))
+    return phases
+
+
 def _get_phase_spans(unit):
-    """Wall-clock spans for each FSDP phase — used by both the annotator and the ASCII timeline.
+    """Wall-clock (CPU) spans for each FSDP phase — used by the layer TID
+    and the ASCII timeline so the phase ordering is always correct.
     """
     phases = []
     phase_src = [
-        ("AG fwd", unit.all_gather_fwd),
-        ("Fwd cmp", unit.fwd_compute),
-        ("AG bwd", unit.all_gather_bwd),
-        ("Bwd cmp", unit.bwd_compute),
-        ("RS", unit.reduce_scatter),
+        ("AG fwd", unit.all_gather_fwd, None),
+        ("Fwd cmp", unit.fwd_compute, unit.fwd_compute_span),
+        ("AG bwd", unit.all_gather_bwd, None),
+        ("Bwd cmp", unit.bwd_compute, unit.bwd_compute_span),
+        ("RS", unit.reduce_scatter, None),
     ]
-    for label, node_list in phase_src:
+    for label, node_list, fallback_span in phase_src:
         span = _phase_wall_span(node_list)
+        if span is None:
+            span = fallback_span
+        elif fallback_span is not None:
+            span = (fallback_span[0], max(span[1], fallback_span[1]))
         if span is not None:
             phases.append((label, span[0], span[1], node_list))
     return phases
@@ -413,6 +459,34 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0):
                          "step": "all"},
             })
             active += delta
+
+    # -- GPU compute thread (GPU domain — overlaps GPU kernel events) ------
+    gpu_comp_tid = max_layers + 5
+    annotations.append({
+        "ph": "M", "pid": pid, "tid": gpu_comp_tid,
+        "name": "thread_name",
+        "args": {"name": "GPU compute (all steps)"},
+    })
+    for step_name, fsdp, _ in step_analyses:
+        for layer_idx, unit in enumerate(fsdp.units):
+            for label, start, end, nodes in _get_gpu_kernel_spans(unit):
+                gpu_dur = _phase_gpu_time(nodes)
+                annotations.append({
+                    "ph": "X", "pid": pid, "tid": gpu_comp_tid,
+                    "ts": start, "dur": end - start,
+                    "cat": PPT_CAT,
+                    "name": f"{label} ({step_name}, Layer {layer_idx})",
+                    "args": {
+                        "phase": label,
+                        "layer": unit.layer_name,
+                        "gpu_us": round(gpu_dur, 1),
+                        "wall_us": round(end - start, 1),
+                        "num_nodes": len(nodes),
+                        "step": step_name,
+                        "domain": "gpu",
+                    },
+                    "cname": PHASE_COLORS.get(label, "#888"),
+                })
 
     # -- Bottleneck markers (all steps merged) ----------------------------
     bneck_tid = max_layers + 3

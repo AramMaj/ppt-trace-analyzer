@@ -181,6 +181,12 @@ class FSDPUnit:
     """One FSDP2 layer — stores CPU nodes for each of the five phases plus
     computed GPU kernel lists.  The core abstraction consumed by bottleneck
     detection, timeline, and annotation.
+
+    ``fwd_compute_span`` / ``bwd_compute_span`` are the exact wall-clock
+    boundaries of the compute phase (e.g. ``all_gather_copy_out.end`` →
+    ``next_all_gather_copy_out.start``), stored separately from the node
+    lists so that wall time is always a clean continuous interval even
+    when the collected nodes are sparse or include anomalous kernels.
     """
     def __init__(self, layer_name: str):
         self.layer_name: str = layer_name
@@ -189,6 +195,8 @@ class FSDPUnit:
         self.reduce_scatter: List[LogicalOperation] = []
         self.fwd_compute: List[LogicalOperation] = []
         self.bwd_compute: List[LogicalOperation] = []
+        self.fwd_compute_span: Optional[Tuple[float, float]] = None
+        self.bwd_compute_span: Optional[Tuple[float, float]] = None
 
     @property
     def all_gather_fwd_gpu_kernels(self) -> List[dict]:
@@ -301,12 +309,9 @@ class StandardFSDPDetector:
                         unit.all_gather_fwd.append(ch)
 
     def _detect_all_gather_bwd(self, roots: List[LogicalOperation], fsdp_units: FSDP):
-        """FSDP2 backward re-gather: ``FSDP::all_gather_copy_out`` child of ``FSDP::pre_backward (layer.X)``.
-        With ``reshard_after_forward=True`` (FSDP2 default), each layer's parameters
-        are freed after forward compute.  Autograd needs full parameters, so FSDP2
-        re-issues the all-gather here (split_with_sizes_copy into contiguous buffers
-        on the backward stream thread, tid=24759 in the 8B trace).
-        """
+        """FSDP2 backward re-gather: ``FSDP::all_gather`` / ``FSDP::all_gather_copy_out``
+        children of ``FSDP::pre_backward (layer.X)``.  Collect both the NCCL all-gather
+        collective and the ``split_with_sizes_copy`` data movement (mirrors forward)."""
         all_nodes = list(TraceParserHelper.iter_nodes(roots))
         for unit in fsdp_units.units:
             pre_bwd_list = []
@@ -317,7 +322,7 @@ class StandardFSDPDetector:
             pre_bwd = _pick_latest_with_allgather(pre_bwd_list)
 
             for ch in pre_bwd.children:
-                if _has_fsdp_prefix(ch.name) and 'all_gather_copy_out' in ch.name:
+                if _has_fsdp_prefix(ch.name) and 'all_gather' in ch.name:
                     if ch not in unit.all_gather_bwd:
                         unit.all_gather_bwd.append(ch)
 
@@ -336,17 +341,20 @@ class StandardFSDPDetector:
 
     def _detect_fwd_cmp(self, roots: List[LogicalOperation], fsdp_units: FSDP, profiler_tid: int = None):
         """Forward compute: collect attn/MLP/norm ops between each layer's
-        ``all_gather_copy_out.end_time`` and the next layer's ``pre_forward.start``.
+        ``all_gather_copy_out.end_time`` and the **next** layer's ``all_gather_copy_out.start``.
+
+        Using the next layer's copy_out start as the boundary (instead of
+        ``pre_forward.start``) is correct for FSDP2 pipelining: the NCCL all-gather
+        inside the next layer's ``pre_forward`` runs concurrently with this layer's
+        compute.  The copy_out only starts after the all-gather finishes and the
+        data has been split into contiguous buffers — that is the true end of
+        this layer's compute window.
 
         Skips FSDP-internal ops (all_gather, copy_out), ProfilerStep markers,
         and Optimizer events.  When backward runs on a separate thread
         (``has_other_tids``, as with tid=24759 in the 8B trace), only the
         profiler thread (tid=24529) is matched — the backward-stream events
         are reserved for ``_detect_bwd_cmp``.
-
-        NB: This relies on sequential-layer boundaries.  In a fully-overlapped
-        FSDP2 schedule where layer i+1 starts its all-gather before layer i's
-        compute finishes, the end_time boundary heuristic breaks.
         """
         all_nodes = sorted(TraceParserHelper.iter_nodes(roots), key=lambda n: n.start_time)
         units = fsdp_units.units
@@ -367,52 +375,87 @@ class StandardFSDPDetector:
                 continue
 
             if i + 1 < len(units):
-                next_node = None
-                for name in _fsdp_phase_name('pre_forward', units[i + 1].layer_name):
-                    next_node = all_pre_fwd.get(name)
-                    if next_node:
-                        break
-                end_time = next_node.start_time if next_node else copy_out_end
+                next_unit = units[i + 1]
+                next_copy_out_start = None
+                for ag_node in next_unit.all_gather_fwd:
+                    if 'all_gather_copy_out' in ag_node.name:
+                        if next_copy_out_start is None or ag_node.start_time < next_copy_out_start:
+                            next_copy_out_start = ag_node.start_time
+                if next_copy_out_start is not None:
+                    end_time = next_copy_out_start
+                else:
+                    next_node = None
+                    for name in _fsdp_phase_name('pre_forward', units[i + 1].layer_name):
+                        next_node = all_pre_fwd.get(name)
+                        if next_node:
+                            break
+                    end_time = next_node.start_time if next_node else copy_out_end
             else:
                 post_fwd_list = []
                 for name in _fsdp_phase_name('post_forward', unit.layer_name):
                     post_fwd_list.extend(n for n in all_nodes if n.name == name)
                 if post_fwd_list:
                     post_fwd = max(post_fwd_list, key=lambda n: n.start_time)
-                    all_pre_bwd = sorted(
-                        [n for n in all_nodes if _has_fsdp_prefix(n.name) and 'pre_backward' in n.name],
-                        key=lambda n: n.start_time
-                    )
                     end_time = post_fwd.end_time
-                    for n in all_pre_bwd:
-                        if n.start_time >= copy_out_end:
-                            end_time = n.start_time
-                            break
                 else:
                     end_time = copy_out_end
+
+            unit.fwd_compute_span = (copy_out_end, end_time)
 
             for n in all_nodes:
                 if has_other_tids and profiler_tid is not None:
                     n_tid = n.raw_event.get('tid') if n.raw_event else None
                     if n_tid != profiler_tid:
                         continue
-                if n.start_time >= copy_out_end and n.end_time <= end_time:
+                if n.start_time < end_time and copy_out_end < n.end_time <= end_time:
                     if _has_fsdp_prefix(n.name) or n.name.startswith('ProfilerStep') or n.name.startswith('Optimizer'):
+                        continue
+                    if n.name in ('backward_pass', 'forward_pass', 'root_pre_forward',
+                                  'root_post_backward_callback', 'inputs_to_device',
+                                  'cast_forward_inputs'):
                         continue
                     unit.fwd_compute.append(n)
 
     def _detect_bwd_cmp(self, roots: List[LogicalOperation], fsdp_units: FSDP, profiler_tid: int = None):
-        """Backward compute: ``autograd::engine::evaluate_function`` ops on the
-        backward stream thread (tid=24759 in the 8B trace) between
-        ``pre_backward.end_time`` and ``reduce_scatter.start_time``.
+        """Backward compute: ``autograd::engine::evaluate_function`` ops between
+        ``all_gather_copy_out.end_time`` (from ``pre_backward``) and
+        ``reduce_scatter.start_time``.
 
-        Inverts the thread filter: when ``has_other_tids``, the profiler thread
-        is excluded — only the backward-stream thread is scanned.  Falls back
-        to ``post_backward_reduce`` name matching if the RS node was missed
-        (e.g. trace captured before the reduce-scatter completed).
+        The ``all_gather_copy_out`` end is more precise than ``pre_backward.end``
+        — the latter may include trailing bookkeeping children after the copy_out.
+        No thread filtering here: the time window alone is tight enough that
+        nodes from the wrong thread won't match, and filtering on thread would
+        miss steps whose backward runs on the same thread as forward.
+        Falls back to ``post_backward_reduce`` name matching if the RS node
+        was missed, then to ``pre_backward.start_time`` of the next layer for
+        traces (e.g. gpu-server steps #4/#6/#8) that skip reduce-scatter.
         """
         all_nodes = sorted(TraceParserHelper.iter_nodes(roots), key=lambda n: n.start_time)
-        has_other_tids = self._has_other_tids(all_nodes, profiler_tid)
+
+        # All pre_backward nodes across every layer, sorted by start_time =
+        # backward execution order (last forward layer's bwd completes first).
+        all_pre_bwd_global = []
+        for unit in fsdp_units.units:
+            for name in _fsdp_phase_name('pre_backward', unit.layer_name):
+                all_pre_bwd_global.extend(n for n in all_nodes if n.name == name)
+        all_pre_bwd_global = sorted(all_pre_bwd_global, key=lambda n: n.start_time)
+
+        # Step end from ProfilerStep roots — last-resort boundary for the final
+        # backward layer when no RS or root_post_backward_callback exists.
+        step_end = None
+        for r in roots:
+            if r.name.startswith('ProfilerStep#'):
+                if step_end is None or r.end_time > step_end:
+                    step_end = r.end_time
+
+        # root_post_backward_callback fires after all layers' backward completes
+        # — a more precise alternative to step_end for the final layer boundary.
+        root_post_bwd = None
+        root_post_bwd_names = _fsdp_phase_name('root_post_backward_callback', '')
+        for n in all_nodes:
+            if n.name in root_post_bwd_names:
+                root_post_bwd = n
+                break
 
         for unit in fsdp_units.units:
             all_pre_bwd = []
@@ -436,18 +479,42 @@ class StandardFSDPDetector:
                         rs_start = rs_list[0].start_time
                         break
 
-            all_gather_end = pre_bwd.end_time if pre_bwd else None
+            # Fallback for traces whose backward thread runs no reduce-scatter
+            # (gpu-server steps #4/#6/#8): use the *next* pre_backward.start_time
+            # as the end boundary instead.  Backward execution walks layers in
+            # reverse order, so each layer's compute window ends when the next
+            # pre_backward fires.
+            if rs_start is None and all_pre_bwd_global:
+                for pi, pb in enumerate(all_pre_bwd_global):
+                    if _extract_layer(pb.name) == unit.layer_name:
+                        pre_bwd = pb
+                        if pi + 1 < len(all_pre_bwd_global):
+                            rs_start = all_pre_bwd_global[pi + 1].start_time
+                        elif root_post_bwd is not None:
+                            rs_start = root_post_bwd.start_time
+                        elif step_end is not None:
+                            rs_start = step_end
+                        break
+
+            copy_out_end_bwd = None
+            for ag_node in unit.all_gather_bwd:
+                if 'all_gather_copy_out' in ag_node.name:
+                    if copy_out_end_bwd is None or ag_node.end_time > copy_out_end_bwd:
+                        copy_out_end_bwd = ag_node.end_time
+            all_gather_end = copy_out_end_bwd if copy_out_end_bwd is not None else (pre_bwd.end_time if pre_bwd else None)
 
             if all_gather_end is None or rs_start is None:
                 continue
 
+            unit.bwd_compute_span = (all_gather_end, rs_start)
+
             for n in all_nodes:
-                if has_other_tids and profiler_tid is not None:
-                    n_tid = n.raw_event.get('tid') if n.raw_event else None
-                    if n_tid == profiler_tid:
-                        continue
-                if n.start_time >= all_gather_end and n.end_time <= rs_start:
+                if n.start_time < rs_start and all_gather_end < n.end_time <= rs_start:
                     if _has_fsdp_prefix(n.name) or n.name.startswith('ProfilerStep') or n.name.startswith('Optimizer'):
+                        continue
+                    if n.name in ('backward_pass', 'forward_pass', 'root_pre_forward',
+                                  'root_post_backward_callback', 'inputs_to_device',
+                                  'cast_forward_inputs'):
                         continue
                     unit.bwd_compute.append(n)
 

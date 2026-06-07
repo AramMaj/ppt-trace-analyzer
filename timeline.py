@@ -33,16 +33,19 @@ def print_timeline(fsdp, report):
     # Collect all phase intervals with their layer index, label, start, end
     intervals = []
     for idx, unit in enumerate(fsdp.units):
-        for label, nodes in [
-            ('AG fwd', unit.all_gather_fwd),
-            ('Fwd cmp', unit.fwd_compute),
-            ('AG bwd', unit.all_gather_bwd),
-            ('Bwd cmp', unit.bwd_compute),
-            ('RS', unit.reduce_scatter),
+        for label, nodes, stored_span in [
+            ('AG fwd', unit.all_gather_fwd, None),
+            ('Fwd cmp', unit.fwd_compute, unit.fwd_compute_span),
+            ('AG bwd', unit.all_gather_bwd, None),
+            ('Bwd cmp', unit.bwd_compute, unit.bwd_compute_span),
+            ('RS', unit.reduce_scatter, None),
         ]:
-            span = _phase_wall_span(nodes)
-            if span:
-                intervals.append((idx, label, span[0], span[1]))
+            if stored_span is not None:
+                intervals.append((idx, label, stored_span[0], stored_span[1]))
+            else:
+                span = _phase_wall_span(nodes)
+                if span:
+                    intervals.append((idx, label, span[0], span[1]))
 
     if not intervals:
         print("  No phase intervals found.")

@@ -12,7 +12,7 @@ Six sections:
 """
 
 import json
-from typing import Dict, List, Optional, Set, Iterator, Any
+from typing import Dict, List, Optional, Set, Iterator, Tuple, Any
 from collections import defaultdict
 
 from trace_parser import LogicalOperation
@@ -76,15 +76,18 @@ def _phase_cpu_time(nodes: List[LogicalOperation]) -> float:
     return sum(n.cpu_duration for n in nodes)
 
 
-def _phase_wall_time(nodes: List[LogicalOperation]) -> float:
+def _phase_wall_time(nodes: List[LogicalOperation], fallback_span: Optional[Tuple[float, float]] = None) -> float:
     """Union wall-clock span — earliest ``start_time`` to latest ``end_time``
-    across *nodes*.  Gaps between phases (e.g. pipeline bubbles between
-    reduce-scatter and the next all-gather) are included.
+    across *nodes*.  When *nodes* is empty, *fallback_span* ``(start, end)``
+    provides a best-effort substitute so callers (the annotator, bottleneck
+    report) always get a span, even for degenerate layers.
 
-    Used for ``layer_span`` (how long this FSDP shard group is live on the
-    host timeline) and for the CPU-span-to-GPU ratio (host-bound detection).
+    Gaps between phases (e.g. pipeline bubbles between reduce-scatter and
+    the next all-gather) are included.
     """
     if not nodes:
+        if fallback_span is not None:
+            return fallback_span[1] - fallback_span[0]
         return 0.0
     start = min(n.start_time for n in nodes)
     end = max(n.end_time for n in nodes)
@@ -216,7 +219,7 @@ class Metrics:
 
         self.fwd_cmp_gpu = _phase_gpu_time(unit.fwd_compute)
         self.fwd_cmp_cpu = _phase_cpu_time(unit.fwd_compute)
-        self.fwd_cmp_wall = _phase_wall_time(unit.fwd_compute)
+        self.fwd_cmp_wall = _phase_wall_time(unit.fwd_compute, unit.fwd_compute_span)
 
         self.ag_bwd_gpu = _phase_gpu_time(unit.all_gather_bwd)
         self.ag_bwd_cpu = _phase_cpu_time(unit.all_gather_bwd)
@@ -224,7 +227,7 @@ class Metrics:
 
         self.bwd_cmp_gpu = _phase_gpu_time(unit.bwd_compute)
         self.bwd_cmp_cpu = _phase_cpu_time(unit.bwd_compute)
-        self.bwd_cmp_wall = _phase_wall_time(unit.bwd_compute)
+        self.bwd_cmp_wall = _phase_wall_time(unit.bwd_compute, unit.bwd_compute_span)
 
         self.rs_gpu = _phase_gpu_time(unit.reduce_scatter)
         self.rs_cpu = _phase_cpu_time(unit.reduce_scatter)
