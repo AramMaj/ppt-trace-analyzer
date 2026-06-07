@@ -14,6 +14,12 @@
 # Ignore all files in the lichtenberg folder
 lichtenberg/*
 
+# Ignore the docs folder itself
+!docs
+
+# Ignore all files in the docs folder
+docs/*
+
 # Ignore pycache
 !__pycache__
 __pycache__/*
