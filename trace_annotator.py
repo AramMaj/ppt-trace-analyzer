@@ -34,58 +34,222 @@ PHASE_COLORS = {
     "AG fwd": "#4CAF50",
     "Fwd cmp": "#2196F3",
     "AG bwd": "#FF9800",
+    "Bwd AG": "#E91E63",
     "Bwd cmp": "#F44336",
     "RS": "#9C27B0",
+    "Pre-fwd AG": "#795548",
+    "Prefetch AG": "#00BCD4",
+    "Trailing RS": "#607D8B",
     "Optimizer": "#607D8B",
     "TP": "#FFEB3B",
 }
 
-PHASE_LABELS = ["AG fwd", "Fwd cmp", "AG bwd", "Bwd cmp", "RS"]
+PHASE_LABELS = ["AG fwd", "Fwd cmp", "AG bwd", "Bwd AG", "Bwd cmp", "RS",
+                "Pre-fwd AG", "Prefetch AG", "Trailing RS"]
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _gpu_kernel_span(nodes):
-    """GPU-domain span covering compute-only GPU events in *nodes*.
+def _collect_nccl_gpu_spans(node):
+    """Recursively collect only NCCL-kernel GPU spans from *node*.
 
-    NCCL collective kernels and all-gather copy-out operations
-    (``_foreach_copy_``, ``all_gather_copy_in``) are excluded so
-    communication / data-movement time does not inflate the compute bar.
+    Used for AG / RS comm phases so the bar shows just the collective
+    (not copy-out/in kernels that precede or follow it on the GPU).
+    """
+    spans = []
+    for gpu in node.direct_gpu_kernels:
+        if 'nccl' in gpu.get('name', '').lower():
+            spans.append((gpu['ts'], gpu['ts'] + gpu.get('dur', 0)))
+    for ch in node.children:
+        spans.extend(_collect_nccl_gpu_spans(ch))
+    return spans
 
-    Returns ``(gpu_start, gpu_end)`` using raw GPU timestamps from
-    ``direct_gpu_kernels``, or ``None`` when no kernel data is available.
+
+def _collect_child_gpu_spans(node):
+    """Recursively collect all GPU spans (excluding NCCL) from *node*.
+
+    Needed for AG bwd, where the copy-out kernel lives on a child
+    (``fsdp::split_with_sizes_copy``) rather than the wrapper node.
+    """
+    spans = []
+    for gpu in node.direct_gpu_kernels:
+        if 'nccl' in gpu.get('name', '').lower():
+            continue
+        spans.append((gpu['ts'], gpu['ts'] + gpu.get('dur', 0)))
+    for ch in node.children:
+        spans.extend(_collect_child_gpu_spans(ch))
+    return spans
+
+
+def _collect_nccl_from_nodes(node, inside_ag=False):
+    """Recursively collect NCCL GPU spans under ``FSDP::all_gather`` subtrees.
+
+    Only collects NCCL kernels that live in the subtree of an
+    ``FSDP::all_gather`` node (backward prefetch all-gather), skipping
+    TP collectives (``_c10d_functional::*``).  Duplicate GPU events
+    (same kernel referenced from multiple CPU nodes) are deduplicated.
+    """
+    spans = []
+    is_tp_collective = node.name.startswith('_c10d_functional::')
+    is_fsdp_ag = 'FSDP::all_gather' in node.name and 'copy_out' not in node.name
+    if is_tp_collective:
+        return spans
+    if inside_ag:
+        for gpu in node.direct_gpu_kernels:
+            if 'nccl' in gpu.get('name', '').lower():
+                spans.append((gpu['ts'], gpu['ts'] + gpu.get('dur', 0)))
+    new_inside = inside_ag or is_fsdp_ag
+    for ch in node.children:
+        spans.extend(_collect_nccl_from_nodes(ch, inside_ag=new_inside))
+    seen = set()
+    deduped = []
+    for s, e in spans:
+        key = (s, e)
+        if key not in seen:
+            seen.add(key)
+            deduped.append((s, e))
+    return deduped
+
+
+def _gpu_kernel_span(nodes, mode):
+    """GPU-domain span for one phase.
+
+    *mode*:
+      ``'nccl'`` — only NCCL kernels, recursive (AG fwd, RS).
+      ``'child'`` — non-NCCL, recursive (AG bwd).
+      ``'compute'`` — non-NCCL, flat on the nodes themselves (Fwd cmp, Bwd cmp).
+    Returns ``(gpu_start, gpu_end)`` or ``None``.
     """
     if not nodes:
         return None
     spans = []
-    for n in nodes:
-        node_name = n.name.lower()
-        if 'foreach_copy' in node_name or 'all_gather_copy_in' in node_name:
-            continue
-        for gpu in n.direct_gpu_kernels:
-            ts = gpu.get('ts', 0)
-            if 'nccl' in gpu.get('name', '').lower():
+    collector = {'nccl': _collect_nccl_gpu_spans,
+                 'child': _collect_child_gpu_spans,
+                 'nccl_from_nodes': _collect_nccl_from_nodes}
+    collect_fn = collector.get(mode)
+    if collect_fn is not None:
+        for n in nodes:
+            spans.extend(collect_fn(n))
+    else:
+        for n in nodes:
+            nn = n.name.lower()
+            if 'foreach_copy' in nn or 'all_gather_copy_in' in nn:
                 continue
-            spans.append((ts, ts + gpu.get('dur', 0)))
+            for gpu in n.direct_gpu_kernels:
+                if 'nccl' in gpu.get('name', '').lower():
+                    continue
+                spans.append((gpu.get('ts', 0), gpu.get('ts', 0) + gpu.get('dur', 0)))
     if not spans:
         return None
     return (min(s[0] for s in spans), max(s[1] for s in spans))
 
 
 def _get_gpu_kernel_spans(unit):
-    """GPU-domain phase spans for compute phases only.
+    """GPU-domain phase spans for all FSDP phases.
 
-    Used on the dedicated GPU compute TID so the bars visually overlap
-    GPU kernel events.  AG / RS phases have no GPU compute span.
+    AG fwd / RS → NCCL-only (``'nccl'``).  AG bwd → non-NCCL recursive
+    (``'child'``).  Compute phases → non-NCCL flat (``'compute'``).
     """
     phases = []
-    for label, node_list in [("Fwd cmp", unit.fwd_compute), ("Bwd cmp", unit.bwd_compute)]:
-        span = _gpu_kernel_span(node_list)
+    for label, node_list, mode in [
+        ("AG fwd", unit.all_gather_fwd, 'nccl'),
+        ("Fwd cmp", unit.fwd_compute, 'compute'),
+        ("AG bwd", unit.all_gather_bwd, 'child'),
+        ("Bwd AG", unit.bwd_compute, 'nccl_from_nodes'),
+        ("Bwd cmp", unit.bwd_compute, 'compute'),
+        ("RS", unit.reduce_scatter, 'nccl'),
+    ]:
+        span = _gpu_kernel_span(node_list, mode)
         if span is not None:
             phases.append((label, span[0], span[1], node_list))
     return phases
+
+
+def _get_unattributed_gpu_spans(fsdp, roots):
+    """GPU-domain spans for NCCL kernels NOT in any unit's phase trees.
+
+    Three categories are recognised:
+
+    * **Pre-fwd AG** — initial all-gather inside ``FSDP::pre_forward``
+      (without a layer suffix, runs before any layer's forward).
+    * **Prefetch AG** — backward-prefetch all-gather inside
+      ``FSDP::backward_prefetch``.
+    * **Trailing RS** — reduce-scatter inside
+      ``root_post_backward_callback`` / ``FSDP::post_backward_reduce``
+      that extends past the step boundary.
+
+    Returns ``[(category, gpu_start, gpu_end), …]``.
+    """
+    # Collect all ext_ids already covered by unit phase trees (recursive)
+    def _collect_attributed_exts(fsdp):
+        exts = set()
+        def _walk(node):
+            exts.update(node.external_ids)
+            for g in node.direct_gpu_kernels:
+                gext = g.get('args', {}).get('External id')
+                if gext:
+                    exts.add(gext)
+            for ch in node.children:
+                _walk(ch)
+        for u in fsdp.units:
+            for lst in (u.all_gather_fwd, u.all_gather_bwd, u.reduce_scatter,
+                        u.fwd_compute, u.bwd_compute):
+                for n in lst:
+                    _walk(n)
+        return exts
+
+    attributed = _collect_attributed_exts(fsdp)
+
+    # Find every NCCL kernel in the roots
+    nccl_events = []  # [(ext_id, ts, end, ancestors_str, name)]
+    def _scan(node, ancestors):
+        for g in node.direct_gpu_kernels:
+            if 'nccl' in g.get('name', '').lower():
+                ext = g.get('args', {}).get('External id')
+                nccl_events.append((ext, g['ts'], g['ts'] + g.get('dur', 0),
+                                    ' '.join(ancestors), g.get('name', '')))
+        for ch in node.children:
+            _scan(ch, ancestors + [node.name])
+
+    for root in roots:
+        _scan(root, [root.name])
+
+    # Categorise unattributed kernels by ancestor path
+    buckets = {}
+    for ext_id, ts, end, path, name in nccl_events:
+        if ext_id and ext_id in attributed:
+            continue
+        path_lower = path.lower()
+        if 'FSDP::pre_forward'.lower() in path_lower and \
+           '(model' not in path and '(layers' not in path and '(layer' not in path:
+            # Future-proofing: some traces use "layers", some "model.layers"
+            if '(model' not in path and '(layers' not in path and '(layer' not in path:
+                buckets.setdefault('Pre-fwd AG', []).append((ts, end))
+            else:
+                buckets.setdefault('Other', []).append((ts, end))
+        elif 'FSDP::backward_prefetch'.lower() in path_lower or \
+             'FSDP::pre_backward'.lower() in path_lower:
+            # backward_prefetch may be nested inside pre_backward
+            buckets.setdefault('Prefetch AG', []).append((ts, end))
+        elif 'root_post_backward_callback'.lower() in path_lower or \
+             'FSDP::post_backward_reduce'.lower() in path_lower:
+            buckets.setdefault('Trailing RS', []).append((ts, end))
+        else:
+            buckets.setdefault('Other', []).append((ts, end))
+
+    result = []
+    for cat, spans in buckets.items():
+        if cat == 'Other':
+            for ts, end in spans:
+                print(f"  [unattributed] Other NCCL: ts={ts:.1f} dur={end-ts:.1f}")
+            continue
+        if spans:
+            s = min(sp[0] for sp in spans)
+            e = max(sp[1] for sp in spans)
+            result.append((cat, s, e))
+    return result
 
 
 def _get_phase_spans(unit):
@@ -217,11 +381,11 @@ def _analyze_step(
     step_end: int,
 ):
     """Full pipeline for one ProfilerStep — re-implemented here (instead of importing from pipeline.py)
-    to avoid circular imports.  Returns ``(fsdp, report)`` or ``(None, None)``.
+    to avoid circular imports.  Returns ``(fsdp, report, roots)`` or ``(None, None, None)``.
     """
     parser = TraceParser(trace_file)
     if not parser.load():
-        return None, None
+        return None, None, None
 
     _filter_gpu_events(parser, step_start, step_end)
     roots = parser.build_tree()
@@ -244,7 +408,7 @@ def _analyze_step(
     report = Report(fsdp, roots, output_path=None)
     report.generate_report()
 
-    return fsdp, report
+    return fsdp, report, roots
 
 
 # ---------------------------------------------------------------------------
@@ -298,16 +462,16 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0):
     for step_name, step_start, step_end, _ in steps:
         sname = step_name.replace("ProfilerStep#", "Step#")
         print(f"  Analysing {sname} …")
-        fsdp, report = _analyze_step(trace_file, step_name, step_start, step_end)
+        fsdp, report, roots = _analyze_step(trace_file, step_name, step_start, step_end)
         if fsdp is None:
             continue
-        step_analyses.append((step_name, fsdp, report))
+        step_analyses.append((step_name, fsdp, report, roots))
 
     if not step_analyses:
         print("  No steps could be analysed.")
         return
 
-    max_layers = max(len(fsdp.units) for _, fsdp, _ in step_analyses)
+    max_layers = max(len(fsdp.units) for _, fsdp, _, _ in step_analyses)
     pid = PPT_PID_BASE
     annotations = []
 
@@ -317,7 +481,7 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0):
 
         # Pick a step that has this layer for the thread name
         layer_name = f"Layer {layer_idx}"
-        for _, fsdp, _ in step_analyses:
+        for _, fsdp, _, _ in step_analyses:
             if layer_idx < len(fsdp.units):
                 raw = fsdp.units[layer_idx].layer_name
                 if raw:
@@ -330,7 +494,7 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0):
             "args": {"name": layer_name},
         })
 
-        for step_idx, (step_name, fsdp, _) in enumerate(step_analyses):
+        for step_idx, (step_name, fsdp, _, _) in enumerate(step_analyses):
             if layer_idx >= len(fsdp.units):
                 continue
             unit = fsdp.units[layer_idx]
@@ -376,13 +540,13 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0):
 
     # -- Optimizer thread (all steps merged) ------------------------------
     opt_tid = max_layers + 1
-    if any(fsdp.optimizer_step for _, fsdp, _ in step_analyses):
+    if any(fsdp.optimizer_step for _, fsdp, _, _ in step_analyses):
         annotations.append({
             "ph": "M", "pid": pid, "tid": opt_tid,
             "name": "thread_name",
             "args": {"name": "Optimizer (all steps)"},
         })
-        for step_name, fsdp, _ in step_analyses:
+        for step_name, fsdp, _, _ in step_analyses:
             for opt_node in fsdp.optimizer_step:
                 annotations.append({
                     "ph": "X", "pid": pid, "tid": opt_tid,
@@ -403,7 +567,7 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0):
     tp_tid = max_layers + 2
     has_tp = any(
         fsdp.tp_all_gather or fsdp.tp_reduce_scatter or fsdp.tp_all_reduce
-        for _, fsdp, _ in step_analyses
+        for _, fsdp, _, _ in step_analyses
     )
     if has_tp:
         annotations.append({
@@ -412,7 +576,7 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0):
             "args": {"name": "TP collectives (all steps)"},
         })
         tp_kernels = []
-        for step_name, fsdp, _ in step_analyses:
+        for step_name, fsdp, _, _ in step_analyses:
             for k in fsdp.tp_all_gather + fsdp.tp_reduce_scatter + fsdp.tp_all_reduce:
                 kc = dict(k)
                 kc["_step"] = step_name
@@ -437,7 +601,7 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0):
     gpu_tid = max_layers + 4
     # Collect combined push-pop events from all steps
     all_events = []
-    for _, fsdp, _ in step_analyses:
+    for _, fsdp, _, _ in step_analyses:
         for unit in fsdp.units:
             for _, start, end, _ in _get_phase_spans(unit):
                 all_events.append((start, 1))
@@ -460,14 +624,15 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0):
             })
             active += delta
 
-    # -- GPU compute thread (GPU domain — overlaps GPU kernel events) ------
+    # -- GPU phase thread (GPU domain — overlaps GPU kernel events) --------
     gpu_comp_tid = max_layers + 5
     annotations.append({
         "ph": "M", "pid": pid, "tid": gpu_comp_tid,
         "name": "thread_name",
-        "args": {"name": "GPU compute (all steps)"},
+        "args": {"name": "GPU phases (all steps)"},
     })
-    for step_name, fsdp, _ in step_analyses:
+    for step_name, fsdp, _, roots in step_analyses:
+        # Per-unit phase bars
         for layer_idx, unit in enumerate(fsdp.units):
             for label, start, end, nodes in _get_gpu_kernel_spans(unit):
                 gpu_dur = _phase_gpu_time(nodes)
@@ -488,6 +653,25 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0):
                     "cname": PHASE_COLORS.get(label, "#888"),
                 })
 
+        # Cross-unit / unattributed phase bars
+        for label, start, end in _get_unattributed_gpu_spans(fsdp, roots):
+            annotations.append({
+                "ph": "X", "pid": pid, "tid": gpu_comp_tid,
+                "ts": start, "dur": end - start,
+                "cat": PPT_CAT,
+                "name": f"{label} ({step_name})",
+                "args": {
+                    "phase": label,
+                    "layer": "-",
+                    "gpu_us": round(end - start, 1),
+                    "wall_us": round(end - start, 1),
+                    "num_nodes": 0,
+                    "step": step_name,
+                    "domain": "gpu",
+                },
+                "cname": PHASE_COLORS.get(label, "#888"),
+            })
+
     # -- Bottleneck markers (all steps merged) ----------------------------
     bneck_tid = max_layers + 3
     annotations.append({
@@ -495,7 +679,7 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0):
         "name": "thread_name",
         "args": {"name": "Bottlenecks (all steps)"},
     })
-    for step_name, fsdp, report in step_analyses:
+    for step_name, fsdp, report, _ in step_analyses:
         for metric, unit in zip(report.metrics_list, fsdp.units):
             issues = Bottlenecks.detect(metric)
             if not issues:
