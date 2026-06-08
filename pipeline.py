@@ -47,8 +47,11 @@ def process_trace(trace_file: str):
     return report.aggregated, report.metrics_list, fsdp, report, text
 
 
-def process_all_steps(trace_file: str):
+def process_all_steps(trace_file: str, model_config=None):
     """Analyse every ProfilerStep in the trace and return one result per step.
+
+    *model_config* (optional ``ModelConfig``) enables MFU/HFU/tokens-per-second
+    computation in each step's report.
 
     Returns a list of ``(step_name, aggregated, metrics_list, fsdp, report, text)``
     tuples, one per ProfilerStep.  Handles single-step traces gracefully.
@@ -57,7 +60,6 @@ def process_all_steps(trace_file: str):
 
     steps = _find_profiler_steps(trace_file)
     if not steps:
-        # Fall back to last-step behaviour
         result = process_trace(trace_file)
         if result is None:
             return []
@@ -87,7 +89,7 @@ def process_all_steps(trace_file: str):
             if step_start <= n.start_time <= step_end
         ]
 
-        report = Report(fsdp, roots, output_path=None)
+        report = Report(fsdp, roots, output_path=None, model_config=model_config)
         text, markers = report.generate_report()
         sname = step_name.replace("ProfilerStep#", "Step#")
         results.append((sname, report.aggregated, report.metrics_list, fsdp, report, text))

@@ -4,6 +4,7 @@
   --timeline  — ASCII Gantt chart of FSDP2 pipeline stagger
   --compare   — side-by-side benchmark table (2+ traces)
   --annotate  — Chrome Trace JSON with phases, flows, counters, bottlenecks
+                (optional: --hidden-dim, --num-layers, etc. for MFU/HFU)
 
 Each mode delegates to dedicated modules (pipeline.py, timeline.py,
 comparison.py, trace_annotator.py) — ``main.py`` only parses argv and prints.
@@ -21,6 +22,46 @@ from timeline import print_timeline
 from comparison import compare_traces
 
 
+MODEL_FLAGS = {
+    "--hidden-dim": "hidden_dim",
+    "--num-layers": "num_layers",
+    "--num-heads": "num_heads",
+    "--seq-len": "seq_len",
+    "--vocab-size": "vocab_size",
+    "--batch-size": "batch_size",
+    "--num-gpus": "num_gpus",
+    "--activation-checkpointing": "activation_checkpointing",
+    "--precision-bits": "precision_bits",
+    "--gpu-peak-tflops": "gpu_peak_tflops",
+    "--gpu-hbm-bw": "gpu_hbm_bw_gbps",
+    "--intermediate-dim": "intermediate_dim",
+    "--num-kv-heads": "num_kv_heads",
+}
+
+
+def _parse_model_config(argv_slice):
+    """Walk *argv_slice* for MODEL_FLAGS and return ``(consumed_count, kwargs_dict)``."""
+    kwargs = {}
+    i = 0
+    while i < len(argv_slice):
+        flag = argv_slice[i]
+        if flag in MODEL_FLAGS and i + 1 < len(argv_slice):
+            key = MODEL_FLAGS[flag]
+            val = argv_slice[i + 1]
+            if key == "activation_checkpointing":
+                kwargs[key] = float(val)
+            elif key == "precision_bits":
+                kwargs[key] = int(val)
+            elif key in ("gpu_peak_tflops", "gpu_hbm_bw_gbps"):
+                kwargs[key] = float(val)
+            else:
+                kwargs[key] = int(val)
+            i += 2
+            continue
+        break
+    return i, kwargs
+
+
 def main():
     """Route to single-trace report, --timeline Gantt, --compare multi-trace, or --annotate chrome://tracing.
     No argparse dependency — manual argv parsing keeps the import footprint small.
@@ -28,19 +69,31 @@ def main():
     if len(sys.argv) < 2:
         print("Usage:")
         print("  Analyze a single trace:     python main.py <trace.json> [--output report.txt]")
-        print("  Compare multiple traces:    python main.py --compare trace1.json trace2.json (etc.) [--output comparison.csv]")
+        print("                               [--hidden-dim N] [--num-layers N] [--num-heads N] [--seq-len N]")
+        print("                               [--vocab-size N] [--batch-size N] [--num-gpus N] [--activation-checkpointing F]")
+        print("  Compare multiple traces:    python main.py --compare trace1.json trace2.json ... [--output comparison.csv]")
+        print("                               [--hidden-dim N] [--num-layers N] [--num-heads N] [--seq-len N]")
+        print("                               [--vocab-size N] [--batch-size N] [--num-gpus N] [--activation-checkpointing F]")
         print("  Annotate trace with phases: python main.py --annotate <trace.json> [--output annotated.json]")
+        print("                               [--hidden-dim N] [--num-layers N] [--num-heads N] [--seq-len N]")
+        print("                               [--vocab-size N] [--batch-size N] [--num-gpus N] [--activation-checkpointing F]")
         print("  Text phase timeline:        python main.py --timeline <trace.json>")
         sys.exit(1)
 
     if sys.argv[1] == "--annotate":
         trace_file = None
         output_file = None
+        mc_kwargs = {}
         i = 2
         while i < len(sys.argv):
             if sys.argv[i] == "--output" and i + 1 < len(sys.argv):
                 output_file = sys.argv[i + 1]
                 i += 2
+                continue
+            if sys.argv[i] in MODEL_FLAGS:
+                consumed, kw = _parse_model_config(sys.argv[i:])
+                mc_kwargs.update(kw)
+                i += consumed
                 continue
             elif not sys.argv[i].startswith("--"):
                 trace_file = sys.argv[i]
@@ -52,7 +105,11 @@ def main():
             base, ext = os.path.splitext(trace_file)
             output_file = f"{base}_annotated{ext}"
         from trace_annotator import annotate_trace
-        annotate_trace(trace_file, output_file)
+        from bottleneck_detector import ModelConfig
+        cfg = ModelConfig(**mc_kwargs) if mc_kwargs else None
+        if cfg and not cfg.is_configured:
+            print("Warning: --hidden-dim, --num-layers, and --batch-size are required for MFU/HFU.")
+        annotate_trace(trace_file, output_file, model_config=cfg)
         return
 
     if sys.argv[1] == "--timeline":
@@ -78,27 +135,50 @@ def main():
     if sys.argv[1] == "--compare":
         trace_files = []
         output_file = None
+        mc_kwargs = {}
         i = 2
         while i < len(sys.argv):
-            if sys.argv[i] == "--output":
-                if i + 1 < len(sys.argv):
-                    output_file = sys.argv[i + 1]
-                    i += 2
-                    continue
+            if sys.argv[i] == "--output" and i + 1 < len(sys.argv):
+                output_file = sys.argv[i + 1]
+                i += 2
+                continue
+            if sys.argv[i] in MODEL_FLAGS:
+                consumed, kw = _parse_model_config(sys.argv[i:])
+                mc_kwargs.update(kw)
+                i += consumed
+                continue
             elif not sys.argv[i].startswith("--"):
                 trace_files.append(sys.argv[i])
             i += 1
         if len(trace_files) < 2:
             print("Error: --compare requires at least 2 trace files.")
             sys.exit(1)
-        compare_traces(trace_files, output_file)
+        from bottleneck_detector import ModelConfig
+        cfg = ModelConfig(**mc_kwargs) if mc_kwargs else None
+        compare_traces(trace_files, output_file, model_config=cfg)
         return
 
     # Default: single-trace analysis
     trace_file = sys.argv[1]
     output_file = None
-    if len(sys.argv) >= 3 and sys.argv[2] == "--output":
-        output_file = sys.argv[3] if len(sys.argv) > 3 else None
+    mc_kwargs = {}
+    i = 2
+    while i < len(sys.argv):
+        if sys.argv[i] == "--output" and i + 1 < len(sys.argv):
+            output_file = sys.argv[i + 1]
+            i += 2
+            continue
+        if sys.argv[i] in MODEL_FLAGS:
+            consumed, kw = _parse_model_config(sys.argv[i:])
+            mc_kwargs.update(kw)
+            i += consumed
+            continue
+        i += 1
+
+    from bottleneck_detector import ModelConfig
+    cfg = ModelConfig(**mc_kwargs) if mc_kwargs else None
+    if cfg and not cfg.is_configured:
+        print("Warning: --hidden-dim, --num-layers, and --batch-size are required for MFU/HFU.")
 
     print(f"Loading trace from {trace_file}...")
     parser = TraceParser(trace_file)
@@ -116,7 +196,7 @@ def main():
     sanitize_optimizer(fsdp, step_start, step_end)
 
     print(f"Detected {len(fsdp.units)} FSDP units.")
-    report = Report(fsdp, roots, output_path=output_file)
+    report = Report(fsdp, roots, output_path=output_file, model_config=cfg)
     text, markers = report.generate_report()
 
     print(text)

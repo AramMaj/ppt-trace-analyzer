@@ -33,7 +33,7 @@ def _format_bottleneck_summary(metrics_list, aggregated) -> str:
     return "; ".join(parts)
 
 
-def compare_traces(trace_files, output_file=None):
+def compare_traces(trace_files, output_file=None, model_config=None):
     """Process multiple traces and print a side-by-side comparison table.
 
     Analyses every ProfilerStep in each trace so the table shows one row per
@@ -45,6 +45,8 @@ def compare_traces(trace_files, output_file=None):
         Paths to Chrome Trace JSON files.
     output_file : str or None
         If given, writes a CSV copy of the comparison table.
+    model_config : ModelConfig or None
+        Enables MFU/HFU/tokens-per-second columns in the comparison table.
     """
     from pipeline import process_all_steps
 
@@ -52,7 +54,7 @@ def compare_traces(trace_files, output_file=None):
     for tf in trace_files:
         label = os.path.basename(tf)
         print(f"Processing {label}...", file=sys.stderr)
-        step_results = process_all_steps(tf)
+        step_results = process_all_steps(tf, model_config=model_config)
         if not step_results:
             print(f"  FAILED to load {tf}", file=sys.stderr)
             continue
@@ -65,11 +67,13 @@ def compare_traces(trace_files, output_file=None):
 
     # Build the comparison table row by row
     rows = []
+    has_tp = model_config is not None
     headers = [
         "Trace", "Layers",
         "Step wall", "AG fwd", "Fwd cmp", "AG bwd", "Bwd cmp",
         "RS", "Opt", "TP total", "Total GPU",
-        "Util", "CtC", "Comm", "FSDP comm", "TP comm",
+        "Util", "CtC", "MFU", "HFU",
+        "Comm", "FSDP comm", "TP comm",
         "Overlap", "Serial eff", "Idle",
         "ExpC", "AG Ovl",
         "F-Ovl", "B-Ovl",
@@ -91,6 +95,8 @@ def compare_traces(trace_files, output_file=None):
         total_gpu = agg.get("total_gpu_us", 0) + tp_total
 
         avg_util = sum(m.gpu_util for m in metrics_list) / max(len(metrics_list), 1)
+        mfu = report.throughput_metrics.get('mfu', 0) if hasattr(report, 'throughput_metrics') else 0
+        hfu = report.throughput_metrics.get('hfu', 0) if hasattr(report, 'throughput_metrics') else 0
         # New universal metrics (compute-to-comm, exposed comm, AG overlap eff)
         ctc_vals = [m.compute_to_comm_ratio for m in metrics_list]
         non_inf = [v for v in ctc_vals if v != float('inf')]
@@ -126,6 +132,8 @@ def compare_traces(trace_files, output_file=None):
             "Total GPU": total_gpu,
             "Util": avg_util,
             "CtC": avg_ctc,
+            "MFU": mfu,
+            "HFU": hfu if hfu else 0,
             "Comm": comm_ratio,
             "FSDP comm": fsdp_comm_ratio,
             "TP comm": tp_comm_ratio,
@@ -152,6 +160,8 @@ def compare_traces(trace_files, output_file=None):
                 return f"{v:.1%}"
             elif header == "CtC":
                 return "inf" if v == float('inf') else f"{v:.2f}x"
+            elif header in ("MFU", "HFU"):
+                return f"{v:.1%}" if v and v > 0 else "N/A"
             elif header in ("Mem peak",):
                 return f"{v:.1f}G" if v > 0 else "N/A"
             elif header in ("Step wall", "AG fwd", "Fwd cmp", "AG bwd", "Bwd cmp",
