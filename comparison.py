@@ -70,14 +70,14 @@ def compare_traces(trace_files, output_file=None, model_config=None):
     has_tp = model_config is not None
     headers = [
         "Trace", "Layers",
-        "Step wall", "AG fwd", "Fwd cmp", "AG bwd", "Bwd cmp",
-        "RS", "Opt", "TP total", "Total GPU",
-        "Util", "CtC", "MFU", "HFU",
-        "Comm", "FSDP comm", "TP comm",
-        "Overlap", "Serial eff", "Idle",
-        "ExpC", "AG Ovl",
-        "F-Ovl", "B-Ovl",
-        "Mem peak",
+        "Step wall", "AG forward", "Forward compute", "AG backward", "Backward compute",
+        "Reduce scatter", "Optimizer", "TP total", "Total GPU",
+        "GPU util", "Compute-to-comm ratio", "MFU", "HFU",
+        "Comm ratio", "FSDP comm ratio", "TP comm ratio",
+        "Pipeline overlap", "Serial efficiency", "Pipeline idle",
+        "Exposed comm fraction", "AG overlap efficiency",
+        "Fwd TP overlap", "Bwd TP overlap",
+        "Peak memory",
         "Bottlenecks",
     ]
 
@@ -122,29 +122,29 @@ def compare_traces(trace_files, output_file=None, model_config=None):
             "Trace": label,
             "Layers": num_units,
             "Step wall": step_wall,
-            "AG fwd": ag_fwd,
-            "Fwd cmp": fwd_cmp,
-            "AG bwd": ag_bwd,
-            "Bwd cmp": bwd_cmp,
-            "RS": rs,
-            "Opt": opt,
+            "AG forward": ag_fwd,
+            "Forward compute": fwd_cmp,
+            "AG backward": ag_bwd,
+            "Backward compute": bwd_cmp,
+            "Reduce scatter": rs,
+            "Optimizer": opt,
             "TP total": tp_total,
             "Total GPU": total_gpu,
-            "Util": avg_util,
-            "CtC": avg_ctc,
+            "GPU util": avg_util,
+            "Compute-to-comm ratio": avg_ctc,
             "MFU": mfu,
             "HFU": hfu if hfu else 0,
-            "Comm": comm_ratio,
-            "FSDP comm": fsdp_comm_ratio,
-            "TP comm": tp_comm_ratio,
-            "Overlap": overlap_ratio,
-            "Serial eff": serial_eff,
-            "Idle": idle_ratio,
-            "ExpC": avg_expc,
-            "AG Ovl": avg_ag_ovl,
-            "F-Ovl": avg_fwd_ovl,
-            "B-Ovl": avg_bwd_ovl,
-            "Mem peak": mem_peak_gib,
+            "Comm ratio": comm_ratio,
+            "FSDP comm ratio": fsdp_comm_ratio,
+            "TP comm ratio": tp_comm_ratio,
+            "Pipeline overlap": overlap_ratio,
+            "Serial efficiency": serial_eff,
+            "Pipeline idle": idle_ratio,
+            "Exposed comm fraction": avg_expc,
+            "AG overlap efficiency": avg_ag_ovl,
+            "Fwd TP overlap": avg_fwd_ovl,
+            "Bwd TP overlap": avg_bwd_ovl,
+            "Peak memory": mem_peak_gib,
             "Bottlenecks": bneck,
         })
 
@@ -154,18 +154,20 @@ def compare_traces(trace_files, output_file=None, model_config=None):
     def _fmt_val(row, header) -> str:
         v = row[header]
         if isinstance(v, float):
-            if header in ("Util", "Comm", "FSDP comm", "TP comm",
-                          "Overlap", "Serial eff", "Idle",
-                          "ExpC", "AG Ovl", "F-Ovl", "B-Ovl"):
+            if header in ("GPU util", "Comm ratio", "FSDP comm ratio", "TP comm ratio",
+                          "Pipeline overlap", "Serial efficiency", "Pipeline idle",
+                          "Exposed comm fraction", "AG overlap efficiency",
+                          "Fwd TP overlap", "Bwd TP overlap"):
                 return f"{v:.1%}"
-            elif header == "CtC":
+            elif header == "Compute-to-comm ratio":
                 return "inf" if v == float('inf') else f"{v:.2f}x"
             elif header in ("MFU", "HFU"):
                 return f"{v:.1%}" if v and v > 0 else "N/A"
-            elif header in ("Mem peak",):
+            elif header in ("Peak memory",):
                 return f"{v:.1f}G" if v > 0 else "N/A"
-            elif header in ("Step wall", "AG fwd", "Fwd cmp", "AG bwd", "Bwd cmp",
-                            "RS", "Opt", "TP total", "Total GPU"):
+            elif header in ("Step wall", "AG forward", "Forward compute", "AG backward",
+                            "Backward compute", "Reduce scatter", "Optimizer",
+                            "TP total", "Total GPU"):
                 return _format_us(v)
             else:
                 return f"{v:.1f}"
