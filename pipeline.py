@@ -5,6 +5,7 @@ report, text).
 
 Handles multi-step traces (8B TP = 3 ProfilerSteps, async TP = 1) by filtering
 to the last step and sanitising optimiser nodes that leak from earlier steps.
+``process_all_steps`` iterates over every ProfilerStep for multi-step comparison.
 """
 
 from trace_parser import TraceParser, TraceParserHelper
@@ -44,6 +45,54 @@ def process_trace(trace_file: str):
     text, markers = report.generate_report()
 
     return report.aggregated, report.metrics_list, fsdp, report, text
+
+
+def process_all_steps(trace_file: str):
+    """Analyse every ProfilerStep in the trace and return one result per step.
+
+    Returns a list of ``(step_name, aggregated, metrics_list, fsdp, report, text)``
+    tuples, one per ProfilerStep.  Handles single-step traces gracefully.
+    """
+    from trace_annotator import _find_profiler_steps, _filter_gpu_events, _prune_roots_for_step
+
+    steps = _find_profiler_steps(trace_file)
+    if not steps:
+        # Fall back to last-step behaviour
+        result = process_trace(trace_file)
+        if result is None:
+            return []
+        _, metrics_list, fsdp, report, text = result
+        return [("Trace", report.aggregated, metrics_list, fsdp, report, text)]
+
+    results = []
+    for step_name, step_start, step_end, _ in steps:
+        parser = TraceParser(trace_file)
+        if not parser.load():
+            continue
+        _filter_gpu_events(parser, step_start, step_end)
+        roots = parser.build_tree()
+        roots = _prune_roots_for_step(roots, step_name, step_start, step_end)
+        parser.attribute_gpu_kernel_with_logical_operation(roots)
+        parser.attribute_memory(roots)
+
+        detector = StandardFSDPDetector(gpu_events=parser.gpu_events)
+        fsdp = detector.extract_fsdp_phases(roots)
+
+        fsdp.optimizer_step = [
+            n for n in fsdp.optimizer_step
+            if step_start <= n.start_time <= step_end
+        ]
+        fsdp.optimizer_zero_grad = [
+            n for n in fsdp.optimizer_zero_grad
+            if step_start <= n.start_time <= step_end
+        ]
+
+        report = Report(fsdp, roots, output_path=None)
+        text, markers = report.generate_report()
+        sname = step_name.replace("ProfilerStep#", "Step#")
+        results.append((sname, report.aggregated, report.metrics_list, fsdp, report, text))
+
+    return results
 
 
 def select_profiler_step(roots, parser):

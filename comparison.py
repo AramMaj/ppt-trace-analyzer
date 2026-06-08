@@ -3,9 +3,9 @@ Lets you compare compute-vs-communication ratios, pipeline overlap, async TP
 efficiency, and bottleneck profiles across different model configurations
 (TP degree, FSDP sharding, batch size, GPU count) in a single table.
 
-Each row is one trace; columns include per-phase GPU time, utilisation,
-FSDP/TP communication breakdown, overlap metrics, and the top-3 bottlenecks.
-Also writes CSV for spreadsheet import.
+Each row is one (trace, ProfilerStep) pair; columns include per-phase GPU time,
+utilisation, compute-to-comm ratio, exposed comm, FSDP/TP communication breakdown,
+overlap metrics, and the top-3 bottlenecks.  Also writes CSV for spreadsheet import.
 """
 
 import csv
@@ -36,6 +36,9 @@ def _format_bottleneck_summary(metrics_list, aggregated) -> str:
 def compare_traces(trace_files, output_file=None):
     """Process multiple traces and print a side-by-side comparison table.
 
+    Analyses every ProfilerStep in each trace so the table shows one row per
+    (trace, step) — useful for comparing steady-state across steps.
+
     Parameters
     ----------
     trace_files : list of str
@@ -43,17 +46,18 @@ def compare_traces(trace_files, output_file=None):
     output_file : str or None
         If given, writes a CSV copy of the comparison table.
     """
-    from pipeline import process_trace
+    from pipeline import process_all_steps
 
     trace_results = []
     for tf in trace_files:
         label = os.path.basename(tf)
         print(f"Processing {label}...", file=sys.stderr)
-        result = process_trace(tf)
-        if result is None:
+        step_results = process_all_steps(tf)
+        if not step_results:
             print(f"  FAILED to load {tf}", file=sys.stderr)
             continue
-        trace_results.append((label, result))
+        for step_name, agg, metrics_list, fsdp, report, text in step_results:
+            trace_results.append((f"{label} ({step_name})", agg, metrics_list, fsdp, report, text))
 
     if not trace_results:
         print("No traces processed successfully.")
@@ -73,7 +77,7 @@ def compare_traces(trace_files, output_file=None):
         "Bottlenecks",
     ]
 
-    for label, (agg, metrics_list, fsdp, report, text) in trace_results:
+    for label, agg, metrics_list, fsdp, report, text in trace_results:
         num_units = len(metrics_list)
         step_wall = agg.get("step_wall", 0)
 
