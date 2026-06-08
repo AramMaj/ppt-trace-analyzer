@@ -65,8 +65,9 @@ def compare_traces(trace_files, output_file=None):
         "Trace", "Layers",
         "Step wall", "AG fwd", "Fwd cmp", "AG bwd", "Bwd cmp",
         "RS", "Opt", "TP total", "Total GPU",
-        "Util", "Comm", "FSDP comm", "TP comm",
+        "Util", "CtC", "Comm", "FSDP comm", "TP comm",
         "Overlap", "Serial eff", "Idle",
+        "ExpC", "AG Ovl",
         "F-Ovl", "B-Ovl",
         "Mem peak",
         "Bottlenecks",
@@ -86,6 +87,13 @@ def compare_traces(trace_files, output_file=None):
         total_gpu = agg.get("total_gpu_us", 0) + tp_total
 
         avg_util = sum(m.gpu_util for m in metrics_list) / max(len(metrics_list), 1)
+        # New universal metrics (compute-to-comm, exposed comm, AG overlap eff)
+        ctc_vals = [m.compute_to_comm_ratio for m in metrics_list]
+        non_inf = [v for v in ctc_vals if v != float('inf')]
+        avg_ctc = sum(non_inf) / max(len(non_inf), 1) if non_inf else float('inf')
+        avg_expc = sum(m.exposed_comm_fraction for m in metrics_list) / max(len(metrics_list), 1)
+        avg_ag_ovl = sum(m.ag_fwd_overlap_efficiency for m in metrics_list) / max(len(metrics_list), 1)
+
         overlap_ratio = agg.get("overlap_ratio", 0)
         serial_eff = agg.get("serial_exec_efficiency", 0)
         idle_ratio = agg.get("idle_ratio", 0)
@@ -113,12 +121,15 @@ def compare_traces(trace_files, output_file=None):
             "TP total": tp_total,
             "Total GPU": total_gpu,
             "Util": avg_util,
+            "CtC": avg_ctc,
             "Comm": comm_ratio,
             "FSDP comm": fsdp_comm_ratio,
             "TP comm": tp_comm_ratio,
             "Overlap": overlap_ratio,
             "Serial eff": serial_eff,
             "Idle": idle_ratio,
+            "ExpC": avg_expc,
+            "AG Ovl": avg_ag_ovl,
             "F-Ovl": avg_fwd_ovl,
             "B-Ovl": avg_bwd_ovl,
             "Mem peak": mem_peak_gib,
@@ -132,8 +143,11 @@ def compare_traces(trace_files, output_file=None):
         v = row[header]
         if isinstance(v, float):
             if header in ("Util", "Comm", "FSDP comm", "TP comm",
-                          "Overlap", "Serial eff", "Idle", "F-Ovl", "B-Ovl"):
+                          "Overlap", "Serial eff", "Idle",
+                          "ExpC", "AG Ovl", "F-Ovl", "B-Ovl"):
                 return f"{v:.1%}"
+            elif header == "CtC":
+                return "inf" if v == float('inf') else f"{v:.2f}x"
             elif header in ("Mem peak",):
                 return f"{v:.1f}G" if v > 0 else "N/A"
             elif header in ("Step wall", "AG fwd", "Fwd cmp", "AG bwd", "Bwd cmp",
