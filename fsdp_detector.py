@@ -552,7 +552,7 @@ class StandardFSDPDetector:
                     fsdp_units.optimizer_zero_grad.append(n)
 
     def _detect_reduce_scatter(self, roots: List[LogicalOperation], fsdp_units: FSDP):
-        """FSDP2 gradient sync: latest ``FSDP::post_backward_reduce (layer.X)`` node
+        """FSDP2 gradient sync: latest ``FSDP::post_bkward_reduce (layer.X)`` node
         per unit.  This is the NCCL reduce-scatter on ``mesh_fsdp`` that averages
         gradients across the FSDP shard group.  In the 8B trace, these nodes appear
         on the backward stream thread (tid=24759) interleaved with autograd.
