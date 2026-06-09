@@ -1,14 +1,17 @@
 """
-Parser for PyTorch Profiler Chrome Trace JSON — loads, classifies, builds
-the CPU event tree, and attributes GPU time / memory back to CPU operations.
-The central data structure is ``LogicalOperation``, one per CPU trace event.
+Parser for converting Pytorch Profiler JSON Files in Chrome Trace Format 
+to internal representations. 
 
-Handles the two trace patterns we've validated against:
+Main parser steps: 
+    load():              Traces are extracted from input trace file and get 
+                         classified as CPU, Memory and GPU operations
 
-1. **8B TP trace** (``rank0_trace_8b_tp.json``): 3 ProfilerSteps on pid=24529
-   tid=24529 (fwd) + tid=24759 (bwd thread).  34 FSDP units (8B LLaMA).
-2. **async TP trace** (``async-tensor-parall/rank0_trace.json``): single
-   ProfilerStep#9, 8 units.  TP collectives on ``mesh_tp`` PG.
+    build_tree():        CPU events are structured as tree signifying 
+                         caller and callee
+
+    attribute_kernels(): Connect GPU Kernels to initiating CPU operations 
+
+    attribute_memory():  Attribute memory usage to logical operations 
 """
 
 import json
@@ -109,22 +112,15 @@ class LogicalOperation:
 # ---------------------------------------------------------------------------
 
 class TraceParser:
-    """Loads Chrome Trace JSON, classifies events, builds the CPU tree, and
-    attributes GPU/memory.
-
-    Usage::
-        parser = TraceParser("trace.json")
-        parser.load()
-        roots = parser.build_tree()
-        parser.attribute_gpu_kernel_with_logical_operation(roots)
-        parser.attribute_memory(roots)
+    """ TraceParser loads trace file, classifies trace events and builds a tree of CPU operations.
+        CPU operations get attributed with initiated GPU and memory usage. 
     """
 
     GPU_CATEGORIES = {'kernel', 'gpu_memcpy', 'gpu_memset',
                       'gpu_user_annotation', 'gpu_op'}
+    
     # Profiler wrapper events (annotation, op) are excluded from GPU_WORK — they
     # have zero duration and would inflate double-counting if attributed as work.
-
     GPU_WORK_CATEGORIES = {'kernel', 'gpu_memcpy', 'gpu_memset'}
 
     def __init__(self, trace_file: str):
@@ -140,11 +136,8 @@ class TraceParser:
 
     def load(self) -> bool:
         """Load JSON, classify events into CPU/GPU/memory lists, and resolve async dependencies.
-
         Validates minimal trace structure: rejects empty/degenerate files, counts
         events per category, and reports load errors via stderr rather than crashing.
-        The 8B TP trace delivers ~98k CPU + ~8k GPU events across 3 ProfilerSteps;
-        the async TP trace yields ~4k CPU + ~1k GPU events.
         """
         try:
             with open(self.trace_file, 'r') as f:
@@ -205,8 +198,9 @@ class TraceParser:
                 self.gpu_events.append(ev)
                 self.gpu_events_by_stream[stream].append(ev)
             elif ph in ('i', 'C') and ('memory' in cat.lower() or name == "[memory]"):
-                self.memory_events.append(ev)
-
+                self.memory_ev
+                
+        self.events_sorted = sorted(events, key=lambda e: e.get('ts', 0))
         self.async_resolver.resolve_dependencies(self.all_events)
         return True
 
@@ -231,10 +225,7 @@ class TraceParser:
         """Build a parent-child tree per (pid, tid) using time-nesting (same logic as Chrome Trace Viewer).
         An event A is a child of B iff A's interval is fully contained within B's.
 
-        Assumes events on the same thread are well-nested.  In the 8B TP trace,
-        the ProfilerStep#3 root (pid=24529 tid=24529) correctly nests all 34 layer's
-        pre_forward → fwd_compute → pre_backward → bwd_compute. Overlapping siblings
-        (rare in PyTorch profiler) cause missing nodes.
+        Assumes events on the same thread are well-nested.  
 
         Warns on threads with zero events per (pid, tid) to flag empty trace segments.
         """
@@ -275,24 +266,14 @@ class TraceParser:
     def attribute_gpu_kernel_with_logical_operation(self, roots: List[LogicalOperation]):
         """Attribute GPU kernel time to the CPU nodes that launched them, using
         two complementary strategies:
+            1. **External-ID correlation** - match GPU events to CPU events by shared ``External id``. 
+                Solve disambiguities through ``correlation id``
 
-        1. **External-ID correlation** — match ``External id`` on GPU events to the
-           *deepest* CPU node that claims that id.  Deepest-match avoids inflating
-           a parent node when multiple children share the same ext_id (common in
-           FSDP2 ``all_gather_copy_out`` where split/empty kernels all carry the
-           parent's external id).
-        2. **Time-overlap heuristic** — for uncorrelated events, find the most-recently-
-           started still-active CPU span at the kernel's timestamp (max-heap sweep).
+            2. **Time-overlap heuristic** — for uncorrelated events, find the most-recently-
+                started still-active CPU span at the kernel's timestamp (max-heap sweep).
 
         After direct attribution, ``gpu_duration`` is propagated upward so every node
         carries the cumulative GPU time for its subtree.
-
-        Known gaps:
-        - The 8B trace has fused ADAMW kernels executing ~727ms *after* the CPU
-          ProfilerStep#3 ends — these fall outside our 5% time margin and are lost.
-        - Strategy 2 misattributes when GPU kernels overlap sibling CPU spans
-          (e.g. NCCL all-gather queued concurrently with aten::copy_ on the same
-          stream).  Together both strategies cover >95% of cases.
         """
         if not self.gpu_events:
             warnings.warn("No GPU events to attribute — trace may be CPU-only")
