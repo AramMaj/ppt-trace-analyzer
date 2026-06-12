@@ -23,3 +23,9 @@ docs/*
 # Ignore pycache
 !__pycache__
 __pycache__/*
+
+# Ignore venv
+.venv
+venv
+venv/
+.venv/
