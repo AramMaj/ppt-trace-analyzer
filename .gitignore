@@ -8,6 +8,9 @@
 # Ignore all trace files
 *.json
 
+# Ignore all html files
+*.html
+
 # Ignore the lichtenberg folder itself
 !lichtenberg
 
