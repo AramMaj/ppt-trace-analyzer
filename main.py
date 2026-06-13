@@ -1,13 +1,20 @@
-"""CLI entry point.  Dispatches to four modes:
+""" 
+CLI entry point for initiating trace anaylsis. 
 
-  Default     — per-layer GPU time breakdown + bottleneck report
-  --timeline  — ASCII Gantt chart of FSDP2 pipeline stagger
-  --compare   — side-by-side benchmark table (2+ traces)
-  --annotate  — Chrome Trace JSON with phases, flows, counters, bottlenecks
-                (optional: --hidden-dim, --num-layers, etc. for MFU/HFU)
+Usage 
+    python main.py [mode] [traceFilePath] [info] [--output filename]
 
-Each mode delegates to dedicated modules (pipeline.py, timeline.py,
-comparison.py, trace_annotator.py) — ``main.py`` only parses argv and prints.
+    [mode] - Specifiaction of analysis type 
+        " "          - Bottleneck report + Per-layer GPU time breakdown 
+        "--timeline" - ASCII Gantt chart of FSDP2 pipeline stagger
+        "--compare"" - Side-by-Side benchmark table of two or more traces
+        "--annotate" - Annotated Trace File in Chrome Trace Format 
+
+    [info] - Specification of model architecture and training details  
+        "--hidden-dim", "--num-layers", "--num-heads", "--seq-len", 
+        "--vocab-size", "--batch-size", "--batch-size", 
+        "--activation-checkpointing", "--precision-bits", "--gpu-peak-tflops", 
+        "--gpu-hbm-bw", "--intermediate-dim", "--num-kv-heads"
 """
 
 import sys
@@ -40,7 +47,7 @@ MODEL_FLAGS = {
 
 
 def _parse_model_config(argv_slice):
-    """Walk *argv_slice* for MODEL_FLAGS and return ``(consumed_count, kwargs_dict)``."""
+    """Extract MODEL_FlAGS from input arguments"""
     kwargs = {}
     i = 0
     while i < len(argv_slice):
@@ -63,9 +70,8 @@ def _parse_model_config(argv_slice):
 
 
 def main():
-    """Route to single-trace report, --timeline Gantt, --compare multi-trace, or --annotate chrome://tracing.
-    No argparse dependency — manual argv parsing keeps the import footprint small.
-    """
+    """CLI entry point to the program"""
+
     if len(sys.argv) < 2:
         print("Usage:")
         print("  Analyze a single trace:     python main.py <trace.json> [--output report.txt]")
@@ -194,11 +200,10 @@ def main():
     detector = StandardFSDPDetector(gpu_events=parser.gpu_events)
     fsdp = detector.extract_fsdp_phases(roots)
     sanitize_optimizer(fsdp, step_start, step_end)
-
     print(f"Detected {len(fsdp.units)} FSDP units.")
+
     report = Report(fsdp, roots, output_path=output_file, model_config=cfg)
     text, markers = report.generate_report()
-
     print(text)
 
     if output_file:
