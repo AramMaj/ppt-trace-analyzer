@@ -84,7 +84,36 @@ def main():
         print("                               [--hidden-dim N] [--num-layers N] [--num-heads N] [--seq-len N]")
         print("                               [--vocab-size N] [--batch-size N] [--num-gpus N] [--activation-checkpointing F]")
         print("  Text phase timeline:        python main.py --timeline <trace.json>")
+        print("  HTML report:                python main.py --html <trace.json> [--output report.html]")
+        print("                               [--hidden-dim N] [--num-layers N] etc.")
         sys.exit(1)
+
+    if sys.argv[1] == "--html":
+        trace_file = None
+        output_file = None
+        mc_kwargs = {}
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--output" and i + 1 < len(sys.argv):
+                output_file = sys.argv[i + 1]
+                i += 2
+                continue
+            if sys.argv[i] in MODEL_FLAGS:
+                consumed, kw = _parse_model_config(sys.argv[i:])
+                mc_kwargs.update(kw)
+                i += consumed
+                continue
+            elif not sys.argv[i].startswith("--"):
+                trace_file = sys.argv[i]
+            i += 1
+        if trace_file is None:
+            print("Error: --html requires a trace file.")
+            sys.exit(1)
+        from html_report import generate_html_report
+        from bottleneck_detector import ModelConfig
+        cfg = ModelConfig(**mc_kwargs) if mc_kwargs else None
+        generate_html_report(trace_file, output_path=output_file, model_config=cfg)
+        return
 
     if sys.argv[1] == "--annotate":
         trace_file = None
