@@ -198,9 +198,7 @@ class TraceParser:
                 self.gpu_events.append(ev)
                 self.gpu_events_by_stream[stream].append(ev)
             elif ph in ('i', 'C') and ('memory' in cat.lower() or name == "[memory]"):
-                self.memory_ev
-                
-        self.events_sorted = sorted(events, key=lambda e: e.get('ts', 0))
+                self.memory_events.append(ev)
         self.async_resolver.resolve_dependencies(self.all_events)
         return True
 
