@@ -80,6 +80,7 @@ def main():
         print("  Compare multiple traces:    python main.py --compare trace1.json trace2.json ... [--output comparison.csv]")
         print("                               [--hidden-dim N] [--num-layers N] [--num-heads N] [--seq-len N]")
         print("                               [--vocab-size N] [--batch-size N] [--num-gpus N] [--activation-checkpointing F]")
+        print("                               [--html] (generate HTML comparison page instead of text table)")
         print("  Annotate trace with phases: python main.py --annotate <trace.json> [--output annotated.json]")
         print("                               [--hidden-dim N] [--num-layers N] [--num-heads N] [--seq-len N]")
         print("                               [--vocab-size N] [--batch-size N] [--num-gpus N] [--activation-checkpointing F]")
@@ -171,11 +172,16 @@ def main():
         trace_files = []
         output_file = None
         mc_kwargs = {}
+        html_mode = False
         i = 2
         while i < len(sys.argv):
             if sys.argv[i] == "--output" and i + 1 < len(sys.argv):
                 output_file = sys.argv[i + 1]
                 i += 2
+                continue
+            if sys.argv[i] == "--html":
+                html_mode = True
+                i += 1
                 continue
             if sys.argv[i] in MODEL_FLAGS:
                 consumed, kw = _parse_model_config(sys.argv[i:])
@@ -190,7 +196,11 @@ def main():
             sys.exit(1)
         from bottleneck_detector import ModelConfig
         cfg = ModelConfig(**mc_kwargs) if mc_kwargs else None
-        compare_traces(trace_files, output_file, model_config=cfg)
+        if html_mode:
+            from html_report import generate_compare_html
+            generate_compare_html(trace_files, output_path=output_file, model_config=cfg)
+        else:
+            compare_traces(trace_files, output_file, model_config=cfg)
         return
 
     # Default: single-trace analysis

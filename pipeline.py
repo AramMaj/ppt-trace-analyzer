@@ -13,7 +13,7 @@ from fsdp_detector import StandardFSDPDetector
 from bottleneck_detector import Report
 
 
-def process_trace(trace_file: str):
+def process_trace(trace_file: str, model_config=None):
     """Full pipeline end-to-end.
 
     1. ``TraceParser.load`` → classify events, validate JSON structure
@@ -41,7 +41,7 @@ def process_trace(trace_file: str):
     fsdp = detector.extract_fsdp_phases(roots)
     sanitize_optimizer(fsdp, step_start, step_end)
 
-    report = Report(fsdp, roots, output_path=None)
+    report = Report(fsdp, roots, output_path=None, model_config=model_config)
     text, markers = report.generate_report()
 
     return report.aggregated, report.metrics_list, fsdp, report, text
@@ -60,7 +60,7 @@ def process_all_steps(trace_file: str, model_config=None):
 
     steps = _find_profiler_steps(trace_file)
     if not steps:
-        result = process_trace(trace_file)
+        result = process_trace(trace_file, model_config=model_config)
         if result is None:
             return []
         _, metrics_list, fsdp, report, text = result
