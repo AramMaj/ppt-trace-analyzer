@@ -287,18 +287,17 @@ class StandardFSDPDetector:
     """
     def __init__(self, gpu_events: Optional[List[dict]] = None):
         self.gpu_events = gpu_events or []
+        self.all_nodes = []
 
     def _detect_all_gather_fwd(self, roots: List[LogicalOperation], fsdp_units: FSDP):
-        """FSDP2 forward unshard: ``FSDP::all_gather`` is a child of ``FSDP::pre_forward (layer.X)``.
-        This is the NCCL all-gather on ``mesh_fsdp`` that collects full parameters
-        from all shards onto this rank.  The ``all_gather_copy_out`` sibling then
-        memcpy-splits the result into contiguous flat parameters (split_with_sizes_copy).
-        """
-        all_nodes = list(TraceParserHelper.iter_nodes(roots))
+        """Function searches ``FSDP::pre_forward (layer.X)`` event which consists of 
+        ``FSDP::all_gather`` (NCCL all-gather that collects parameters) and 
+        `all_gather_copy_out`` (Copies result into flat parameters)"""
+        self.all_nodes = list(TraceParserHelper.iter_nodes(roots))
         for unit in fsdp_units.units:
             pre_fwd_list = []
             for name in _fsdp_phase_name('pre_forward', unit.layer_name):
-                pre_fwd_list.extend(n for n in all_nodes if n.name == name)
+                pre_fwd_list.extend(n for n in self.all_nodes if n.name == name)
             if not pre_fwd_list:
                 continue
             pre_fwd = _pick_latest_with_allgather(pre_fwd_list)
@@ -309,14 +308,12 @@ class StandardFSDPDetector:
                         unit.all_gather_fwd.append(ch)
 
     def _detect_all_gather_bwd(self, roots: List[LogicalOperation], fsdp_units: FSDP):
-        """FSDP2 backward re-gather: ``FSDP::all_gather`` / ``FSDP::all_gather_copy_out``
-        children of ``FSDP::pre_backward (layer.X)``.  Collect both the NCCL all-gather
-        collective and the ``split_with_sizes_copy`` data movement (mirrors forward)."""
-        all_nodes = list(TraceParserHelper.iter_nodes(roots))
+        """Function searches ``FSDP::pre_backward (layer.X)`` event which consists of 
+        ``FSDP::all_gather`` and  `all_gather_copy_out`` (mirrors forward) """
         for unit in fsdp_units.units:
             pre_bwd_list = []
             for name in _fsdp_phase_name('pre_backward', unit.layer_name):
-                pre_bwd_list.extend(n for n in all_nodes if n.name == name)
+                pre_bwd_list.extend(n for n in self.all_nodes if n.name == name)
             if not pre_bwd_list:
                 continue
             pre_bwd = _pick_latest_with_allgather(pre_bwd_list)
@@ -340,9 +337,10 @@ class StandardFSDPDetector:
         )
 
     def _detect_fwd_cmp(self, roots: List[LogicalOperation], fsdp_units: FSDP, profiler_tid: int = None):
-        """Forward compute: collect attn/MLP/norm ops between each layer's
-        ``all_gather_copy_out.end_time`` and the **next** layer's ``all_gather_copy_out.start``.
-
+        """Function collects all compute operations (attn/MLP/norm) starting from its 
+        layer's ``all_gather_copy_out.end_time`` and the **next** layer's 
+        ``all_gather_copy_out.start`
+        
         Using the next layer's copy_out start as the boundary (instead of
         ``pre_forward.start``) is correct for FSDP2 pipelining: the NCCL all-gather
         inside the next layer's ``pre_forward`` runs concurrently with this layer's
@@ -356,7 +354,7 @@ class StandardFSDPDetector:
         profiler thread (tid=24529) is matched — the backward-stream events
         are reserved for ``_detect_bwd_cmp``.
         """
-        all_nodes = sorted(TraceParserHelper.iter_nodes(roots), key=lambda n: n.start_time)
+        all_nodes = sorted(self.all_nodes, key=lambda n: n.start_time)
         units = fsdp_units.units
         has_other_tids = self._has_other_tids(all_nodes, profiler_tid)
 
@@ -417,9 +415,9 @@ class StandardFSDPDetector:
                     unit.fwd_compute.append(n)
 
     def _detect_bwd_cmp(self, roots: List[LogicalOperation], fsdp_units: FSDP, profiler_tid: int = None):
-        """Backward compute: ``autograd::engine::evaluate_function`` ops between
-        ``all_gather_copy_out.end_time`` (from ``pre_backward``) and
-        ``reduce_scatter.start_time``.
+        """Function collects all ``autograd::engine::evaluate_function`` compute 
+        operations between its layer's ``all_gather_copy_out.end_time`` 
+        (from ``pre_backward``) and ``reduce_scatter.start_time``.
 
         The ``all_gather_copy_out`` end is more precise than ``pre_backward.end``
         — the latter may include trailing bookkeeping children after the copy_out.
@@ -430,7 +428,7 @@ class StandardFSDPDetector:
         was missed, then to ``pre_backward.start_time`` of the next layer for
         traces (e.g. gpu-server steps #4/#6/#8) that skip reduce-scatter.
         """
-        all_nodes = sorted(TraceParserHelper.iter_nodes(roots), key=lambda n: n.start_time)
+        all_nodes = sorted(self.all_nodes, key=lambda n: n.start_time)
 
         # All pre_backward nodes across every layer, sorted by start_time =
         # backward execution order (last forward layer's bwd completes first).
@@ -545,8 +543,7 @@ class StandardFSDPDetector:
         ProfilerStep#3 ends — these nodes are collected but their GPU time may
         fall outside the active step's time margin (handled in ``sanitize_optimizer``).
         """
-        all_nodes = list(TraceParserHelper.iter_nodes(roots))
-        for n in all_nodes:
+        for n in self.all_nodes:
             if n.name.startswith('Optimizer.step#'):
                 if n not in fsdp_units.optimizer_step:
                     fsdp_units.optimizer_step.append(n)
@@ -555,16 +552,15 @@ class StandardFSDPDetector:
                     fsdp_units.optimizer_zero_grad.append(n)
 
     def _detect_reduce_scatter(self, roots: List[LogicalOperation], fsdp_units: FSDP):
-        """FSDP2 gradient sync: latest ``FSDP::post_backward_reduce (layer.X)`` node
+        """FSDP2 gradient sync: latest ``FSDP::post_bkward_reduce (layer.X)`` node
         per unit.  This is the NCCL reduce-scatter on ``mesh_fsdp`` that averages
         gradients across the FSDP shard group.  In the 8B trace, these nodes appear
         on the backward stream thread (tid=24759) interleaved with autograd.
         """
-        all_nodes = list(TraceParserHelper.iter_nodes(roots))
         for unit in fsdp_units.units:
             rs_list = []
             for name in _fsdp_phase_name('post_backward_reduce', unit.layer_name):
-                rs_list.extend(n for n in all_nodes if n.name == name)
+                rs_list.extend(n for n in self.all_nodes if n.name == name)
             if rs_list:
                 rs_node = max(rs_list, key=lambda n: n.start_time)
                 if rs_node not in unit.reduce_scatter:
