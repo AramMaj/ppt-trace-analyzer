@@ -450,7 +450,7 @@ def generate_html_report(trace_file: str, output_path: str = None, model_config:
         BOTTLENECK_TAGS=_bottleneck_tags(metrics_list),
         PER_UNIT_TABLE=_per_unit_table(metrics_list),
     )
-    html = body
+    html = _render_page(title, body, json.dumps(chart_data))
     with open(output_path, 'w') as f:
         f.write(html)
     print(f"HTML report written to {output_path}")

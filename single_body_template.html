@@ -1,0 +1,52 @@
+<h1>{{TITLE}}</h1>
+<p class="subtitle">{{SUBTITLE}}</p>
+{{DASHBOARD_CARDS}}
+
+<div class="section">
+<h2>Phase Composition</h2>
+<div class="chart-row">
+  <div class="chart-box"><canvas id="phasePie"></canvas></div>
+  <div>{{PHASE_METRICS_TABLE}}</div>
+</div>
+</div>
+
+<div class="section">
+<h2>GPU Utilization per Layer</h2>
+<div class="chart-box tall"><canvas id="utilChart"></canvas></div>
+<p style="font-size:.8em;color:#888;margin-top:4px">Values &gt;100% indicate multi-stream concurrency (compute + NCCL on different streams).</p>
+</div>
+
+<div class="section">
+<h2>Compute vs Communication per Layer</h2>
+<div class="chart-box tall"><canvas id="compCommChart"></canvas></div>
+</div>
+
+<div class="section">
+<h2>Efficiency &amp; Overlap</h2>
+<div class="chart-row">
+  <div>
+    <div class="chart-box"><canvas id="overlapChart"></canvas></div>
+    <p style="font-size:.8em;color:#888;margin-top:4px;text-align:center">Comm overlap efficiency (GPU time / wall span). Low = well hidden.</p>
+  </div>
+  <div>
+    <div class="chart-box"><canvas id="ctcChart"></canvas></div>
+    <p style="font-size:.8em;color:#888;margin-top:4px;text-align:center">Compute-to-communication ratio per layer</p>
+  </div>
+</div>
+</div>
+
+<div class="section">
+<h2>Key Metrics</h2>
+<div class="chart-row">
+  <div>{{EFFICIENCY_TABLE}}</div>
+  <div>
+    <h3 style="font-size:.95em;margin-bottom:8px;color:#16213e">Bottlenecks</h3>
+    {{BOTTLENECK_TAGS}}
+  </div>
+</div>
+</div>
+
+<div class="section">
+<h2>Per-Unit Details</h2>
+{{PER_UNIT_TABLE}}
+</div>
