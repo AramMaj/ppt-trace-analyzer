@@ -225,9 +225,9 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
     COMPARE_METRICS.append(("Compute-to-comm ratio", lambda r, m: sum(x.compute_to_comm_ratio for x in m) / max(len(m), 1), "higher", True))
 
     # MFU/HFU
-    COMPARE_METRICS.append(("MFU", lambda r, m, tp=r4: tp.get("mfu", 0) if m else 0, "higher", True))
-    COMPARE_METRICS.append(("HFU", lambda r, m, tp=r4: tp.get("hfu", 0) if m else 0, "higher", True))
-    COMPARE_METRICS.append(("Tokens/sec/GPU", lambda r, m, tp=r4: tp.get("tokens_per_second_per_gpu", 0) if m else 0, "higher", True))
+    COMPARE_METRICS.append(("MFU", lambda r, m, tp=None: tp.get("mfu", 0) if tp else 0, "higher", True))
+    COMPARE_METRICS.append(("HFU", lambda r, m, tp=None: tp.get("hfu", 0) if tp else 0, "higher", True))
+    COMPARE_METRICS.append(("Tokens/sec/GPU", lambda r, m, tp=None: tp.get("tokens_per_second_per_gpu", 0) if tp else 0, "higher", True))
 
     # Comm breakdown
     COMPARE_METRICS.append(("Comm ratio", lambda r, m: r.get("comm_ratio", 0), "lower", True))
@@ -261,8 +261,6 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
     for ri, (label, agg, metrics, steps, tp) in enumerate(all_results):
         vals = {}
         for name, fn, direction, do_color in COMPARE_METRICS:
-            if "tp=r4" in str(fn.__code__.co_varnames) if hasattr(fn, "__code__") else False:
-                pass
             try:
                 if name in ("MFU", "HFU", "Tokens/sec/GPU"):
                     _tp = all_results[ri][4]
