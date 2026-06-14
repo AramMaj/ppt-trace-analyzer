@@ -211,9 +211,39 @@ def _per_unit_table(metrics_list: list) -> str:
         cols.append("Mem")
     cols.append("Issues")
     thead = "".join(f"<th>{c}</th>" if c != "Issues" else '<th style="text-align:left">Issues</th>' for c in cols)
+
+    # Collect raw numeric values per column for outlier detection
+    numeric_keys = [
+        "ag_fwd_gpu_us", "fwd_cmp_gpu_us", "ag_bwd_gpu_us", "bwd_cmp_gpu_us",
+        "rs_gpu_us", "optimizer_gpu_us", "total_gpu_us", "layer_span_us",
+        "gpu_util", "compute_to_comm_ratio", "exposed_comm_fraction",
+        "kernel_count", "avg_kernel_dur_us",
+    ]
+    col_values = {k: [] for k in numeric_keys}
+    dicts = [m.to_dict() for m in metrics_list]
+    for d in dicts:
+        for k in numeric_keys:
+            v = d.get(k, 0)
+            if isinstance(v, (int, float)) and v > 0:
+                col_values[k].append(v)
+
+    def _median(vals):
+        s = sorted(vals)
+        n = len(s)
+        if n == 0:
+            return 0
+        return s[n // 2]
+
+    medians = {k: _median(col_values[k]) for k in numeric_keys}
+
+    def _is_outlier(val, med):
+        if not isinstance(val, (int, float)) or val == float('inf') or med <= 0:
+            return False
+        return val > 2 * med or val < 0.5 * med
+
     rows = ""
-    for m in metrics_list:
-        d = m.to_dict()
+    for mi, m in enumerate(metrics_list):
+        d = dicts[mi]
         issues = Bottlenecks.detect(m)
         ctc = d.get('compute_to_comm_ratio', 0)
         ctc_str = f"{ctc:.2f}x" if ctc != float('inf') else "inf"
@@ -225,48 +255,53 @@ def _per_unit_table(metrics_list: list) -> str:
             mem_str = "N/A"
         tags = ""
         if issues:
-            top = issues[0]
-            tag_cls = "tag-high" if any(w in top for w in ["bound", "saturation", "BW", "heavy"]) else "tag-med"
-            tag_txt = top.split("(")[0].strip()
-            extras = len(issues) - 1
-            if extras:
-                tags = f'<span class="tag {tag_cls}">{tag_txt} +{extras}</span>'
-            else:
-                tags = f'<span class="tag {tag_cls}">{tag_txt}</span>'
+            for i, iss in enumerate(issues):
+                if i > 0:
+                    tags += ", "
+                tags += f'<span class="tag">{iss.split("(")[0].strip()}</span>'
         else:
             tags = '<span class="tag tag-ok">OK</span>'
 
+        def _cell(val, fmt, key=None):
+            cls = ""
+            title = ""
+            if key is not None:
+                raw = d.get(key, 0)
+                med = medians[key]
+                if _is_outlier(raw, med):
+                    cls = ' class="ol"'
+                    ratio = raw / med if med > 0 else 0
+                    title = f' title="{ratio:.1f}× column median"'
+            return f"<td{cls}{title}>{fmt}</td>"
+
         rows += f"""<tr>
 <td>{m.layer_name}</td>
-<td>{_format_us(d['ag_fwd_gpu_us'])}</td>
-<td>{_format_us(d['fwd_cmp_gpu_us'])}</td>
-<td>{_format_us(d['ag_bwd_gpu_us'])}</td>
-<td>{_format_us(d['bwd_cmp_gpu_us'])}</td>
-<td>{_format_us(d['rs_gpu_us'])}</td>
-<td>{_format_us(d['optimizer_gpu_us'])}</td>
-<td>{_format_us(d['total_gpu_us'])}</td>
-<td>{d['gpu_util']:.1%}</td>
-<td>{ctc_str}</td>
-<td>{exp:.1%}</td>
-<td>{_format_us(d['layer_span_us'])}</td>
-<td>{d['kernel_count']}</td>
-<td>{d['avg_kernel_dur_us']:.1f}us</td>
+{_cell(d['ag_fwd_gpu_us'], _format_us(d['ag_fwd_gpu_us']), 'ag_fwd_gpu_us')}
+{_cell(d['fwd_cmp_gpu_us'], _format_us(d['fwd_cmp_gpu_us']), 'fwd_cmp_gpu_us')}
+{_cell(d['ag_bwd_gpu_us'], _format_us(d['ag_bwd_gpu_us']), 'ag_bwd_gpu_us')}
+{_cell(d['bwd_cmp_gpu_us'], _format_us(d['bwd_cmp_gpu_us']), 'bwd_cmp_gpu_us')}
+{_cell(d['rs_gpu_us'], _format_us(d['rs_gpu_us']), 'rs_gpu_us')}
+{_cell(d['optimizer_gpu_us'], _format_us(d['optimizer_gpu_us']), 'optimizer_gpu_us')}
+{_cell(d['total_gpu_us'], _format_us(d['total_gpu_us']), 'total_gpu_us')}
+{_cell(d['gpu_util'], f"{d['gpu_util']:.1%}", 'gpu_util')}
+{_cell(ctc, ctc_str, 'compute_to_comm_ratio')}
+{_cell(exp, f"{exp:.1%}", 'exposed_comm_fraction')}
+{_cell(d['layer_span_us'], _format_us(d['layer_span_us']), 'layer_span_us')}
+{_cell(d['kernel_count'], str(d['kernel_count']), 'kernel_count')}
+{_cell(d['avg_kernel_dur_us'], f"{d['avg_kernel_dur_us']:.1f}us", 'avg_kernel_dur_us')}
 """
         if mem_avail:
             rows += f"<td>{mem_str}</td>\n"
         rows += f"<td class='tag-cell'>{tags}</td></tr>\n"
 
+    info = '<p style="font-size:10px;color:#999;margin-top:6px">Yellow cells are outliers (&gt;2× or &lt;0.5× column median).</p>'
     return f"""<div class="table-wrap">
 <table><tr>{thead}</tr>
 {rows}
-</table></div>"""
+</table>{info}</div>"""
 
 
 BOTTLENECK_DESCRIPTIONS = {
-    "compute-bound":
-        "Attention/MLP kernels dominate GPU time. Try Flash Attention, kernel fusion (torch.compile), "
-        "or reducing the model size.",
-
     "I/O or pipeline bubble":
         "Wall time with no active FSDP work. May indicate a data-loading stall, Python GIL contention, "
         "or a synchronization barrier.",

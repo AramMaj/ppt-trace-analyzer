@@ -773,13 +773,6 @@ class Bottlenecks:
         # Section A — Classic bottlenecks
         # ================================================================
 
-        # --- Compute-bound ---
-        # attn/MLP/norm (fwd_cmp + bwd_cmp) dominates total GPU.
-        comp_gpu = metrics.fwd_cmp_gpu + metrics.bwd_cmp_gpu
-        comp_ratio = comp_gpu / total_gpu if total_gpu > 0 else 0.0
-        if comp_ratio >= cls.COMP_HEAVY_THRESHOLD:
-            issues.append(f"compute-bound (comp={comp_ratio:.1%})")
-
         # --- Pipeline bubble (idle between layers) ---
         # Sweep-line found wall time where NO FSDP shard group was active —
         # a pipeline bubble, data-loading stall, or synchronisation point.
@@ -811,9 +804,9 @@ class Bottlenecks:
 
         # --- Dominant phase (>35% of GPU) ---
         # First phase exceeding 35% of total GPU time gets flagged.
+        # Fwd cmp / Bwd cmp excluded — they are expected to dominate in FSDP.
         phases = [("AG fwd", metrics.ag_fwd_gpu), ("AG bwd", metrics.ag_bwd_gpu),
-                  ("RS", metrics.rs_gpu), ("Fwd cmp", metrics.fwd_cmp_gpu),
-                  ("Bwd cmp", metrics.bwd_cmp_gpu), ("Optimizer", metrics.optimizer_gpu),
+                  ("RS", metrics.rs_gpu), ("Optimizer", metrics.optimizer_gpu),
                   ("TP", tp_total)]
         for name, val in phases:
             if total_gpu > 0 and val / total_gpu > 0.35:
