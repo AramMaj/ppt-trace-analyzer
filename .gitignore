@@ -8,6 +8,11 @@
 # Ignore all trace files
 *.json
 
+# Ignore all html files (except template files in the root)
+*.html
+!html_template.html
+!*_body_template.html
+
 # Ignore the lichtenberg folder itself
 !lichtenberg
 
