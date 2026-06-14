@@ -23,14 +23,42 @@ COLORS = {
 
 
 
-def generate_html_report(trace_file, output_path=None, model_config=None):
+def generate_html_report(trace_file: str, output_path: str = None, model_config: ModelConfig = None):
+    """Run the full pipeline and write an enhanced HTML report with charts."""
     result = process_trace(trace_file, model_config=model_config)
-    if result is None: return
+    if result is None:
+        print(f"Failed to load {trace_file}.")
+        return
+
     aggregated, metrics_list, fsdp, report, text = result
+
     if output_path is None:
         base, _ = os.path.splitext(trace_file)
         output_path = f"{base}.html"
+
     title = f"Trace Analysis — {os.path.basename(trace_file)}"
-    body = f"""<h1>{title}</h1><p class="subtitle">{os.path.basename(trace_file)} — {len(metrics_list)} layers</p>"""
-    with open(output_path, 'w') as f: f.write(body)
+    num_layers = len(metrics_list)
+
+    # Serialise chart data to JSON
+    chart_data = {
+        "phasePie": json.loads(_phase_pie_chart_data(aggregated)),
+        "utilChart": json.loads(_util_chart_data(metrics_list)),
+        "compCommChart": json.loads(_comp_comm_chart_data(metrics_list, aggregated)),
+        "overlapChart": json.loads(_overlap_chart_data(metrics_list)),
+        "ctcChart": json.loads(_ctc_chart_data(metrics_list)),
+    }
+
+    body = _fill(
+        _load_body("single_body_template.html"),
+        TITLE=title,
+        SUBTITLE=f"{os.path.basename(trace_file)} — {num_layers} layers",
+        DASHBOARD_CARDS=_dashboard_cards(aggregated, metrics_list, report.throughput_metrics),
+        PHASE_METRICS_TABLE=_phase_metrics_table(aggregated, num_layers),
+        EFFICIENCY_TABLE=_efficiency_table(aggregated, metrics_list),
+        BOTTLENECK_TAGS=_bottleneck_tags(metrics_list),
+        PER_UNIT_TABLE=_per_unit_table(metrics_list),
+    )
+    html = body
+    with open(output_path, 'w') as f:
+        f.write(html)
     print(f"HTML report written to {output_path}")
