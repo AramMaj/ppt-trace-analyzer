@@ -14,6 +14,19 @@ from collections import defaultdict
 
 _HERE = os.path.dirname(__file__)
 _PAGE_TEMPLATE = None
+_BODY_TEMPLATES = {}
+
+
+def _render_page(title: str, body: str, chart_data: str) -> str:
+    global _PAGE_TEMPLATE
+    if _PAGE_TEMPLATE is None:
+        with open(os.path.join(_HERE, "html_template.html")) as f:
+            _PAGE_TEMPLATE = f.read()
+    return (_PAGE_TEMPLATE
+            .replace("{{TITLE}}", title)
+            .replace("{{BODY}}", body)
+            .replace("{{CHART_DATA}}", chart_data))
+
 
 def _load_body(name: str) -> str:
     if name not in _BODY_TEMPLATES:
@@ -28,12 +41,287 @@ def _fill(template: str, **kwargs) -> str:
     return template
 
 
+def _dashboard_cards(aggregated: dict, metrics_list: list, throughput: dict) -> str:
+    num_layers = len(metrics_list)
+    wall = aggregated.get("step_wall", 0)
+    wall_str = _format_us(wall)
+    avg_util = sum(m.gpu_util for m in metrics_list) / len(metrics_list) if metrics_list else 0
+    avg_ctc = sum(m.compute_to_comm_ratio for m in metrics_list) / len(metrics_list) if metrics_list else 0
+    ctc_str = f"{avg_ctc:.2f}x" if avg_ctc != float('inf') else "inf"
+    steps_s = f"{1e6 / wall:.1f}" if wall > 0 else "N/A"
+    mfu = throughput.get('mfu', 0)
+    tps = throughput.get('tokens_per_second_per_gpu', 0)
+
+    cards = f"""
+    <div class="card"><div class="value">{num_layers}</div><div class="label">Layers</div></div>
+    <div class="card"><div class="value">{wall_str}</div><div class="label">Step Wall</div></div>
+    <div class="card"><div class="value">{steps_s}/s</div><div class="label">Steps/sec</div></div>
+    <div class="card"><div class="value">{avg_util:.1%}</div><div class="label">GPU Util</div></div>
+    <div class="card"><div class="value">{ctc_str}</div><div class="label">Comp:Comm</div></div>
+"""
+    if mfu > 0:
+        cards += f'<div class="card"><div class="value">{mfu:.1%}</div><div class="label">MFU</div></div>\n'
+        hfu = throughput.get('hfu', 0)
+        if hfu > 0 and abs(hfu - mfu) > 0.001:
+            cards += f'<div class="card"><div class="value">{hfu:.1%}</div><div class="label">HFU</div></div>\n'
+        cards += f'<div class="card"><div class="value">{tps:.1f}</div><div class="label">Tok/s/GPU</div></div>\n'
+    return f'<div class="dashboard">{cards}</div>'
+
+
+def _phase_pie_chart_data(aggregated: dict) -> str:
+    total = aggregated.get("total_gpu_us", 0) + aggregated.get("tp_total_gpu_us", 0)
+    if total == 0:
+        return "null"
+    phases = [
+        ("Forward compute", aggregated.get("fwd_cmp_gpu_us", 0), COLORS['fwd_cmp']),
+        ("Backward compute", aggregated.get("bwd_cmp_gpu_us", 0), COLORS['bwd_cmp']),
+        ("All-gather fwd", aggregated.get("ag_fwd_gpu_us", 0), COLORS['ag']),
+        ("All-gather bwd", aggregated.get("ag_bwd_gpu_us", 0), COLORS['ag']),
+        ("Reduce-scatter", aggregated.get("rs_gpu_us", 0), COLORS['rs']),
+        ("TP all-gather", aggregated.get("tp_ag_gpu_us", 0), COLORS['tp_ag']),
+        ("TP all-reduce", aggregated.get("tp_ar_gpu_us", 0), COLORS['tp_ar']),
+        ("TP reduce-scatter", aggregated.get("tp_rs_gpu_us", 0), COLORS['tp_rs']),
+        ("Optimizer", aggregated.get("optimizer_gpu_us", 0), COLORS['opt']),
+    ]
+    phases = [(l, v, c) for l, v, c in phases if v > 0]
+    labels = [p[0] for p in phases]
+    values = [round(p[1], 1) for p in phases]
+    colors = [p[2] for p in phases]
+    return json.dumps({"labels": labels, "values": values, "colors": colors})
+
 
 COLORS = {
     'fwd_cmp': '#4e79a7', 'bwd_cmp': '#e15759', 'ag': '#76b7b2',
     'rs': '#f28e2b', 'opt': '#59a14f', 'tp_ag': '#af7aa1',
     'tp_rs': '#ff9da7', 'tp_ar': '#9c755f',
 }
+
+
+def _util_chart_data(metrics_list: list) -> str:
+    labels = [m.layer_name for m in metrics_list]
+    values = [round(m.gpu_util * 100, 1) for m in metrics_list]
+    return json.dumps({"labels": labels, "values": values})
+
+
+def _comp_comm_chart_data(metrics_list: list, aggregated: dict) -> str:
+    labels = [m.layer_name for m in metrics_list]
+    tp_total = aggregated.get("tp_total_gpu_us", 0) / max(len(metrics_list), 1)
+    datasets = [
+        {"label": "Forward compute", "data": [round(m.fwd_cmp_gpu, 1) for m in metrics_list], "backgroundColor": COLORS['fwd_cmp']},
+        {"label": "Backward compute", "data": [round(m.bwd_cmp_gpu, 1) for m in metrics_list], "backgroundColor": COLORS['bwd_cmp']},
+        {"label": "FSDP comm", "data": [round(m.ag_fwd_gpu + m.ag_bwd_gpu + m.rs_gpu, 1) for m in metrics_list], "backgroundColor": COLORS['ag']},
+        {"label": "TP comm", "data": [round(tp_total, 1) for _ in metrics_list], "backgroundColor": COLORS['tp_ag']},
+    ]
+    return json.dumps({"labels": labels, "datasets": datasets})
+
+
+def _overlap_chart_data(metrics_list: list) -> str:
+    labels = ["AG forward", "AG backward", "Reduce scatter"]
+    vals = []
+    for attr in ["ag_fwd_overlap_efficiency", "ag_bwd_overlap_efficiency", "rs_overlap_efficiency"]:
+        vs = [getattr(m, attr) for m in metrics_list]
+        vals.append(round(sum(vs) / len(vs), 3) if vs else 0)
+    return json.dumps({"labels": labels, "values": vals})
+
+
+def _ctc_chart_data(metrics_list: list) -> str:
+    labels = [m.layer_name for m in metrics_list]
+    values = []
+    for m in metrics_list:
+        v = m.compute_to_comm_ratio
+        values.append(round(v, 2) if v != float('inf') else None)
+    return json.dumps({"labels": labels, "values": values})
+
+
+def _phase_metrics_table(aggregated: dict, num_layers: int) -> str:
+    total_gpu = aggregated.get("total_gpu_us", 0)
+    tp_total = aggregated.get("tp_total_gpu_us", 0)
+    total = total_gpu + tp_total
+
+    phases = [
+        ("All-gather fwd", "ag_fwd_gpu_us", COLORS['ag']),
+        ("Forward compute", "fwd_cmp_gpu_us", COLORS['fwd_cmp']),
+        ("  TP all-gather", "tp_ag_gpu_us", COLORS['tp_ag']),
+        ("  TP all-reduce", "tp_ar_gpu_us", COLORS['tp_ar']),
+        ("All-gather bwd", "ag_bwd_gpu_us", COLORS['ag']),
+        ("Backward compute", "bwd_cmp_gpu_us", COLORS['bwd_cmp']),
+        ("Reduce-scatter", "rs_gpu_us", COLORS['rs']),
+        ("  TP reduce-scatter", "tp_rs_gpu_us", COLORS['tp_rs']),
+        ("Optimizer step", "optimizer_gpu_us", COLORS['opt']),
+    ]
+
+    rows = ""
+    for label, key, color in phases:
+        per = aggregated.get(key, 0)
+        tot = per * num_layers
+        pct = per / total * 100 if total > 0 else 0
+        rows += f"<tr><td><span class='legend-dot' style='background:{color}'></span> {label}</td><td>{_format_us(per)}</td><td>{_format_us(tot)}</td><td>{pct:.1f}%</td></tr>\n"
+
+    rows += f"<tr style='border-top:2px solid #ccc'><td><strong>FSDP total</strong></td><td>{_format_us(total_gpu)}</td><td>{_format_us(total_gpu * num_layers)}</td><td></td></tr>\n"
+    rows += f"<tr><td><strong>TP total</strong></td><td>{_format_us(tp_total)}</td><td>{_format_us(tp_total * num_layers)}</td><td></td></tr>\n"
+    rows += f"<tr><td><strong>Total (incl. TP)</strong></td><td>{_format_us(total_gpu + tp_total)}</td><td>{_format_us((total_gpu + tp_total) * num_layers)}</td><td>100.0%</td></tr>\n"
+    rows += f"<tr><td>Total CPU</td><td>{_format_us(aggregated.get('total_cpu_us', 0))}</td><td></td><td></td></tr>\n"
+
+    return f"""<table>
+<tr><th>Phase</th><th>Per unit</th><th>Total</th><th>% GPU</th></tr>
+{rows}
+</table>"""
+
+
+def _efficiency_table(aggregated: dict, metrics_list: list) -> str:
+    total = aggregated.get("total_gpu_us", 0) + aggregated.get("tp_total_gpu_us", 0)
+    tp_total = aggregated.get("tp_total_gpu_us", 0)
+    fsdp_comm = aggregated.get("ag_fwd_gpu_us", 0) + aggregated.get("ag_bwd_gpu_us", 0) + aggregated.get("rs_gpu_us", 0)
+    comp = aggregated.get("fwd_cmp_gpu_us", 0) + aggregated.get("bwd_cmp_gpu_us", 0)
+    true_comp = comp - tp_total
+    avg_util = sum(m.gpu_util for m in metrics_list) / len(metrics_list) if metrics_list else 0
+    avg_ctc = sum(m.compute_to_comm_ratio for m in metrics_list) / len(metrics_list) if metrics_list else 0
+    max_span = max(m.layer_span for m in metrics_list) if metrics_list else 0
+    min_span = min(m.layer_span for m in metrics_list if m.layer_span > 0) or max_span
+    imbalance = max_span / min_span if min_span > 0 else 1
+    avg_fwd_ov = sum(m.fwd_comp_comm_overlap for m in metrics_list) / max(len(metrics_list), 1)
+    avg_bwd_ov = sum(m.bwd_comp_comm_overlap for m in metrics_list) / max(len(metrics_list), 1)
+    ov = aggregated.get("overlap_ratio", 0)
+    idle = aggregated.get("idle_ratio", 0)
+    serial = aggregated.get("serial_exec_efficiency", 0)
+
+    return f"""<table>
+<tr><th>Metric</th><th>Value</th></tr>
+<tr><td>True compute (ex-TP)</td><td>{true_comp / total:.1%}</td></tr>
+<tr><td>FSDP communication</td><td>{fsdp_comm / total:.1%}</td></tr>
+<tr><td>TP communication</td><td>{tp_total / total:.1%}</td></tr>
+<tr><td>Optimizer</td><td>{aggregated.get('optimizer_ratio', 0):.1%}</td></tr>
+<tr><td>Avg GPU utilization</td><td>{avg_util:.1%}</td></tr>
+<tr><td>Compute-to-comm ratio</td><td>{avg_ctc:.2f}x</td></tr>
+<tr><td>Layer span imbalance</td><td>{imbalance:.1f}x</td></tr>
+<tr style='border-top:2px solid #ccc'><td>Pipeline overlap</td><td>{ov:.1%}</td></tr>
+<tr><td>Serial execution</td><td>{serial:.1%}</td></tr>
+<tr><td>Idle / gap time</td><td>{idle:.1%}</td></tr>
+<tr><td>Fwd TP overlap</td><td>{avg_fwd_ov:.1%}</td></tr>
+<tr><td>Bwd TP overlap</td><td>{avg_bwd_ov:.1%}</td></tr>
+</table>"""
+
+
+def _per_unit_table(metrics_list: list) -> str:
+    mem_avail = any(m.memory_has_data for m in metrics_list)
+    cols = ["Layer", "AG fwd", "Fwd cmp", "AG bwd", "Bwd cmp", "RS", "Opt",
+            "Total", "Util", "CtC", "ExpC", "Span", "K#", "AvgK"]
+    if mem_avail:
+        cols.append("Mem")
+    cols.append("Issues")
+    thead = "".join(f"<th>{c}</th>" for c in cols)
+    rows = ""
+    for m in metrics_list:
+        d = m.to_dict()
+        issues = Bottlenecks.detect(m)
+        ctc = d.get('compute_to_comm_ratio', 0)
+        ctc_str = f"{ctc:.2f}x" if ctc != float('inf') else "inf"
+        exp = d.get('exposed_comm_fraction', 0)
+        mem_str = ""
+        if mem_avail and d.get('memory_peak', 0) > 0:
+            mem_str = f"{d['memory_peak']/(1024**3):.1f}G"
+        elif mem_avail:
+            mem_str = "N/A"
+        tags = ""
+        if issues:
+            for iss in issues[:3]:
+                tag_cls = "tag-high" if any(w in iss for w in ["bound", "saturation", "BW", "heavy"]) else "tag-med"
+                tags += f'<span class="tag {tag_cls}">{iss.split("(")[0].strip()}</span> '
+        else:
+            tags = '<span class="tag tag-ok">OK</span>'
+
+        rows += f"""<tr>
+<td>{m.layer_name}</td>
+<td>{_format_us(d['ag_fwd_gpu_us'])}</td>
+<td>{_format_us(d['fwd_cmp_gpu_us'])}</td>
+<td>{_format_us(d['ag_bwd_gpu_us'])}</td>
+<td>{_format_us(d['bwd_cmp_gpu_us'])}</td>
+<td>{_format_us(d['rs_gpu_us'])}</td>
+<td>{_format_us(d['optimizer_gpu_us'])}</td>
+<td>{_format_us(d['total_gpu_us'])}</td>
+<td>{d['gpu_util']:.1%}</td>
+<td>{ctc_str}</td>
+<td>{exp:.1%}</td>
+<td>{_format_us(d['layer_span_us'])}</td>
+<td>{d['kernel_count']}</td>
+<td>{d['avg_kernel_dur_us']:.1f}us</td>
+"""
+        if mem_avail:
+            rows += f"<td>{mem_str}</td>\n"
+        rows += f"<td style='text-align:left'>{tags}</td></tr>\n"
+
+    return f"""<div class="table-wrap">
+<table><tr>{thead}</tr>
+{rows}
+</table></div>"""
+
+
+def _bottleneck_tags(metrics_list: list) -> str:
+    all_issues = defaultdict(list)
+    for m in metrics_list:
+        issues = Bottlenecks.detect(m)
+        for iss in issues:
+            all_issues[iss].append(m.layer_name)
+
+    if not all_issues:
+        return '<p style="color:#2e7d32">No bottlenecks detected.</p>'
+
+    parts = ""
+    for iss, layers in sorted(all_issues.items(), key=lambda x: -len(x[1])):
+        count = len(layers)
+        if count >= len(metrics_list) * 0.5:
+            severity = "tag-high"
+        elif count >= 3:
+            severity = "tag-med"
+        else:
+            severity = "tag-low"
+        short = iss.split("(")[0].strip()
+        layers_str = ", ".join(layers[:4])
+        if len(layers) > 4:
+            layers_str += f" (+{len(layers) - 4})"
+        parts += f'<div style="margin:4px 0"><span class="tag {severity}">{short}</span> <span style="font-size:.8em;color:#666">{count} units — {layers_str}</span></div>\n'
+    return parts
+
+
+def generate_html_report(trace_file: str, output_path: str = None, model_config: ModelConfig = None):
+    """Run the full pipeline and write an enhanced HTML report with charts."""
+    result = process_trace(trace_file, model_config=model_config)
+    if result is None:
+        print(f"Failed to load {trace_file}.")
+        return
+
+    aggregated, metrics_list, fsdp, report, text = result
+
+    if output_path is None:
+        base, _ = os.path.splitext(trace_file)
+        output_path = f"{base}.html"
+
+    title = f"Trace Analysis — {os.path.basename(trace_file)}"
+    num_layers = len(metrics_list)
+
+    # Serialise chart data to JSON
+    chart_data = {
+        "phasePie": json.loads(_phase_pie_chart_data(aggregated)),
+        "utilChart": json.loads(_util_chart_data(metrics_list)),
+        "compCommChart": json.loads(_comp_comm_chart_data(metrics_list, aggregated)),
+        "overlapChart": json.loads(_overlap_chart_data(metrics_list)),
+        "ctcChart": json.loads(_ctc_chart_data(metrics_list)),
+    }
+
+    body = _fill(
+        _load_body("single_body_template.html"),
+        TITLE=title,
+        SUBTITLE=f"{os.path.basename(trace_file)} — {num_layers} layers",
+        DASHBOARD_CARDS=_dashboard_cards(aggregated, metrics_list, report.throughput_metrics),
+        PHASE_METRICS_TABLE=_phase_metrics_table(aggregated, num_layers),
+        EFFICIENCY_TABLE=_efficiency_table(aggregated, metrics_list),
+        BOTTLENECK_TAGS=_bottleneck_tags(metrics_list),
+        PER_UNIT_TABLE=_per_unit_table(metrics_list),
+    )
+    html = _render_page(title, body, json.dumps(chart_data))
+    with open(output_path, 'w') as f:
+        f.write(html)
+    print(f"HTML report written to {output_path}")
 
 
 def generate_compare_html(trace_files, output_path=None, model_config=None):
@@ -307,8 +595,7 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
                     elif _worse(val, bval, direction):
                         cell_class = ' class="cmp-worse"'
             cells += f"<td{cell_class}>{formatted}</td>"
-        table_rows += f"<tr>{cells}</tr>
-"
+        table_rows += f"<tr>{cells}</tr>\n"
 
     # Bottleneck summary per trace
     bneck_sections = ""
@@ -370,45 +657,3 @@ def _format_bottleneck_summary(metrics_list) -> str:
     for iss in list(all_issues.keys())[:3]:
         parts.append(iss)
     return "; ".join(parts)
-
-
-
-def generate_html_report(trace_file: str, output_path: str = None, model_config: ModelConfig = None):
-    """Run the full pipeline and write an enhanced HTML report with charts."""
-    result = process_trace(trace_file, model_config=model_config)
-    if result is None:
-        print(f"Failed to load {trace_file}.")
-        return
-
-    aggregated, metrics_list, fsdp, report, text = result
-
-    if output_path is None:
-        base, _ = os.path.splitext(trace_file)
-        output_path = f"{base}.html"
-
-    title = f"Trace Analysis — {os.path.basename(trace_file)}"
-    num_layers = len(metrics_list)
-
-    # Serialise chart data to JSON
-    chart_data = {
-        "phasePie": json.loads(_phase_pie_chart_data(aggregated)),
-        "utilChart": json.loads(_util_chart_data(metrics_list)),
-        "compCommChart": json.loads(_comp_comm_chart_data(metrics_list, aggregated)),
-        "overlapChart": json.loads(_overlap_chart_data(metrics_list)),
-        "ctcChart": json.loads(_ctc_chart_data(metrics_list)),
-    }
-
-    body = _fill(
-        _load_body("single_body_template.html"),
-        TITLE=title,
-        SUBTITLE=f"{os.path.basename(trace_file)} — {num_layers} layers",
-        DASHBOARD_CARDS=_dashboard_cards(aggregated, metrics_list, report.throughput_metrics),
-        PHASE_METRICS_TABLE=_phase_metrics_table(aggregated, num_layers),
-        EFFICIENCY_TABLE=_efficiency_table(aggregated, metrics_list),
-        BOTTLENECK_TAGS=_bottleneck_tags(metrics_list),
-        PER_UNIT_TABLE=_per_unit_table(metrics_list),
-    )
-    html = _render_page(title, body, json.dumps(chart_data))
-    with open(output_path, 'w') as f:
-        f.write(html)
-    print(f"HTML report written to {output_path}")
