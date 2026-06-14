@@ -22,10 +22,11 @@ def _render_page(title: str, body: str, chart_data: str) -> str:
     if _PAGE_TEMPLATE is None:
         with open(os.path.join(_HERE, "html_template.html")) as f:
             _PAGE_TEMPLATE = f.read()
+    data_script = f"<script>const DATA = {chart_data}</script>"
     return (_PAGE_TEMPLATE
             .replace("{{TITLE}}", title)
             .replace("{{BODY}}", body)
-            .replace("{{CHART_DATA}}", chart_data))
+            .replace("{{CHART_SCRIPT}}", data_script))
 
 
 def _load_body(name: str) -> str:

@@ -55,9 +55,8 @@ tr:hover { background: #f5f7fa; }
 </head>
 <body>
 {{BODY}}
+{{CHART_SCRIPT}}
 <script>
-const DATA = {{CHART_DATA}};
-
 const COLORS = { fwd: '#4e79a7', bwd: '#e15759', ag: '#76b7b2', rs: '#f28e2b', opt: '#59a14f', tp_ag: '#af7aa1', tp_rs: '#ff9da7', tp_ar: '#9c755f', fwd_cmp: '#4e79a7', bwd_cmp: '#e15759', fsdp_comm: '#76b7b2', tp_comm: '#af7aa1' };
 
 function doughnutChart(id, labels, values, colors) {
