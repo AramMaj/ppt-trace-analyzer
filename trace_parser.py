@@ -263,12 +263,16 @@ class TraceParser:
 
     def attribute_gpu_kernel_with_logical_operation(self, roots: List[LogicalOperation]):
         """Attribute GPU kernel time to the CPU nodes that launched them, using
-        two complementary strategies:
-            1. **External-ID correlation** - match GPU events to CPU events by shared ``External id``. 
-                Solve disambiguities through ``correlation id``
-
-            2. **Time-overlap heuristic** — for uncorrelated events, find the most-recently-
-                started still-active CPU span at the kernel's timestamp (max-heap sweep).
+        three complementary strategies in priority order:
+            1. **External-ID correlation** — match GPU events to CPU events
+               by shared ``External id`` (most reliable, set by PyTorch profiler).
+            2. **Correlation-ID matching** — for events lacking External ID,
+               match via ``args.correlation`` to the ``cudaLaunchKernel``
+               CPU event (set by CUDA runtime).  Disambiguates siblings at
+               the same tree depth that the time heuristic cannot separate.
+            3. **Time-overlap heuristic** — for events with neither External
+               ID nor correlation, find the most-recently-started still-active
+               CPU span at the kernel's timestamp (max-heap sweep).
 
         After direct attribution, ``gpu_duration`` is propagated upward so every node
         carries the cumulative GPU time for its subtree.
@@ -290,6 +294,21 @@ class TraceParser:
                 ext_to_gpu_node[ext_id].append(gpu_ev)
 
         event_to_node = {id(node.raw_event): node for node in all_nodes if node.raw_event}
+
+        # Build correlation-ID → node map for cudaLaunchKernel events
+        corr_to_node = {}
+        for node in all_nodes:
+            raw = node.raw_event or {}
+            corr = raw.get('args', {}).get('correlation')
+            if corr is not None:
+                corr_to_node.setdefault(corr, []).append(node)
+        # Prefer the deepest node for each correlation ID
+        def _subtree_size(n):
+            return 1 + sum(_subtree_size(c) for c in n.children)
+        for corr in corr_to_node:
+            if len(corr_to_node[corr]) > 1:
+                corr_to_node[corr] = [max(corr_to_node[corr], key=lambda n: _subtree_size(n))]
+
         all_cpu = [ev for evlist in self.cpu_events_by_pid_tid.values() for ev in evlist]
         all_cpu.sort(key=lambda e: e['ts'])
         gpu_no_extid = [ev for ev in self.gpu_events
@@ -301,6 +320,14 @@ class TraceParser:
         n_cpu = len(all_cpu)
         for gpu_ev in gpu_no_extid:
             ts = gpu_ev['ts']
+            corr = gpu_ev.get('args', {}).get('correlation')
+            # Strategy 2: correlation-ID match (deepest node)
+            if corr is not None and corr in corr_to_node:
+                node = corr_to_node[corr][0]
+                node.direct_gpu_duration += gpu_ev.get('dur', 0)
+                node.direct_gpu_kernels.append(gpu_ev)
+                continue
+            # Strategy 3: time-overlap heuristic
             while cpu_idx < n_cpu and all_cpu[cpu_idx]['ts'] <= ts:
                 ce = all_cpu[cpu_idx]
                 heapq.heappush(heap, (-ce['ts'], ce['ts'] + ce.get('dur', 0), ce))

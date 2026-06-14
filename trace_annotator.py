@@ -255,6 +255,8 @@ def _get_unattributed_gpu_spans(fsdp, roots):
 def _get_phase_spans(unit):
     """Wall-clock (CPU) spans for each FSDP phase — used by the layer TID
     and the ASCII timeline so the phase ordering is always correct.
+    The AG bwd span is clamped to ``unit.all_gather_bwd_end`` to prevent
+    overlap with backward compute of the same layer.
     """
     phases = []
     phase_src = [
@@ -271,6 +273,8 @@ def _get_phase_spans(unit):
         elif fallback_span is not None:
             span = (fallback_span[0], max(span[1], fallback_span[1]))
         if span is not None:
+            if label == "AG bwd" and unit.all_gather_bwd_end is not None:
+                span = (span[0], unit.all_gather_bwd_end)
             phases.append((label, span[0], span[1], node_list))
     return phases
 

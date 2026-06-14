@@ -197,6 +197,7 @@ class FSDPUnit:
         self.bwd_compute: List[LogicalOperation] = []
         self.fwd_compute_span: Optional[Tuple[float, float]] = None
         self.bwd_compute_span: Optional[Tuple[float, float]] = None
+        self.all_gather_bwd_end: Optional[float] = None
 
     @property
     def all_gather_fwd_gpu_kernels(self) -> List[dict]:
@@ -500,6 +501,7 @@ class StandardFSDPDetector:
                     if copy_out_end_bwd is None or ag_node.end_time > copy_out_end_bwd:
                         copy_out_end_bwd = ag_node.end_time
             all_gather_end = copy_out_end_bwd if copy_out_end_bwd is not None else (pre_bwd.end_time if pre_bwd else None)
+            unit.all_gather_bwd_end = all_gather_end
 
             if all_gather_end is None or rs_start is None:
                 continue
@@ -556,6 +558,11 @@ class StandardFSDPDetector:
         per unit.  This is the NCCL reduce-scatter on ``mesh_fsdp`` that averages
         gradients across the FSDP shard group.  In the 8B trace, these nodes appear
         on the backward stream thread (tid=24759) interleaved with autograd.
+
+        Falls back to NCCL GPU kernel matching when no CPU node is found for a
+        layer: searches for reduce-scatter NCCL kernels whose ``_pg_desc`` or
+        ``_coll_name`` indicates FSDP (not TP), then wraps them in a synthetic
+        ``LogicalOperation`` anchored to the last layer's backward compute window.
         """
         for unit in fsdp_units.units:
             rs_list = []
@@ -565,6 +572,34 @@ class StandardFSDPDetector:
                 rs_node = max(rs_list, key=lambda n: n.start_time)
                 if rs_node not in unit.reduce_scatter:
                     unit.reduce_scatter.append(rs_node)
+                continue
+
+            # Fallback: find NCCL ReduceScatter GPU kernels for this layer
+            bwd_span = unit.bwd_compute_span
+            if bwd_span is None:
+                continue
+            for ev in self.gpu_events:
+                pg = ev.get('_pg_desc', '')
+                coll = ev.get('_coll_name', '')
+                if pg == FSDP_PG_DESC and 'reduce_scatter' in coll.lower():
+                    ev_start = ev.get('ts', 0)
+                    ev_end = ev_start + ev.get('dur', 0)
+                    if ev_start >= bwd_span[0] and ev_end <= bwd_span[1] + 5000:
+                        import copy
+                        fake = copy.deepcopy(unit.bwd_compute[0]) if unit.bwd_compute else None
+                        if fake is not None:
+                            fake.name = f'FSDP::post_backward_reduce ({unit.layer_name})'
+                            fake.start_time = ev_start
+                            fake.end_time = ev_end
+                            fake.cpu_duration = 0.0
+                            fake.gpu_duration = ev.get('dur', 0)
+                            fake.direct_gpu_kernels = [ev]
+                            fake.direct_gpu_duration = ev.get('dur', 0)
+                            fake.children = []
+                            fake.external_ids = set()
+                            if fake not in unit.reduce_scatter:
+                                unit.reduce_scatter.append(fake)
+                                break
 
     def _profiler_tid(self, roots: List[LogicalOperation]):
         """Thread ID of the first ProfilerStep# event — used for conditional
