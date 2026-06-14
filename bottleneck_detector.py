@@ -172,6 +172,64 @@ def _compute_overlap_metrics(units: List['FSDPUnit']) -> dict:
     }
 
 
+def _get_layer_gpu_span(unit: 'FSDPUnit'):
+    """Collect all GPU kernel timestamps across every phase for an FSDP unit,
+    returning ``(gpu_start, gpu_end)`` as the union span of all GPU kernels.
+
+    Returns ``None`` if the unit has no attributed GPU kernels (no kernel
+    data in the trace, or attribution failed).
+    """
+    all_kernels = []
+    for phase_kernels in [
+        unit.all_gather_fwd_gpu_kernels,
+        unit.all_gather_bwd_gpu_kernels,
+        unit.reduce_scatter_gpu_kernels,
+        _collect_gpu_kernels(unit.fwd_compute),
+        _collect_gpu_kernels(unit.bwd_compute),
+    ]:
+        all_kernels.extend(phase_kernels)
+    if not all_kernels:
+        return None
+    min_start = min(k.get('ts', 0) for k in all_kernels)
+    max_end = max(k.get('ts', 0) + k.get('dur', 0) for k in all_kernels)
+    return (min_start, max_end)
+
+
+def _compute_cross_layer_overlap(units):
+    """GPU-execution overlap ratio between consecutive FSDP layers.
+
+    For each adjacent pair ``(N, N+1)``:
+        overlap = max(0, min(end_N, end_N1) - max(start_N, start_N1))
+        pair_ratio = overlap / max(span_N, span_N1)
+
+    Returns ``(avg_ratio, per_layer_overlap)`` where *per_layer_overlap[i]*
+    is layer *i*'s GPU-span overlap with layer *i-1* (``0.0`` for layer 0).
+    """
+    spans = [_get_layer_gpu_span(unit) for unit in units]
+    pair_ratios = []
+    for i in range(len(spans) - 1):
+        if spans[i] is None or spans[i + 1] is None:
+            pair_ratios.append(0.0)
+            continue
+        s1, e1 = spans[i]
+        s2, e2 = spans[i + 1]
+        overlap = max(0.0, min(e1, e2) - max(s1, s2))
+        max_span = max(e1 - s1, e2 - s2)
+        pair_ratios.append(overlap / max_span if max_span > 0 else 0.0)
+    per_layer = [0.0]
+    for i in range(1, len(spans)):
+        if spans[i - 1] is None or spans[i] is None:
+            per_layer.append(0.0)
+            continue
+        s_prev, e_prev = spans[i - 1]
+        s_cur, e_cur = spans[i]
+        overlap = max(0.0, min(e_prev, e_cur) - max(s_prev, s_cur))
+        cur_span = e_cur - s_cur
+        per_layer.append(overlap / cur_span if cur_span > 0 else 0.0)
+    avg = sum(pair_ratios) / len(pair_ratios) if pair_ratios else 0.0
+    return avg, per_layer
+
+
 def _collect_memory(unit: 'FSDPUnit', metrics: 'Metrics'):
     """Sum ``memory_delta`` (activation memory, parameter memory, gradient buffers)
     across all FSDP phase nodes.  Peak is max(allocated, freed), approximating
@@ -692,6 +750,12 @@ class Bottlenecks:
     # Computed as 1 − min(1.0, gpu_util).  Replaces old overlap-efficiency
     # formula which broke for async NCCL (CPU_wall = dispatch, not execution).
     EXPOSED_COMM_IDLE_THRESHOLD = 0.50
+    # Low cross-layer GPU pipeline overlap: consecutive layers' GPU execution
+    # spans overlap by < 20 %.  Layers run mostly sequentially on GPU, wasting
+    # the FSDP2 pipeline stagger.  Should be cross-checked against the CPU
+    # overlap_ratio (sweep-line metric) which measures pipelining of CPU
+    # dispatch spans — GPU overlap is a complementary signal.
+    PIPELINE_OVERLAP_LOW = 0.20
 
     @classmethod
     def detect(cls, metrics: Metrics) -> List[str]:
@@ -910,6 +974,17 @@ class Bottlenecks:
             issues.append(f"exposed communication "
                           f"(GPU idle={gpu_idle:.1%} of wall)")
 
+        # 14. Low cross-layer GPU pipeline overlap
+        # Adjacent layers' GPU execution spans overlap by less than 20%.
+        # In a well-pipelined FSDP2 step, the GPU kernel of layer N+1's
+        # all-gather (or fwd compute) should overlap with layer N's GPU
+        # work.  Low overlap means layers run mostly sequentially on
+        # the GPU — the pipeline stagger is not achieving its goal even
+        # if CPU dispatch spans overlap.
+        if 0 < metrics.pipeline_overlap_ratio < cls.PIPELINE_OVERLAP_LOW:
+            issues.append(f"low cross-layer GPU overlap "
+                          f"({metrics.pipeline_overlap_ratio:.1%})")
+
         return issues
 
 
@@ -1000,6 +1075,13 @@ class Report:
         self.aggregated["step_wall"] = ov['step_wall']
         self.aggregated["overlap_time"] = ov['overlap_time']
         self.aggregated["serial_time"] = ov['serial_time']
+
+        # Cross-layer GPU pipeline overlap: consecutive layers' GPU spans
+        cross_layer_avg, per_layer_overlaps = _compute_cross_layer_overlap(self.fsdp.units)
+        self.aggregated["pipeline_overlap_ratio"] = cross_layer_avg
+        for i, m in enumerate(self.metrics_list):
+            if i < len(per_layer_overlaps):
+                m.pipeline_overlap_ratio = per_layer_overlaps[i]
 
     def _compute_throughput(self):
         """Compute MFU / HFU / tokens-per-second from model config and step wall.
@@ -1152,6 +1234,8 @@ class Report:
         avg_bwd_ov = sum(m.bwd_comp_comm_overlap for m in self.metrics_list) / max(len(self.metrics_list), 1)
         lines.append(f"  Avg Fwd comp-comm:    {avg_fwd_ov:.1%} (avg TP overlap during fwd compute)")
         lines.append(f"  Avg Bwd comp-comm:    {avg_bwd_ov:.1%} (avg TP overlap during bwd compute)")
+        avg_po = self.aggregated.get("pipeline_overlap_ratio", 0.0)
+        lines.append(f"  Pipeline cross-layer: {avg_po:.1%} (GPU overlap between adjacent layers)")
         lines.append("")
 
         # Memory
@@ -1176,7 +1260,7 @@ class Report:
                   f"{'TP AR':>9s} {'AG bwd':>10s} {'Bwd cmp':>10s} {'RS':>10s} "
                   f"{'Opt':>10s} {'Total':>10s} "
                   f"{'Util':>6s}{'CtC':>6s}{'ExpC':>6s}"
-                  f"{'Span':>9s}{'F-Ovl':>8s}{'B-Ovl':>8s} "
+                  f"{'Span':>9s}{'F-Ovl':>8s}{'B-Ovl':>8s}{'P-Ovl':>7s} "
                   f"{'K#':>7s}{'AvgK':>7s}{mem_col:>10s}  {'Bottleneck'}")
         lines.append(header)
         lines.append("-" * len(header))
@@ -1210,6 +1294,7 @@ class Report:
                 f"{_format_us(d['layer_span_us']):>9s}"
                 f"{d['fwd_comp_comm_overlap']:>7.1%} "
                 f"{d['bwd_comp_comm_overlap']:>7.1%} "
+                f"{m.pipeline_overlap_ratio:>6.1%} "
                 f"{d['kernel_count']:>7d} "
                 f"{d['avg_kernel_dur_us']:>5.1f}us "
                 f"{mem_str:>10s}  "
