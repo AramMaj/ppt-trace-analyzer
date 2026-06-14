@@ -54,19 +54,19 @@ def _dashboard_cards(aggregated: dict, metrics_list: list, throughput: dict) -> 
     tps = throughput.get('tokens_per_second_per_gpu', 0)
 
     cards = f"""
-    <div class="card"><div class="value">{num_layers}</div><div class="label">Layers</div></div>
-    <div class="card"><div class="value">{wall_str}</div><div class="label">Step Wall</div></div>
-    <div class="card"><div class="value">{steps_s}/s</div><div class="label">Steps/sec</div></div>
-    <div class="card"><div class="value">{avg_util:.1%}</div><div class="label">GPU Util</div></div>
-    <div class="card"><div class="value">{ctc_str}</div><div class="label">Comp:Comm</div></div>
+    <div class="kpi-item"><div class="kpi-value">{num_layers}</div><div class="kpi-label">Layers</div></div>
+    <div class="kpi-item"><div class="kpi-value">{wall_str}</div><div class="kpi-label">Step Wall</div></div>
+    <div class="kpi-item"><div class="kpi-value">{steps_s}/s</div><div class="kpi-label">Steps/sec</div></div>
+    <div class="kpi-item"><div class="kpi-value">{avg_util:.1%}</div><div class="kpi-label">GPU Util</div></div>
+    <div class="kpi-item"><div class="kpi-value">{ctc_str}</div><div class="kpi-label">Comp:Comm</div></div>
 """
     if mfu > 0:
-        cards += f'<div class="card"><div class="value">{mfu:.1%}</div><div class="label">MFU</div></div>\n'
+        cards += f'<div class="kpi-item"><div class="kpi-value">{mfu:.1%}</div><div class="kpi-label">MFU</div></div>\n'
         hfu = throughput.get('hfu', 0)
         if hfu > 0 and abs(hfu - mfu) > 0.001:
-            cards += f'<div class="card"><div class="value">{hfu:.1%}</div><div class="label">HFU</div></div>\n'
-        cards += f'<div class="card"><div class="value">{tps:.1f}</div><div class="label">Tok/s/GPU</div></div>\n'
-    return f'<div class="dashboard">{cards}</div>'
+            cards += f'<div class="kpi-item"><div class="kpi-value">{hfu:.1%}</div><div class="kpi-label">HFU</div></div>\n'
+        cards += f'<div class="kpi-item"><div class="kpi-value">{tps:.1f}</div><div class="kpi-label">Tok/s/GPU</div></div>\n'
+    return f'<div class="kpi-strip">{cards}</div>'
 
 
 def _phase_pie_chart_data(aggregated: dict) -> str:
@@ -158,7 +158,7 @@ def _phase_metrics_table(aggregated: dict, num_layers: int) -> str:
         pct = per / total * 100 if total > 0 else 0
         rows += f"<tr><td><span class='legend-dot' style='background:{color}'></span> {label}</td><td>{_format_us(per)}</td><td>{_format_us(tot)}</td><td>{pct:.1f}%</td></tr>\n"
 
-    rows += f"<tr style='border-top:2px solid #ccc'><td><strong>FSDP total</strong></td><td>{_format_us(total_gpu)}</td><td>{_format_us(total_gpu * num_layers)}</td><td></td></tr>\n"
+    rows += f"<tr style='border-top:1px solid #ccc'><td><strong>FSDP total</strong></td><td>{_format_us(total_gpu)}</td><td>{_format_us(total_gpu * num_layers)}</td><td></td></tr>\n"
     rows += f"<tr><td><strong>TP total</strong></td><td>{_format_us(tp_total)}</td><td>{_format_us(tp_total * num_layers)}</td><td></td></tr>\n"
     rows += f"<tr><td><strong>Total (incl. TP)</strong></td><td>{_format_us(total_gpu + tp_total)}</td><td>{_format_us((total_gpu + tp_total) * num_layers)}</td><td>100.0%</td></tr>\n"
     rows += f"<tr><td>Total CPU</td><td>{_format_us(aggregated.get('total_cpu_us', 0))}</td><td></td><td></td></tr>\n"
@@ -195,7 +195,7 @@ def _efficiency_table(aggregated: dict, metrics_list: list) -> str:
 <tr><td>Avg GPU utilization</td><td>{avg_util:.1%}</td></tr>
 <tr><td>Compute-to-comm ratio</td><td>{avg_ctc:.2f}x</td></tr>
 <tr><td>Layer span imbalance</td><td>{imbalance:.1f}x</td></tr>
-<tr style='border-top:2px solid #ccc'><td>Pipeline overlap</td><td>{ov:.1%}</td></tr>
+<tr style='border-top:1px solid #ccc'><td>Pipeline overlap</td><td>{ov:.1%}</td></tr>
 <tr><td>Serial execution</td><td>{serial:.1%}</td></tr>
 <tr><td>Idle / gap time</td><td>{idle:.1%}</td></tr>
 <tr><td>Fwd TP overlap</td><td>{avg_fwd_ov:.1%}</td></tr>
@@ -210,7 +210,7 @@ def _per_unit_table(metrics_list: list) -> str:
     if mem_avail:
         cols.append("Mem")
     cols.append("Issues")
-    thead = "".join(f"<th>{c}</th>" for c in cols)
+    thead = "".join(f"<th>{c}</th>" if c != "Issues" else '<th style="text-align:left">Issues</th>' for c in cols)
     rows = ""
     for m in metrics_list:
         d = m.to_dict()
@@ -225,9 +225,14 @@ def _per_unit_table(metrics_list: list) -> str:
             mem_str = "N/A"
         tags = ""
         if issues:
-            for iss in issues[:3]:
-                tag_cls = "tag-high" if any(w in iss for w in ["bound", "saturation", "BW", "heavy"]) else "tag-med"
-                tags += f'<span class="tag {tag_cls}">{iss.split("(")[0].strip()}</span> '
+            top = issues[0]
+            tag_cls = "tag-high" if any(w in top for w in ["bound", "saturation", "BW", "heavy"]) else "tag-med"
+            tag_txt = top.split("(")[0].strip()
+            extras = len(issues) - 1
+            if extras:
+                tags = f'<span class="tag {tag_cls}">{tag_txt} +{extras}</span>'
+            else:
+                tags = f'<span class="tag {tag_cls}">{tag_txt}</span>'
         else:
             tags = '<span class="tag tag-ok">OK</span>'
 
@@ -249,7 +254,7 @@ def _per_unit_table(metrics_list: list) -> str:
 """
         if mem_avail:
             rows += f"<td>{mem_str}</td>\n"
-        rows += f"<td style='text-align:left'>{tags}</td></tr>\n"
+        rows += f"<td class='tag-cell'>{tags}</td></tr>\n"
 
     return f"""<div class="table-wrap">
 <table><tr>{thead}</tr>
@@ -257,18 +262,123 @@ def _per_unit_table(metrics_list: list) -> str:
 </table></div>"""
 
 
+BOTTLENECK_DESCRIPTIONS = {
+    "compute-bound":
+        "Attention/MLP kernels dominate GPU time. Try Flash Attention, kernel fusion (torch.compile), "
+        "or reducing the model size.",
+
+    "I/O or pipeline bubble":
+        "Wall time with no active FSDP work. May indicate a data-loading stall, Python GIL contention, "
+        "or a synchronization barrier.",
+
+    "comm-bound":
+        "Communication consumes most of the GPU budget. Check interconnect topology (NVLink/NIC), "
+        "reduce all-gather frequency, or increase sharding degree (HSDP).",
+
+    "all-gather-heavy":
+        "All-gather dominates FSDP communication. Consider a higher sharding degree (HSDP), "
+        "async all-gather, or overlapping AG with compute.",
+
+    "reduce-scatter-heavy":
+        "Reduce-scatter dominates FSDP communication. Try gradient compression, a higher sharding "
+        "degree, or fusing RS with backward compute.",
+
+    "TP-heavy":
+        "Tensor-parallel collectives dominate GPU time. Reduce TP degree if the model fits in "
+        "host memory, or fuse TP communication kernels.",
+
+    "optimizer-heavy":
+        "ADAMW parameter update dominates GPU. Enable fused optimizer (apex FusedAdam) or reduce "
+        "precision for optimizer states.",
+
+    "low GPU utilization":
+        "GPU is idle more than half the wall span. The pipeline stagger may not be overlapping "
+        "this layer's work with neighbours. Check for blocking CPU operations or excessive synchronization.",
+
+    "small-kernel-bound":
+        "Hundreds of tiny CUDA kernels — mostly launch latency, not GPU execution. Use torch.compile "
+        "or manually fuse the split/empty kernels in the all-gather copy-in path.",
+
+    "serial pipeline":
+        "Layers execute mostly sequentially on GPU — little overlap between consecutive shard groups. "
+        "The FSDP2 pipeline stagger may be operating at too coarse a granularity.",
+
+    "low async TP overlap":
+        "Async TP collectives are not hiding behind compute. TP communication sits on the critical "
+        "path instead of overlapping with GEMM kernels. Check TP communication scheduling.",
+
+    "async TP asymmetry":
+        "Forward and backward TP overlap differ significantly. The pipeline stagger is uneven "
+        "across phases — investigate if activation recomputation or gradient scaling is asymmetric.",
+
+    "host-bound":
+        "CPU wall span is much wider than GPU execution. Likely pipeline serialization — the CPU "
+        "launches a layer, starts the next, and only returns later. Check for blocking CPU "
+        "operations or Python-level serialization.",
+
+    "copy-heavy all-gather":
+        "All-gather dominated by GPU memcpy (split_with_sizes_copy) rather than NCCL. Common with "
+        "small buffer sizes — try fusing the copy kernels or increasing the shard granularity.",
+
+    "fwd-bwd imbalance":
+        "Forward and backward phases use noticeably different GPU time. This may be natural with "
+        "activation checkpointing; if extreme, check for gradient accumulation asymmetry.",
+
+    "inter-node BW":
+        "All-gather GPU time approaches or exceeds forward compute — the gather is fully exposed. "
+        "Upgrade inter-node bandwidth (IB/RoCE), overlap AG with compute, or use async AG.",
+
+    "HBM bandwidth-bound":
+        "Compute kernels average <8 µs with low GPU utilisation — memory-bandwidth-limited. "
+        "Check for suboptimal tensor shapes or use memory-bound-optimized kernel implementations.",
+
+    "RS injection pressure":
+        "Reduce-scatter contends with backward compute for GPU resources (both active on separate "
+        "streams). Try gradient accumulation or increasing the sharding degree to reduce RS size.",
+
+    "synchronous TP on critical path":
+        "TP collectives overlap poorly with compute and sit on the critical path. This defeats "
+        "the purpose of async TP. Consider fusing TP communication or reducing TP degree.",
+
+    "NVLink saturation":
+        "Many small TP kernel launches fragment NVLink bandwidth. Try fusing TP communication "
+        "messages or increasing the message size per collective.",
+
+    "no comm/compute overlap":
+        "The all-gather overlaps poorly with forward compute. The pipeline stagger may be "
+        "insufficient for this layer — check for excessive synchronization or narrow the pipeline.",
+
+    "exposed communication":
+        "GPU is idle for much of the wall time — communication is fully exposed. Consider "
+        "overlapping communication with compute from other layers via pipeline stagger.",
+
+    "low cross-layer GPU overlap":
+        "Adjacent layers' GPU spans overlap by <20%. The pipeline stagger is not keeping the GPU "
+        "busy — try increasing the number of in-flight layers or narrowing the pipeline window.",
+}
+
 def _bottleneck_tags(metrics_list: list) -> str:
+    # Group by short name (before parenthesis) to collapse variants like
+    # "compute-bound (comp=88.9%)" and "compute-bound (comp=85.0%)".
     all_issues = defaultdict(list)
     for m in metrics_list:
         issues = Bottlenecks.detect(m)
         for iss in issues:
-            all_issues[iss].append(m.layer_name)
+            short = iss.split("(")[0].strip()
+            all_issues[short].append(m.layer_name)
 
     if not all_issues:
-        return '<p style="color:#2e7d32">No bottlenecks detected.</p>'
+        return '<p class="tag-ok" style="font-size:12px">No bottlenecks detected.</p>'
 
-    parts = ""
-    for iss, layers in sorted(all_issues.items(), key=lambda x: -len(x[1])):
+    legend = ('<div style="font-size:11px;color:#888;margin-bottom:10px">'
+              '<span style="color:#c0392b">&#9679;</span> widespread (&#8805;50% of layers)'
+              ' &nbsp; '
+              '<span style="color:#b8860b">&#9679;</span> moderate (&#8805;3 layers)'
+              ' &nbsp; '
+              '<span style="color:#1a7a2e">&#9679;</span> few layers'
+              '</div>')
+    parts = legend
+    for short, layers in sorted(all_issues.items(), key=lambda x: -len(x[1])):
         count = len(layers)
         if count >= len(metrics_list) * 0.5:
             severity = "tag-high"
@@ -276,11 +386,12 @@ def _bottleneck_tags(metrics_list: list) -> str:
             severity = "tag-med"
         else:
             severity = "tag-low"
-        short = iss.split("(")[0].strip()
         layers_str = ", ".join(layers[:4])
         if len(layers) > 4:
             layers_str += f" (+{len(layers) - 4})"
-        parts += f'<div style="margin:4px 0"><span class="tag {severity}">{short}</span> <span style="font-size:.8em;color:#666">{count} units — {layers_str}</span></div>\n'
+        desc = BOTTLENECK_DESCRIPTIONS.get(short, "")
+        desc_suffix = f"<br><span style='font-size:11px;color:#666;font-style:italic;margin-left:8px'>{desc}</span>" if desc else ""
+        parts += f'<div style="margin:4px 0"><span class="tag {severity}">{short}</span> <span style="font-size:11px;color:#888">{count} units &mdash; {layers_str}</span>{desc_suffix}</div>\n'
     return parts
 
 
@@ -384,7 +495,7 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
             extras += f"<tr><td>MFU</td><td>{mfu:.1%}</td></tr>"
             extras += f"<tr><td>Tok/s/GPU</td><td>{tps:.1f}</td></tr>"
 
-        summary_cards += f"""<div class="trace-summary" style="border-top:4px solid {colors[i]}">
+        summary_cards += f"""<div class="cmp-card" style="border-top:3px solid {colors[i]}">
 <h3>{label}</h3>
 <table>
 <tr><td>Step wall</td><td>{_format_us(wall)}</td></tr>
@@ -599,21 +710,34 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
         table_rows += f"<tr>{cells}</tr>\n"
 
     # Bottleneck summary per trace
+    bneck_legend = ('<div style="font-size:10px;color:#888;margin-bottom:8px">'
+                    '<span style="color:#c0392b">&#9679;</span> &#8805;50% of layers'
+                    ' &nbsp; '
+                    '<span style="color:#b8860b">&#9679;</span> &#8805;20% of layers'
+                    ' &nbsp; '
+                    '<span style="color:#1a7a2e">&#9679;</span> &lt;20% of layers'
+                    '</div>')
     bneck_sections = ""
     for i, (label, agg, metrics, steps, tp) in enumerate(all_results):
-        issues = defaultdict(int)
+        issues = defaultdict(list)
         for m in metrics:
             for iss in Bottlenecks.detect(m):
-                issues[iss] += 1
+                issues[iss.split("(")[0].strip()].append(m.layer_name)
         if not issues:
-            bneck_sections += f'<div class="comp-col"><h3>{label}</h3><p style="color:#2e7d32">No bottlenecks detected.</p></div>'
+            bneck_sections += f'<div class="comp-col"><h3>{label}</h3><p class="tag-ok" style="font-size:12px">No bottlenecks detected.</p></div>'
             continue
+        seen = set()
         rows = ""
-        for iss, count in sorted(issues.items(), key=lambda x: -x[1]):
+        for short, layers in sorted(issues.items(), key=lambda x: -len(x[1])):
+            if short in seen:
+                continue
+            seen.add(short)
+            count = len(layers)
             pct = count / max(len(metrics), 1)
-            short = iss.split("(")[0].strip()
             cls = "tag-high" if pct >= 0.5 else ("tag-med" if pct >= 0.2 else "tag-low")
-            rows += f'<div style="margin:3px 0"><span class="tag {cls}">{short}</span> <span style="font-size:.75em;color:#888">{count}/{len(metrics)}</span></div>'
+            desc = BOTTLENECK_DESCRIPTIONS.get(short, "")
+            desc_suffix = f"<br><span style='font-size:10px;color:#666;font-style:italic'>{desc}</span>" if desc else ""
+            rows += f'<div style="margin:3px 0"><span class="tag {cls}">{short}</span> <span style="font-size:11px;color:#888">{count}/{len(metrics)}</span>{desc_suffix}</div>'
         bneck_sections += f'<div class="comp-col"><h3>{label}</h3>{rows}</div>'
 
     trace_tabs = "".join(
@@ -637,6 +761,7 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
         MFU_CHART=mfu_chart,
         TABLE_HEAD="".join(thead_parts),
         TABLE_ROWS=table_rows,
+        BOTTLENECK_LEGEND=bneck_legend,
         BOTTLENECK_SECTIONS=bneck_sections,
     )
     chart_data = json.dumps({"compare": compare_data})
