@@ -201,6 +201,49 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
             return f"{raw_val:.1f}"
         return str(raw_val)
 
+    
+    # Which direction is "better" for each metric: "higher" or "lower"
+    BETTER_DIRECTION = {
+        "Step wall": "lower", "AG forward": "lower", "Forward compute": "lower",
+        "AG backward": "lower", "Backward compute": "lower", "Reduce scatter": "lower",
+        "TP all-gather": "lower", "TP all-reduce": "lower", "TP reduce-scatter": "lower",
+        "TP total": "lower", "Total GPU": "lower", "Total CPU": "lower", "Optimizer": "lower",
+        "GPU util": "higher", "Compute-to-comm ratio": "higher",
+        "MFU": "higher", "HFU": "higher", "Comm ratio": "lower",
+        "FSDP comm ratio": "lower", "TP comm ratio": "lower",
+        "Pipeline overlap": "higher", "Serial efficiency": "higher",
+        "Pipeline idle": "lower", "Exposed comm fraction": "lower",
+        "AG overlap efficiency": "lower", "Fwd TP overlap": "higher",
+        "Bwd TP overlap": "higher", "Peak memory": "lower",
+        "Steps/second": "higher", "Tokens/sec/GPU": "higher",
+    }
+    def _better(val, baseline, direction):
+        if direction == "higher": return val > baseline
+        return val < baseline
+    def _worse(val, baseline, direction):
+        if direction == "higher": return val < baseline
+        return val > baseline
+    def _fmt_metric(name, raw_val):
+        if raw_val is None: return "N/A"
+        if name in ("GPU util", "Comm ratio", "FSDP comm ratio", "TP comm ratio",
+                     "Pipeline overlap", "Serial efficiency", "Pipeline idle",
+                     "Exposed comm fraction", "AG overlap efficiency",
+                     "Fwd TP overlap", "Bwd TP overlap", "MFU", "HFU"):
+            return f"{raw_val:.1%}" if isinstance(raw_val, float) else str(raw_val)
+        if name == "Compute-to-comm ratio":
+            return "inf" if raw_val == float('inf') else f"{raw_val:.2f}x"
+        if name == "Peak memory":
+            return f"{raw_val:.1f}G" if raw_val and raw_val > 0 else "N/A"
+        if name in ("Step wall", "AG forward", "Forward compute", "AG backward",
+                     "Backward compute", "Reduce scatter", "Optimizer",
+                     "TP total", "Total GPU", "Total CPU",
+                     "TP all-gather", "TP all-reduce", "TP reduce-scatter"):
+            from bottleneck_detector import _format_us
+            return _format_us(raw_val) if isinstance(raw_val, (int, float)) else str(raw_val)
+        if name == "Steps/second": return f"{raw_val:.1f}"
+        if name == "Tokens/sec/GPU": return f"{raw_val:.1f}"
+        return str(raw_val)
+
     # Define all metrics to show in the comparison table
     COMPARE_METRICS = [
         ("Layers", lambda r, m: int(len(m)), None, False),
