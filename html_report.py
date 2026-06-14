@@ -12,7 +12,7 @@ from pipeline import process_trace, process_all_steps
 from bottleneck_detector import ModelConfig, _format_us, Bottlenecks
 from collections import defaultdict
 
-_HERE = os.path.dirname(__file__)
+_HERE = os.path.dirname(os.path.abspath(__file__))
 _PAGE_TEMPLATE = None
 _BODY_TEMPLATES = {}
 
