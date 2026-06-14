@@ -15,6 +15,20 @@ from collections import defaultdict
 _HERE = os.path.dirname(__file__)
 _PAGE_TEMPLATE = None
 
+def _load_body(name: str) -> str:
+    if name not in _BODY_TEMPLATES:
+        with open(os.path.join(_HERE, name)) as f:
+            _BODY_TEMPLATES[name] = f.read()
+    return _BODY_TEMPLATES[name]
+
+
+def _fill(template: str, **kwargs) -> str:
+    for key, val in kwargs.items():
+        template = template.replace("{{" + key + "}}", str(val))
+    return template
+
+
+
 COLORS = {
     'fwd_cmp': '#4e79a7', 'bwd_cmp': '#e15759', 'ag': '#76b7b2',
     'rs': '#f28e2b', 'opt': '#59a14f', 'tp_ag': '#af7aa1',
