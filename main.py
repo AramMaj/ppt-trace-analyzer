@@ -163,6 +163,13 @@ def main():
         detector = StandardFSDPDetector(gpu_events=parser.gpu_events)
         fsdp = detector.extract_fsdp_phases(roots)
         sanitize_optimizer(fsdp, step_start, step_end)
+        from trace_annotator import _get_ac2g_bwd_supplement, _find_profiler_steps
+        all_steps = _find_profiler_steps(trace_file)
+        step_index = len(all_steps) - 1 if len(all_steps) > 1 else 0
+        num_steps = len(all_steps) if all_steps else 1
+        ac2g_supplement = _get_ac2g_bwd_supplement(parser.all_events, step_index, num_steps)
+        for unit in fsdp.units:
+            unit.ag_bwd_supplement_us = ac2g_supplement.get(unit.layer_name, 0.0)
         report = Report(fsdp, roots, output_path=None)
         report.generate_report()
         print_timeline(fsdp, report)
@@ -240,6 +247,14 @@ def main():
     fsdp = detector.extract_fsdp_phases(roots)
     sanitize_optimizer(fsdp, step_start, step_end)
     print(f"Detected {len(fsdp.units)} FSDP units.")
+
+    from trace_annotator import _get_ac2g_bwd_supplement, _find_profiler_steps
+    all_steps = _find_profiler_steps(trace_file)
+    step_index = len(all_steps) - 1 if len(all_steps) > 1 else 0
+    num_steps = len(all_steps) if all_steps else 1
+    ac2g_supplement = _get_ac2g_bwd_supplement(parser.all_events, step_index, num_steps)
+    for unit in fsdp.units:
+        unit.ag_bwd_supplement_us = ac2g_supplement.get(unit.layer_name, 0.0)
 
     report = Report(fsdp, roots, output_path=output_file, model_config=cfg)
     text, markers = report.generate_report()

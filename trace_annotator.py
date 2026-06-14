@@ -176,6 +176,34 @@ def _total_ac2g_kernel_us(layer_name: str,
     raw = ac2g_layer_spans.get(layer_name, [])
     return sum(kdur for _, _, kdur in raw)
 
+
+def _get_ac2g_bwd_supplement(raw_events, step_index: int = 0,
+                              num_steps: int = 1):
+    """Compute all-gather backward copy-out GPU kernel supplement from ac2g events.
+    Returns ``{layer_name: total_kernel_us}`` — the kernel time on pure copy-out
+    streams (e.g. stream 18) that is MISSING from CPU-tree-based ``ag_bwd_gpu``.
+
+    For each layer, selects only the *second* annotation per step (bwd copy-out,
+    which is always later and larger than the fwd copy-out).
+    """
+    all_spans = _find_ac2g_ag_bwd_spans(raw_events)
+    if not all_spans:
+        return {}
+    result = {}
+    for layer_name, spans in all_spans.items():
+        sorted_spans = sorted(spans, key=lambda x: x[0])
+        if num_steps <= 1:
+            # Single step: 2 annotations (fwd, bwd). Take the bwd (last).
+            pick = sorted_spans[-1:] if len(sorted_spans) >= 2 else sorted_spans
+        else:
+            # Multi-step: filter by step_index.
+            bwd_idx = step_index * 2 + 1
+            pick = [sorted_spans[bwd_idx]] if bwd_idx < len(sorted_spans) else []
+        total = sum(kernel_us for _, _, kernel_us in pick)
+        if total > 0:
+            result[layer_name] = total
+    return result
+
 def _collect_nccl_gpu_spans(node):
     """Recursively collect only NCCL-kernel GPU spans from *node*.
 
@@ -517,6 +545,9 @@ def _analyze_step(
     step_start: int,
     step_end: int,
     model_config: Optional[ModelConfig] = None,
+    *,  # keyword-only below
+    step_index: int = 0,
+    num_steps: int = 1,
 ):
     """Full pipeline for one ProfilerStep.
 
@@ -544,6 +575,10 @@ def _analyze_step(
         n for n in fsdp.optimizer_zero_grad
         if step_start <= n.start_time <= step_end
     ]
+
+    ac2g_supplement = _get_ac2g_bwd_supplement(parser.all_events, step_index, num_steps)
+    for unit in fsdp.units:
+        unit.ag_bwd_supplement_us = ac2g_supplement.get(unit.layer_name, 0.0)
 
     report = Report(fsdp, roots, output_path=None, model_config=model_config)
     report.generate_report()
@@ -610,11 +645,16 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0,
               f"spans on {len(ac2g_layer_spans)} layers")
 
     # 3b. Analyse all steps
+    num_steps = len(steps)
     step_analyses = []
-    for step_name, step_start, step_end, _ in steps:
+    for step_idx, (step_name, step_start, step_end, _) in enumerate(steps):
         sname = step_name.replace("ProfilerStep#", "Step#")
         print(f"  Analysing {sname} …")
-        fsdp, report, roots = _analyze_step(trace_file, step_name, step_start, step_end, model_config=model_config)
+        fsdp, report, roots = _analyze_step(
+            trace_file, step_name, step_start, step_end,
+            model_config=model_config,
+            step_index=step_idx, num_steps=num_steps,
+        )
         if fsdp is None:
             continue
         step_analyses.append((step_name, fsdp, report, roots))

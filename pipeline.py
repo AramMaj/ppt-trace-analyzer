@@ -41,6 +41,16 @@ def process_trace(trace_file: str, model_config=None):
     fsdp = detector.extract_fsdp_phases(roots)
     sanitize_optimizer(fsdp, step_start, step_end)
 
+    from trace_annotator import _get_ac2g_bwd_supplement, _find_profiler_steps
+    all_steps = _find_profiler_steps(trace_file)
+    step_index = len(all_steps) - 1 if len(all_steps) > 1 else 0
+    num_steps = len(all_steps) if all_steps else 1
+    ac2g_supplement = _get_ac2g_bwd_supplement(
+        parser.all_events, step_index, num_steps,
+    )
+    for unit in fsdp.units:
+        unit.ag_bwd_supplement_us = ac2g_supplement.get(unit.layer_name, 0.0)
+
     report = Report(fsdp, roots, output_path=None, model_config=model_config)
     text, markers = report.generate_report()
 
@@ -56,7 +66,8 @@ def process_all_steps(trace_file: str, model_config=None):
     Returns a list of ``(step_name, aggregated, metrics_list, fsdp, report, text)``
     tuples, one per ProfilerStep.  Handles single-step traces gracefully.
     """
-    from trace_annotator import _find_profiler_steps, _filter_gpu_events, _prune_roots_for_step
+    from trace_annotator import (_find_profiler_steps, _filter_gpu_events,
+                                 _prune_roots_for_step, _get_ac2g_bwd_supplement)
 
     steps = _find_profiler_steps(trace_file)
     if not steps:
@@ -66,8 +77,9 @@ def process_all_steps(trace_file: str, model_config=None):
         _, metrics_list, fsdp, report, text = result
         return [("Trace", report.aggregated, metrics_list, fsdp, report, text)]
 
+    num_steps = len(steps)
     results = []
-    for step_name, step_start, step_end, _ in steps:
+    for step_idx, (step_name, step_start, step_end, _) in enumerate(steps):
         parser = TraceParser(trace_file)
         if not parser.load():
             continue
@@ -88,6 +100,12 @@ def process_all_steps(trace_file: str, model_config=None):
             n for n in fsdp.optimizer_zero_grad
             if step_start <= n.start_time <= step_end
         ]
+
+        ac2g_supplement = _get_ac2g_bwd_supplement(
+            parser.all_events, step_idx, num_steps,
+        )
+        for unit in fsdp.units:
+            unit.ag_bwd_supplement_us = ac2g_supplement.get(unit.layer_name, 0.0)
 
         report = Report(fsdp, roots, output_path=None, model_config=model_config)
         text, markers = report.generate_report()

@@ -198,6 +198,7 @@ class FSDPUnit:
         self.fwd_compute_span: Optional[Tuple[float, float]] = None
         self.bwd_compute_span: Optional[Tuple[float, float]] = None
         self.all_gather_bwd_end: Optional[float] = None
+        self.ag_bwd_supplement_us: float = 0.0
 
     @property
     def all_gather_fwd_gpu_kernels(self) -> List[dict]:
