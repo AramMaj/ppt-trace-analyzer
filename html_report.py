@@ -296,12 +296,7 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
 
     # Compute numeric values for each trace
     trace_values = []
-    r4_idx = None
-    for ri, (label, agg, metrics, steps, tp) in enumerate(all_results):
-        if tp.get("mfu", 0) > 0 and r4_idx is None:
-            r4_idx = ri
-
-    for ri, (label, agg, metrics, steps, tp) in enumerate(all_results):
+for ri, (label, agg, metrics, steps, tp) in enumerate(all_results):
         vals = {}
         for name, fn, direction, do_color in COMPARE_METRICS:
             try:
