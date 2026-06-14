@@ -172,6 +172,64 @@ def _compute_overlap_metrics(units: List['FSDPUnit']) -> dict:
     }
 
 
+def _get_layer_gpu_span(unit: 'FSDPUnit'):
+    """Collect all GPU kernel timestamps across every phase for an FSDP unit,
+    returning ``(gpu_start, gpu_end)`` as the union span of all GPU kernels.
+
+    Returns ``None`` if the unit has no attributed GPU kernels (no kernel
+    data in the trace, or attribution failed).
+    """
+    all_kernels = []
+    for phase_kernels in [
+        unit.all_gather_fwd_gpu_kernels,
+        unit.all_gather_bwd_gpu_kernels,
+        unit.reduce_scatter_gpu_kernels,
+        _collect_gpu_kernels(unit.fwd_compute),
+        _collect_gpu_kernels(unit.bwd_compute),
+    ]:
+        all_kernels.extend(phase_kernels)
+    if not all_kernels:
+        return None
+    min_start = min(k.get('ts', 0) for k in all_kernels)
+    max_end = max(k.get('ts', 0) + k.get('dur', 0) for k in all_kernels)
+    return (min_start, max_end)
+
+
+def _compute_cross_layer_overlap(units):
+    """GPU-execution overlap ratio between consecutive FSDP layers.
+
+    For each adjacent pair ``(N, N+1)``:
+        overlap = max(0, min(end_N, end_N1) - max(start_N, start_N1))
+        pair_ratio = overlap / max(span_N, span_N1)
+
+    Returns ``(avg_ratio, per_layer_overlap)`` where *per_layer_overlap[i]*
+    is layer *i*'s GPU-span overlap with layer *i-1* (``0.0`` for layer 0).
+    """
+    spans = [_get_layer_gpu_span(unit) for unit in units]
+    pair_ratios = []
+    for i in range(len(spans) - 1):
+        if spans[i] is None or spans[i + 1] is None:
+            pair_ratios.append(0.0)
+            continue
+        s1, e1 = spans[i]
+        s2, e2 = spans[i + 1]
+        overlap = max(0.0, min(e1, e2) - max(s1, s2))
+        max_span = max(e1 - s1, e2 - s2)
+        pair_ratios.append(overlap / max_span if max_span > 0 else 0.0)
+    per_layer = [0.0]
+    for i in range(1, len(spans)):
+        if spans[i - 1] is None or spans[i] is None:
+            per_layer.append(0.0)
+            continue
+        s_prev, e_prev = spans[i - 1]
+        s_cur, e_cur = spans[i]
+        overlap = max(0.0, min(e_prev, e_cur) - max(s_prev, s_cur))
+        cur_span = e_cur - s_cur
+        per_layer.append(overlap / cur_span if cur_span > 0 else 0.0)
+    avg = sum(pair_ratios) / len(pair_ratios) if pair_ratios else 0.0
+    return avg, per_layer
+
+
 def _collect_memory(unit: 'FSDPUnit', metrics: 'Metrics'):
     """Sum ``memory_delta`` (activation memory, parameter memory, gradient buffers)
     across all FSDP phase nodes.  Peak is max(allocated, freed), approximating
@@ -319,7 +377,7 @@ class Metrics:
         self.fwd_cmp_cpu = _phase_cpu_time(unit.fwd_compute)
         self.fwd_cmp_wall = _phase_wall_time(unit.fwd_compute, unit.fwd_compute_span)
 
-        self.ag_bwd_gpu = _phase_gpu_time(unit.all_gather_bwd)
+        self.ag_bwd_gpu = _phase_gpu_time(unit.all_gather_bwd) + unit.ag_bwd_supplement_us
         self.ag_bwd_cpu = _phase_cpu_time(unit.all_gather_bwd)
         self.ag_bwd_wall = _phase_wall_time(unit.all_gather_bwd)
 
@@ -353,15 +411,19 @@ class Metrics:
         # How well each collective is hidden behind compute:
         #   GPU time / CPU wall span → 1.0 = fully exposed (no overlap),
         #   << 1.0 = well hidden (GPU execution overlaps with other work).
-        self.ag_fwd_overlap_efficiency = (
+        # Values > 1.0 are capped at 1.0 because async NCCL and ac2g copy-out
+        # streams routinely produce GPU_time > CPU_wall (NCCL kernel dispatched
+        # in 0.4ms CPU, runs 24ms on GPU).  Capping keeps exposed_comm_fraction
+        # in [0, 1] and prevents negative comm_hiding_efficiency in the report.
+        self.ag_fwd_overlap_efficiency = min(1.0, (
             self.ag_fwd_gpu / self.ag_fwd_wall if self.ag_fwd_wall > 0 else 0.0
-        )
-        self.rs_overlap_efficiency = (
+        ))
+        self.rs_overlap_efficiency = min(1.0, (
             self.rs_gpu / self.rs_wall if self.rs_wall > 0 else 0.0
-        )
-        self.ag_bwd_overlap_efficiency = (
+        ))
+        self.ag_bwd_overlap_efficiency = min(1.0, (
             self.ag_bwd_gpu / self.ag_bwd_wall if self.ag_bwd_wall > 0 else 0.0
-        )
+        ))
 
         # --- Layer wall span + GPU utilisation ---
         all_events = (unit.all_gather_fwd + unit.fwd_compute + unit.all_gather_bwd
@@ -655,7 +717,7 @@ class Bottlenecks:
     SMALL_KERNEL_COUNT = 100
     ASYNC_TP_OVERLAP_LOW = 0.30
     OVERLAP_ASYMMETRY_DIFF = 0.40
-    HOST_BOUND_RATIO = 1.5
+    HOST_BOUND_RATIO = 3.0
     COPY_HEAVY_RATIO = 0.50
     FWD_BWD_IMBALANCE = 0.30
     SERIAL_EXEC_HIGH = 0.85
@@ -667,9 +729,11 @@ class Bottlenecks:
     # suggests memory-bandwidth-bound (kernels too short to be arithmetic-heavy)
     HBM_BOUND_AVG_KERNEL_US = 8.0
     HBM_BOUND_GPU_UTIL = 0.50
-    # Gradient accumulation / injection pressure: RS not hidden behind compute,
-    # RS overlap efficiency ≥ 0.70 means RS GPU time dominates its wall span
-    RS_EXPOSED_THRESHOLD = 0.70
+    # Gradient accumulation / injection pressure: RS dominates backward compute.
+    # RS GPU time ≥ 30% of backward compute GPU time → injection pressure.
+    # Uses GPU-time ratio instead of overlap efficiency because async NCCL's
+    # CPU_wall is just dispatch time, making overlap efficiency meaningless.
+    RS_INJECTION_RATIO = 0.30
     # Synchronous TP: TP GPU time ≥ 10% of compute, but TP overlap < 0.20
     # (TP collectives block on critical path, defeating async TP)
     TP_ON_CRITICAL_PATH_RATIO = 0.10
@@ -677,6 +741,21 @@ class Bottlenecks:
     # NVLink saturation: many (≥ 50) small (< 10µs avg) TP kernels
     NVLINK_SAT_COUNT = 50
     NVLINK_SAT_AVG_US = 10.0
+    # No comm/compute overlap: AG fwd GPU time ≥ 10% of fwd compute AND
+    # GPU utilisation < 50%.  Low parallelism + meaningful AG → pipeline
+    # stagger is not hiding the all-gather.
+    COMM_COMPUTE_UTIL_THRESHOLD = 0.50
+    AG_VS_FWD_RATIO = 0.10
+    # Exposed communication: GPU idle fraction of wall time
+    # Computed as 1 − min(1.0, gpu_util).  Replaces old overlap-efficiency
+    # formula which broke for async NCCL (CPU_wall = dispatch, not execution).
+    EXPOSED_COMM_IDLE_THRESHOLD = 0.50
+    # Low cross-layer GPU pipeline overlap: consecutive layers' GPU execution
+    # spans overlap by < 20 %.  Layers run mostly sequentially on GPU, wasting
+    # the FSDP2 pipeline stagger.  Should be cross-checked against the CPU
+    # overlap_ratio (sweep-line metric) which measures pipelining of CPU
+    # dispatch spans — GPU overlap is a complementary signal.
+    PIPELINE_OVERLAP_LOW = 0.20
 
     @classmethod
     def detect(cls, metrics: Metrics) -> List[str]:
@@ -693,13 +772,6 @@ class Bottlenecks:
         # ================================================================
         # Section A — Classic bottlenecks
         # ================================================================
-
-        # --- Compute-bound ---
-        # attn/MLP/norm (fwd_cmp + bwd_cmp) dominates total GPU.
-        comp_gpu = metrics.fwd_cmp_gpu + metrics.bwd_cmp_gpu
-        comp_ratio = comp_gpu / total_gpu if total_gpu > 0 else 0.0
-        if comp_ratio >= cls.COMP_HEAVY_THRESHOLD:
-            issues.append(f"compute-bound (comp={comp_ratio:.1%})")
 
         # --- Pipeline bubble (idle between layers) ---
         # Sweep-line found wall time where NO FSDP shard group was active —
@@ -732,9 +804,9 @@ class Bottlenecks:
 
         # --- Dominant phase (>35% of GPU) ---
         # First phase exceeding 35% of total GPU time gets flagged.
+        # Fwd cmp / Bwd cmp excluded — they are expected to dominate in FSDP.
         phases = [("AG fwd", metrics.ag_fwd_gpu), ("AG bwd", metrics.ag_bwd_gpu),
-                  ("RS", metrics.rs_gpu), ("Fwd cmp", metrics.fwd_cmp_gpu),
-                  ("Bwd cmp", metrics.bwd_cmp_gpu), ("Optimizer", metrics.optimizer_gpu),
+                  ("RS", metrics.rs_gpu), ("Optimizer", metrics.optimizer_gpu),
                   ("TP", tp_total)]
         for name, val in phases:
             if total_gpu > 0 and val / total_gpu > 0.35:
@@ -745,7 +817,9 @@ class Bottlenecks:
         if 0 < metrics.gpu_util < cls.UTIL_LOW_THRESHOLD:
             issues.append(f"low GPU utilization ({metrics.gpu_util:.1%})")
         if metrics.gpu_util > 1.0:
-            issues.append(f"high compute-comm overlap ({metrics.gpu_util:.1%} util)")
+            # GPU time > CPU wall → multi-stream overlap across layers/phases.
+            # This is a positive signal (good pipeline stagger), not a bottleneck.
+            pass
 
         # ================================================================
         # Section B — FSDP2 / TP / async TP specific bottlenecks
@@ -813,7 +887,7 @@ class Bottlenecks:
                 issues.append(f"fwd-bwd imbalance ({heavier}={imbalance:.1%} heavier)")
 
         # ================================================================
-        # Section C — Communication-hiding / BW bottlenecks (new)
+        # Section C — Communication-hiding / BW bottlenecks
         # ================================================================
 
         # 7. Inter-node bandwidth (all-gather not hidden behind compute)
@@ -837,12 +911,15 @@ class Bottlenecks:
                           f"util {metrics.gpu_util:.1%})")
 
         # 9. Gradient accumulation / injection bandwidth pressure
-        # Reduce-scatter is not hidden behind backward compute → RS GPU time
-        # dominates its wall span.  High RS overlap efficiency means RS is
-        # exposed on the critical path rather than overlapping with bwd compute.
-        if metrics.rs_overlap_efficiency >= cls.RS_EXPOSED_THRESHOLD:
-            issues.append(f"RS injection pressure "
-                          f"(RS overlap efficiency={metrics.rs_overlap_efficiency:.1%})")
+        # Reduce-scatter consumes significant GPU time relative to backward
+        # compute.  RS GPU time ≥ 30% of backward compute → injection pressure
+        # (the RS kernel is large enough to contend with bwd compute for GPU
+        # resources, even if both run on separate streams async).
+        if metrics.bwd_cmp_gpu > 0:
+            rs_injection = metrics.rs_gpu / metrics.bwd_cmp_gpu
+            if rs_injection >= cls.RS_INJECTION_RATIO:
+                issues.append(f"RS injection pressure "
+                              f"(RS={rs_injection:.1%} of bwd compute)")
 
         # 10. Synchronous TP on critical path
         # TP collectives exist but have low overlap with compute → they block
@@ -866,17 +943,40 @@ class Bottlenecks:
                           f"({tp_kernel_count} small TP kernels, avg {tp_avg_us:.1f}us)")
 
         # 12. No comm/compute overlap (FSDP2 pipeline idle)
-        # AG fwd overlap efficiency close to 1.0 means the all-gather runs
-        # entirely serially with no overlap → classic FSDP2 pipeline bubble.
-        if metrics.ag_fwd_overlap_efficiency > 0 and metrics.ag_fwd_overlap_efficiency >= 0.85:
-            issues.append(f"no comm/compute overlap "
-                          f"(AG overlap efficiency={metrics.ag_fwd_overlap_efficiency:.1%})")
+        # GPU utilisation is low AND AG fwd is a meaningful fraction of forward
+        # compute → the all-gather is not being hidden behind compute from other
+        # layers (pipeline stagger is ineffective).  Uses GPU-time ratio instead
+        # of overlap efficiency because async NCCL's CPU_wall is just dispatch.
+        if metrics.fwd_cmp_gpu > 0:
+            ag_vs_fwd = metrics.ag_fwd_gpu / metrics.fwd_cmp_gpu
+            if ag_vs_fwd >= cls.AG_VS_FWD_RATIO and metrics.gpu_util < cls.COMM_COMPUTE_UTIL_THRESHOLD:
+                issues.append(f"no comm/compute overlap "
+                              f"(util={metrics.gpu_util:.1%}, AG={ag_vs_fwd:.1%} of fwd)")
 
         # 13. Exposed communication (general overlap quality)
-        # Composite metric across all comm phases.  >50% exposed → poor hiding.
-        if metrics.exposed_comm_fraction > 0.50:
+        # Fraction of wall time with no GPU activity of any kind.  Uses GPU
+        # utilisation as a proxy: if most of the wall time has zero GPU kernels
+        # running, the work is exposed (not hidden behind other GPU work).
+        # Only fires when the layer has both forward AND backward activity
+        # (otherwise low utilisation is pipeline warmup, not exposed comm).
+        # Replaces the old overlap-efficiency-based formula which broke for
+        # async NCCL operations (CPU_wall = dispatch time, not execution).
+        gpu_idle = 1.0 - min(1.0, metrics.gpu_util)
+        if (gpu_idle > cls.EXPOSED_COMM_IDLE_THRESHOLD
+                and metrics.fwd_cmp_gpu > 0 and metrics.bwd_cmp_gpu > 0):
             issues.append(f"exposed communication "
-                          f"(comm hiding efficiency={1-metrics.exposed_comm_fraction:.1%})")
+                          f"(GPU idle={gpu_idle:.1%} of wall)")
+
+        # 14. Low cross-layer GPU pipeline overlap
+        # Adjacent layers' GPU execution spans overlap by less than 20%.
+        # In a well-pipelined FSDP2 step, the GPU kernel of layer N+1's
+        # all-gather (or fwd compute) should overlap with layer N's GPU
+        # work.  Low overlap means layers run mostly sequentially on
+        # the GPU — the pipeline stagger is not achieving its goal even
+        # if CPU dispatch spans overlap.
+        if 0 < metrics.pipeline_overlap_ratio < cls.PIPELINE_OVERLAP_LOW:
+            issues.append(f"low cross-layer GPU overlap "
+                          f"({metrics.pipeline_overlap_ratio:.1%})")
 
         return issues
 
@@ -968,6 +1068,13 @@ class Report:
         self.aggregated["step_wall"] = ov['step_wall']
         self.aggregated["overlap_time"] = ov['overlap_time']
         self.aggregated["serial_time"] = ov['serial_time']
+
+        # Cross-layer GPU pipeline overlap: consecutive layers' GPU spans
+        cross_layer_avg, per_layer_overlaps = _compute_cross_layer_overlap(self.fsdp.units)
+        self.aggregated["pipeline_overlap_ratio"] = cross_layer_avg
+        for i, m in enumerate(self.metrics_list):
+            if i < len(per_layer_overlaps):
+                m.pipeline_overlap_ratio = per_layer_overlaps[i]
 
     def _compute_throughput(self):
         """Compute MFU / HFU / tokens-per-second from model config and step wall.
@@ -1120,6 +1227,8 @@ class Report:
         avg_bwd_ov = sum(m.bwd_comp_comm_overlap for m in self.metrics_list) / max(len(self.metrics_list), 1)
         lines.append(f"  Avg Fwd comp-comm:    {avg_fwd_ov:.1%} (avg TP overlap during fwd compute)")
         lines.append(f"  Avg Bwd comp-comm:    {avg_bwd_ov:.1%} (avg TP overlap during bwd compute)")
+        avg_po = self.aggregated.get("pipeline_overlap_ratio", 0.0)
+        lines.append(f"  Pipeline cross-layer: {avg_po:.1%} (GPU overlap between adjacent layers)")
         lines.append("")
 
         # Memory
@@ -1144,7 +1253,7 @@ class Report:
                   f"{'TP AR':>9s} {'AG bwd':>10s} {'Bwd cmp':>10s} {'RS':>10s} "
                   f"{'Opt':>10s} {'Total':>10s} "
                   f"{'Util':>6s}{'CtC':>6s}{'ExpC':>6s}"
-                  f"{'Span':>9s}{'F-Ovl':>8s}{'B-Ovl':>8s} "
+                  f"{'Span':>9s}{'F-Ovl':>8s}{'B-Ovl':>8s}{'P-Ovl':>7s} "
                   f"{'K#':>7s}{'AvgK':>7s}{mem_col:>10s}  {'Bottleneck'}")
         lines.append(header)
         lines.append("-" * len(header))
@@ -1178,6 +1287,7 @@ class Report:
                 f"{_format_us(d['layer_span_us']):>9s}"
                 f"{d['fwd_comp_comm_overlap']:>7.1%} "
                 f"{d['bwd_comp_comm_overlap']:>7.1%} "
+                f"{m.pipeline_overlap_ratio:>6.1%} "
                 f"{d['kernel_count']:>7d} "
                 f"{d['avg_kernel_dur_us']:>5.1f}us "
                 f"{mem_str:>10s}  "

@@ -52,6 +52,158 @@ PHASE_LABELS = ["AG fwd", "Fwd cmp", "AG bwd", "Bwd AG", "Bwd cmp", "RS",
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _find_ac2g_ag_bwd_spans(raw_events: List[dict]):
+    """Parse ac2g flow events + gpu_user_annotation to identify all-gather
+    copy-out GPU spans on dedicated CUDA streams (e.g. stream 18 in gpu-server).
+
+    Uses only streams where the ``FSDP::all_gather`` annotations DO NOT overlap
+    with GEMM compute kernels (i.e. streams dedicated to all-gather copy-out).
+    Returns ``{layer_name: [(gpu_start, gpu_end, kernel_dur_us), …]}`` per layer,
+    or an empty dict when no ac2g annotations are present.
+    """
+    # 1. Find streams that carry ac2g flow-step events
+    ac2g_streams = set()
+    for ev in raw_events:
+        if ev.get('cat') == 'ac2g' and ev.get('ph') == 'f':
+            ac2g_streams.add(ev['tid'])
+
+    if not ac2g_streams:
+        return {}
+
+    # 2. On ac2g streams, find FSDP::all_gather annotations with a layer name
+    import re
+    layer_pat = re.compile(r'model\.layers\.(\d+)')
+    annotations = []  # (tid, ts, end, layer_name)
+    for ev in raw_events:
+        tid = ev.get('tid', 0)
+        if tid not in ac2g_streams:
+            continue
+        if ev.get('cat') == 'gpu_user_annotation' and ev.get('ph') == 'X':
+            name = ev.get('name', '')
+            if 'FSDP::all_gather' not in name:
+                continue
+            m = layer_pat.search(name)
+            if not m:
+                continue
+            ts = ev.get('ts', 0)
+            dur = ev.get('dur', 0)
+            annotations.append((tid, ts, ts + dur, f'model.layers.{m.group(1)}'))
+
+    if not annotations:
+        return {}
+
+    # 3. Classify streams as "pure" (only copy-out kernels, no GEMM compute)
+    ann_streams = {tid for tid, _, _, _ in annotations}
+    pure_streams = set()
+    for tid in ann_streams:
+        kernels_on_stream = [
+            ev for ev in raw_events
+            if ev.get('tid') == tid and ev.get('cat') == 'kernel'
+            and 'nccl' not in ev.get('name', '').lower()
+        ]
+        if not kernels_on_stream:
+            pure_streams.add(tid)
+            continue
+        has_gemm = any(
+            'gemm' in ev.get('name', '').lower()
+            or '16816' in ev.get('name', '').lower()
+            for ev in kernels_on_stream
+        )
+        if not has_gemm:
+            pure_streams.add(tid)
+
+    if not pure_streams:
+        return {}
+
+    # 4. For each annotation on a *pure* stream, record the annotation span
+    #    and contained GPU kernel durations.
+    result = {}
+    for tid, ann_ts, ann_end, layer_name in annotations:
+        if tid not in pure_streams:
+            continue
+        kernel_total = 0
+        for ev in raw_events:
+            if ev.get('tid') != tid:
+                continue
+            if ev.get('cat') != 'kernel':
+                continue
+            if 'nccl' in ev.get('name', '').lower():
+                continue
+            k_ts = ev.get('ts', 0)
+            k_end = k_ts + ev.get('dur', 0)
+            if k_ts >= ann_ts and k_end <= ann_end:
+                kernel_total += ev.get('dur', 0)
+        result.setdefault(layer_name, []).append((ann_ts, ann_end, kernel_total))
+
+    return result
+
+
+def _filter_ac2g_spans_by_step(ac2g_layer_spans, step_index, num_steps):
+    """Pick the AG bwd (backward) copy-out annotation for *step_index*.
+
+    Each layer has ``num_steps × 2`` annotations (fwd copy-out + bwd copy-out
+    per step), ordered by timestamp.  For AG bwd we want the SECOND (larger,
+    later) annotation — the backward all-gather copy-out.
+    Returns a new dict with only the kernels from the bwd annotation.
+    """
+    if num_steps <= 1:
+        return ac2g_layer_spans
+
+    filtered = {}
+    for layer_name, spans in ac2g_layer_spans.items():
+        sorted_spans = sorted(spans, key=lambda x: x[0])
+        # Each layer: num_steps steps × 2 per step = fwd + bwd
+        # Pick the second (bwd) annotation for this step
+        bwd_idx = step_index * 2 + 1
+        if bwd_idx < len(sorted_spans):
+            # Return just the kernel spans from this single annotation
+            filtered[layer_name] = [sorted_spans[bwd_idx]]
+    return filtered
+
+
+def _collect_ac2g_gpu_spans(layer_name: str,
+                            ac2g_layer_spans: Dict[str, list]):
+    """Return ac2g-identified GPU span boundaries for *layer_name*.
+    Returns ``[(gpu_start, gpu_end), …]`` or ``[]``.
+    """
+    raw = ac2g_layer_spans.get(layer_name, [])
+    return [(s, e) for s, e, _ in raw]
+
+
+def _total_ac2g_kernel_us(layer_name: str,
+                          ac2g_layer_spans: Dict[str, list]) -> float:
+    """Sum of GPU kernel execution times within ac2g spans for *layer_name*."""
+    raw = ac2g_layer_spans.get(layer_name, [])
+    return sum(kdur for _, _, kdur in raw)
+
+
+def _get_ac2g_bwd_supplement(raw_events, step_index: int = 0,
+                              num_steps: int = 1):
+    """Compute all-gather backward copy-out GPU kernel supplement from ac2g events.
+    Returns ``{layer_name: total_kernel_us}`` — the kernel time on pure copy-out
+    streams (e.g. stream 18) that is MISSING from CPU-tree-based ``ag_bwd_gpu``.
+
+    For each layer, selects only the *second* annotation per step (bwd copy-out,
+    which is always later and larger than the fwd copy-out).
+    """
+    all_spans = _find_ac2g_ag_bwd_spans(raw_events)
+    if not all_spans:
+        return {}
+    result = {}
+    for layer_name, spans in all_spans.items():
+        sorted_spans = sorted(spans, key=lambda x: x[0])
+        if num_steps <= 1:
+            # Single step: 2 annotations (fwd, bwd). Take the bwd (last).
+            pick = sorted_spans[-1:] if len(sorted_spans) >= 2 else sorted_spans
+        else:
+            # Multi-step: filter by step_index.
+            bwd_idx = step_index * 2 + 1
+            pick = [sorted_spans[bwd_idx]] if bwd_idx < len(sorted_spans) else []
+        total = sum(kernel_us for _, _, kernel_us in pick)
+        if total > 0:
+            result[layer_name] = total
+    return result
+
 def _collect_nccl_gpu_spans(node):
     """Recursively collect only NCCL-kernel GPU spans from *node*.
 
@@ -146,11 +298,13 @@ def _gpu_kernel_span(nodes, mode):
     return (min(s[0] for s in spans), max(s[1] for s in spans))
 
 
-def _get_gpu_kernel_spans(unit):
+def _get_gpu_kernel_spans(unit, ac2g_layer_spans=None):
     """GPU-domain phase spans for all FSDP phases.
 
-    AG fwd / RS → NCCL-only (``'nccl'``).  AG bwd → non-NCCL recursive
-    (``'child'``).  Compute phases → non-NCCL flat (``'compute'``).
+    AG fwd / RS → NCCL-only (``'nccl'``).  AG bwd → primary source is
+    ac2g-identified copy-out GPU spans (``ac2g_layer_spans``), falling back
+    to ``'child'`` (non-NCCL recursive) when ac2g is unavailable.
+    Compute phases → non-NCCL flat (``'compute'``).
     """
     phases = []
     for label, node_list, mode in [
@@ -162,6 +316,13 @@ def _get_gpu_kernel_spans(unit):
         ("RS", unit.reduce_scatter, 'nccl'),
     ]:
         span = _gpu_kernel_span(node_list, mode)
+        if label == "AG bwd" and ac2g_layer_spans:
+            ac2g_spans = _collect_ac2g_gpu_spans(unit.layer_name, ac2g_layer_spans)
+            if ac2g_spans:
+                # ac2g spans are the authoritative GPU source for AG bwd
+                ac2g_start = min(s for s, _ in ac2g_spans)
+                ac2g_end = max(e for _, e in ac2g_spans)
+                span = (ac2g_start, ac2g_end)
         if span is not None:
             phases.append((label, span[0], span[1], node_list))
     return phases
@@ -255,6 +416,8 @@ def _get_unattributed_gpu_spans(fsdp, roots):
 def _get_phase_spans(unit):
     """Wall-clock (CPU) spans for each FSDP phase — used by the layer TID
     and the ASCII timeline so the phase ordering is always correct.
+    The AG bwd span is clamped to ``unit.all_gather_bwd_end`` to prevent
+    overlap with backward compute of the same layer.
     """
     phases = []
     phase_src = [
@@ -271,6 +434,8 @@ def _get_phase_spans(unit):
         elif fallback_span is not None:
             span = (fallback_span[0], max(span[1], fallback_span[1]))
         if span is not None:
+            if label == "AG bwd" and unit.all_gather_bwd_end is not None:
+                span = (span[0], unit.all_gather_bwd_end)
             phases.append((label, span[0], span[1], node_list))
     return phases
 
@@ -380,6 +545,9 @@ def _analyze_step(
     step_start: int,
     step_end: int,
     model_config: Optional[ModelConfig] = None,
+    *,  # keyword-only below
+    step_index: int = 0,
+    num_steps: int = 1,
 ):
     """Full pipeline for one ProfilerStep.
 
@@ -407,6 +575,10 @@ def _analyze_step(
         n for n in fsdp.optimizer_zero_grad
         if step_start <= n.start_time <= step_end
     ]
+
+    ac2g_supplement = _get_ac2g_bwd_supplement(parser.all_events, step_index, num_steps)
+    for unit in fsdp.units:
+        unit.ag_bwd_supplement_us = ac2g_supplement.get(unit.layer_name, 0.0)
 
     report = Report(fsdp, roots, output_path=None, model_config=model_config)
     report.generate_report()
@@ -465,12 +637,24 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0,
     if max_steps and max_steps < len(steps):
         steps = steps[-max_steps:]
 
-    # 3. Analyse all steps
+    # 3a. Build ac2g-based all-gather copy-out GPU spans (across all steps)
+    raw_events = trace_json.get("traceEvents", [])
+    ac2g_layer_spans = _find_ac2g_ag_bwd_spans(raw_events)
+    if ac2g_layer_spans:
+        print(f"  Found {sum(len(v) for v in ac2g_layer_spans.values())} ac2g copy-out GPU "
+              f"spans on {len(ac2g_layer_spans)} layers")
+
+    # 3b. Analyse all steps
+    num_steps = len(steps)
     step_analyses = []
-    for step_name, step_start, step_end, _ in steps:
+    for step_idx, (step_name, step_start, step_end, _) in enumerate(steps):
         sname = step_name.replace("ProfilerStep#", "Step#")
         print(f"  Analysing {sname} …")
-        fsdp, report, roots = _analyze_step(trace_file, step_name, step_start, step_end, model_config=model_config)
+        fsdp, report, roots = _analyze_step(
+            trace_file, step_name, step_start, step_end,
+            model_config=model_config,
+            step_index=step_idx, num_steps=num_steps,
+        )
         if fsdp is None:
             continue
         step_analyses.append((step_name, fsdp, report, roots))
@@ -639,11 +823,13 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0,
         "name": "thread_name",
         "args": {"name": "GPU phases (all steps)"},
     })
-    for step_name, fsdp, _, roots in step_analyses:
+    for step_idx, (step_name, fsdp, _, roots) in enumerate(step_analyses):
+        step_ac2g = _filter_ac2g_spans_by_step(ac2g_layer_spans, step_idx, len(step_analyses))
         # Per-unit phase bars
         for layer_idx, unit in enumerate(fsdp.units):
-            for label, start, end, nodes in _get_gpu_kernel_spans(unit):
+            for label, start, end, nodes in _get_gpu_kernel_spans(unit, ac2g_layer_spans=step_ac2g):
                 gpu_dur = _phase_gpu_time(nodes)
+                ac2g_us = _total_ac2g_kernel_us(unit.layer_name, step_ac2g) if label == "AG bwd" else 0
                 annotations.append({
                     "ph": "X", "pid": pid, "tid": gpu_comp_tid,
                     "ts": start, "dur": end - start,
@@ -652,7 +838,7 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0,
                     "args": {
                         "phase": label,
                         "layer": unit.layer_name,
-                        "gpu_us": round(gpu_dur, 1),
+                        "gpu_us": round(gpu_dur + ac2g_us, 1),
                         "wall_us": round(end - start, 1),
                         "num_nodes": len(nodes),
                         "step": step_name,

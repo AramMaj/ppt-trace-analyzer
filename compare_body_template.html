@@ -4,7 +4,7 @@
     {{TRACE_TABS}}
 </div>
 
-<div class="compare-grid">{{SUMMARY_CARDS}}</div>
+<div class="cmp-grid">{{SUMMARY_CARDS}}</div>
 
 <div class="section">
     <h2>Key Metrics Comparison</h2>
@@ -27,16 +27,17 @@
 <div class="section">
     <h2>Comprehensive Comparison</h2>
     <p style="font-size:.85em;color:#888;margin-bottom:12px">
-        <span class="cmp-better" style="padding:2px 8px;border-radius:4px;margin-right:12px">Better than
+        <span class="cmp-better" style="padding:2px 8px;margin-right:12px">Better than
             {{BASELINE}}</span>
-        <span class="cmp-worse" style="padding:2px 8px;border-radius:4px">Worse than {{BASELINE}}</span>
+        <span class="cmp-worse" style="padding:2px 8px">Worse than {{BASELINE}}</span>
     </p>
     <div class="table-wrap">
-        <table>{{TABLE_HEAD}}{{TABLE_ROWS}}</table>
+        <table class="cmp-table">{{TABLE_HEAD}}{{TABLE_ROWS}}</table>
     </div>
 </div>
 
 <div class="section">
     <h2>Bottleneck Profile by Trace</h2>
+    {{BOTTLENECK_LEGEND}}
     <div class="comp-row">{{BOTTLENECK_SECTIONS}}</div>
 </div>
