@@ -502,10 +502,14 @@ class Metrics:
         fwd_active = _merge_intervals(fwd_intervals)
         bwd_active = _merge_intervals(bwd_intervals)
         gpu_active_us = fwd_active + bwd_active
-        # busies per-phase avoid the misleading pipeline gap
-        self.fwd_busy = min(1.0, fwd_active / fwd_span) if fwd_span > 0 else 0.0
-        self.bwd_busy = min(1.0, bwd_active / bwd_span) if bwd_span > 0 else 0.0
-        self.gpu_busy = min(1.0, gpu_active_us / self.layer_span) if self.layer_span > 0 else 0.0
+        # Use max(cpu_span, gpu_kernel_span) as the denominator so that
+        # async-issued kernels whose timestamps fall outside the CPU event
+        # window don't push ratio > 1.0.
+        fwd_gpu_span = (max(e for _, e in fwd_intervals) - min(s for s, _ in fwd_intervals)) if fwd_intervals else 0.0
+        bwd_gpu_span = (max(e for _, e in bwd_intervals) - min(s for s, _ in bwd_intervals)) if bwd_intervals else 0.0
+        self.fwd_busy = min(1.0, fwd_active / max(fwd_span, fwd_gpu_span)) if max(fwd_span, fwd_gpu_span) > 0 else 0.0
+        self.bwd_busy = min(1.0, bwd_active / max(bwd_span, bwd_gpu_span)) if max(bwd_span, bwd_gpu_span) > 0 else 0.0
+        self.gpu_busy = min(1.0, gpu_active_us / max(self.layer_span, fwd_gpu_span + bwd_gpu_span)) if max(self.layer_span, fwd_gpu_span + bwd_gpu_span) > 0 else 0.0
 
         # --- TP metrics (evenly split across layers) ---
         self.tp_ag_gpu = global_tp_ag_gpu / num_units if num_units > 0 else 0.0

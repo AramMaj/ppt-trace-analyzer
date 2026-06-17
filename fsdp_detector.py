@@ -28,7 +28,7 @@ scans only the profiler thread and backward compute filters it out.
 """
 
 from copy import deepcopy
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 from trace_parser import LogicalOperation, TraceParserHelper
 
