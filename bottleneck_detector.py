@@ -173,6 +173,51 @@ def _compute_overlap_metrics(units: List['FSDPUnit']) -> dict:
     }
 
 
+def _merge_intervals(intervals):
+    """Merge a list of ``(start, end)`` tuples into non-overlapping spans and
+    return the total covered wall-clock time.
+    """
+    if not intervals:
+        return 0.0
+    intervals.sort()
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return sum(end - start for start, end in merged)
+
+
+def _collect_kernel_intervals(phase_kernel_lists):
+    """Extract ``(start, end)`` timestamps from one or more GPU-kernel lists
+    (each element is a ``dict`` with ``'ts'`` and ``'dur'`` keys).
+    """
+    intervals = []
+    for kernels in phase_kernel_lists:
+        for k in kernels:
+            s = k.get('ts', 0)
+            intervals.append((s, s + k.get('dur', 0)))
+    return intervals
+
+
+def _compute_gpu_active_time(unit: 'FSDPUnit') -> float:
+    """Total wall-clock time where at least one GPU kernel (attributed to this
+    unit) was executing.  Merges overlapping intervals across streams so that
+    parallel kernels on different CUDA streams are NOT double-counted.
+
+    Returns ``0.0`` when the unit has no attributed GPU kernels.
+    """
+    intervals = _collect_kernel_intervals([
+        unit.all_gather_fwd_gpu_kernels,
+        unit.all_gather_bwd_gpu_kernels,
+        unit.reduce_scatter_gpu_kernels,
+        _collect_gpu_kernels(unit.fwd_compute),
+        _collect_gpu_kernels(unit.bwd_compute),
+    ])
+    return _merge_intervals(intervals)
+
+
 def _get_layer_gpu_span(unit: 'FSDPUnit'):
     """Collect all GPU kernel timestamps across every phase for an FSDP unit,
     returning ``(gpu_start, gpu_end)`` as the union span of all GPU kernels.
@@ -436,16 +481,30 @@ class Metrics:
             self.ag_bwd_gpu / self.ag_bwd_wall if self.ag_bwd_wall > 0 else 0.0
         ))
 
-        # --- Layer wall span + GPU busy fraction ---
-        # GPU busy = fraction of the layer's CPU wall span where at least one
-        # GPU kernel (attributed to this layer) was active.  Uses the union of
-        # GPU kernel intervals, NOT the sum of their durations, so it is always
-        # ∈ [0, 1].  Values < 1.0 mean the GPU was idle for part of the span.
-        all_events = (unit.all_gather_fwd + unit.fwd_compute + unit.all_gather_bwd
-                      + unit.bwd_compute + unit.reduce_scatter)
-        self.layer_span = _phase_wall_time(all_events) if all_events else 0.0
-        gpu_span = _get_layer_gpu_span(unit)
-        gpu_active_us = (gpu_span[1] - gpu_span[0]) if gpu_span else 0.0
+        # --- Per-phase wall spans (sum of forward + backward, not union,
+        # so the pipeline gap between forward and backward is excluded) ---
+        fwd_events = unit.all_gather_fwd + unit.fwd_compute
+        bwd_events = unit.all_gather_bwd + unit.bwd_compute + unit.reduce_scatter
+        fwd_span = _phase_wall_time(fwd_events) if fwd_events else 0.0
+        bwd_span = _phase_wall_time(bwd_events) if bwd_events else 0.0
+        self.layer_span = fwd_span + bwd_span
+
+        # --- Per-phase GPU active time + overall busy ---
+        fwd_intervals = _collect_kernel_intervals([
+            unit.all_gather_fwd_gpu_kernels,
+            _collect_gpu_kernels(unit.fwd_compute),
+        ])
+        bwd_intervals = _collect_kernel_intervals([
+            unit.all_gather_bwd_gpu_kernels,
+            unit.reduce_scatter_gpu_kernels,
+            _collect_gpu_kernels(unit.bwd_compute),
+        ])
+        fwd_active = _merge_intervals(fwd_intervals)
+        bwd_active = _merge_intervals(bwd_intervals)
+        gpu_active_us = fwd_active + bwd_active
+        # busies per-phase avoid the misleading pipeline gap
+        self.fwd_busy = min(1.0, fwd_active / fwd_span) if fwd_span > 0 else 0.0
+        self.bwd_busy = min(1.0, bwd_active / bwd_span) if bwd_span > 0 else 0.0
         self.gpu_busy = min(1.0, gpu_active_us / self.layer_span) if self.layer_span > 0 else 0.0
 
         # --- TP metrics (evenly split across layers) ---
@@ -666,6 +725,8 @@ class Metrics:
             "comp_ratio": self.comp_ratio,
             "optimizer_ratio": self.optimizer_ratio,
             "gpu_busy": self.gpu_busy,
+            "fwd_busy": self.fwd_busy,
+            "bwd_busy": self.bwd_busy,
             "layer_span_us": self.layer_span,
             "overlap_ratio": self.overlap_ratio,
             "serial_ratio": self.serial_ratio,
