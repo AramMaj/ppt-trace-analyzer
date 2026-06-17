@@ -27,6 +27,7 @@ CUDA stream thread (tid=24759) than forward (tid=24529), forward compute
 scans only the profiler thread and backward compute filters it out.
 """
 
+from copy import deepcopy
 from typing import List, Optional, Tuple
 
 from trace_parser import LogicalOperation, TraceParserHelper
@@ -105,6 +106,7 @@ class FSDP:
         self.tp_all_gather: List[dict] = []
         self.tp_reduce_scatter: List[dict] = []
         self.tp_all_reduce: List[dict] = []
+        self.tp_other: List[dict] = []
 
     @property
     def tp_all_gather_gpu(self) -> float:
@@ -340,7 +342,8 @@ class StandardFSDPDetector:
             copy_out_end = None
             for n in unit.all_gather_fwd:
                 if 'all_gather_copy_out' in n.name:
-                    copy_out_end = n.end_time
+                    if copy_out_end is None or n.end_time > copy_out_end:
+                        copy_out_end = n.end_time
 
             if copy_out_end is None:
                 continue
@@ -378,7 +381,7 @@ class StandardFSDPDetector:
                     n_tid = n.raw_event.get('tid') if n.raw_event else None
                     if n_tid != profiler_tid:
                         continue
-                if n.start_time < end_time and copy_out_end < n.end_time <= end_time:
+                if n.start_time < end_time and n.start_time >= copy_out_end and copy_out_end < n.end_time <= end_time:
                     if _has_fsdp_prefix(n.name) or n.name.startswith('ProfilerStep') or n.name.startswith('Optimizer'):
                         continue
                     if n.name in ('backward_pass', 'forward_pass', 'root_pre_forward',
@@ -473,6 +476,15 @@ class StandardFSDPDetector:
                     if copy_out_end_bwd is None or ag_node.end_time > copy_out_end_bwd:
                         copy_out_end_bwd = ag_node.end_time
             all_gather_end = copy_out_end_bwd if copy_out_end_bwd is not None else (pre_bwd.end_time if pre_bwd else None)
+
+            # Fallback: search all_pre_bwd_global for this layer when the local
+            # copy_out_bwd + pre_bwd chain came up empty but rs_start is known.
+            if all_gather_end is None and rs_start is not None and all_pre_bwd_global:
+                for pb in all_pre_bwd_global:
+                    if _extract_layer(pb.name) == unit.layer_name:
+                        all_gather_end = pb.end_time
+                        break
+
             unit.all_gather_bwd_end = all_gather_end
 
             if all_gather_end is None or rs_start is None:
@@ -510,6 +522,8 @@ class StandardFSDPDetector:
                 fsdp.tp_reduce_scatter.append(ev)
             elif cat == 'tp_all_reduce':
                 fsdp.tp_all_reduce.append(ev)
+            elif cat == 'tp_other':
+                fsdp.tp_other.append(ev)
 
     def _detect_optimizer_step(self, roots: List[LogicalOperation], fsdp_units: FSDP):
         """Collect ``Optimizer.step#N`` / ``Optimizer.zero_grad#N`` CPU nodes.
@@ -556,9 +570,8 @@ class StandardFSDPDetector:
                 if pg == FSDP_PG_DESC and 'reduce_scatter' in coll.lower():
                     ev_start = ev.get('ts', 0)
                     ev_end = ev_start + ev.get('dur', 0)
-                    if ev_start >= bwd_span[0] and ev_end <= bwd_span[1] + 5000:
-                        import copy
-                        fake = copy.deepcopy(unit.bwd_compute[0]) if unit.bwd_compute else None
+                    if ev_start >= bwd_span[0] and ev_end <= bwd_span[1] + 1000:
+                        fake = deepcopy(unit.bwd_compute[0]) if unit.bwd_compute else None
                         if fake is not None:
                             fake.name = f'FSDP::post_backward_reduce ({unit.layer_name})'
                             fake.start_time = ev_start
@@ -571,7 +584,6 @@ class StandardFSDPDetector:
                             fake.external_ids = set()
                             if fake not in unit.reduce_scatter:
                                 unit.reduce_scatter.append(fake)
-                                break
 
     def _profiler_tid(self, roots: List[LogicalOperation]):
         """Thread ID of the first ProfilerStep# event — used for conditional
