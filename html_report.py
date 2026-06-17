@@ -46,7 +46,7 @@ def _dashboard_cards(aggregated: dict, metrics_list: list, throughput: dict) -> 
     num_layers = len(metrics_list)
     wall = aggregated.get("step_wall", 0)
     wall_str = _format_us(wall)
-    avg_util = sum(m.gpu_util for m in metrics_list) / len(metrics_list) if metrics_list else 0
+    avg_busy = sum(m.gpu_busy for m in metrics_list) / len(metrics_list) if metrics_list else 0
     avg_ctc = sum(m.compute_to_comm_ratio for m in metrics_list) / len(metrics_list) if metrics_list else 0
     ctc_str = f"{avg_ctc:.2f}x" if avg_ctc != float('inf') else "inf"
     steps_s = f"{1e6 / wall:.1f}" if wall > 0 else "N/A"
@@ -57,7 +57,7 @@ def _dashboard_cards(aggregated: dict, metrics_list: list, throughput: dict) -> 
     <div class="kpi-item"><div class="kpi-value">{num_layers}</div><div class="kpi-label">Layers</div></div>
     <div class="kpi-item"><div class="kpi-value">{wall_str}</div><div class="kpi-label">Step Wall</div></div>
     <div class="kpi-item"><div class="kpi-value">{steps_s}/s</div><div class="kpi-label">Steps/sec</div></div>
-    <div class="kpi-item"><div class="kpi-value">{avg_util:.1%}</div><div class="kpi-label">GPU Util</div></div>
+    <div class="kpi-item"><div class="kpi-value">{avg_busy:.1%}</div><div class="kpi-label">GPU Busy</div></div>
     <div class="kpi-item"><div class="kpi-value">{ctc_str}</div><div class="kpi-label">Comp:Comm</div></div>
 """
     if mfu > 0:
@@ -98,9 +98,9 @@ COLORS = {
 }
 
 
-def _util_chart_data(metrics_list: list) -> str:
+def _busy_chart_data(metrics_list: list) -> str:
     labels = [m.layer_name for m in metrics_list]
-    values = [round(m.gpu_util * 100, 1) for m in metrics_list]
+    values = [round(m.gpu_busy * 100, 1) for m in metrics_list]
     return json.dumps({"labels": labels, "values": values})
 
 
@@ -119,7 +119,7 @@ def _comp_comm_chart_data(metrics_list: list, aggregated: dict) -> str:
 def _overlap_chart_data(metrics_list: list) -> str:
     labels = ["AG forward", "AG backward", "Reduce scatter"]
     vals = []
-    for attr in ["ag_fwd_overlap_efficiency", "ag_bwd_overlap_efficiency", "rs_overlap_efficiency"]:
+    for attr in ["ag_fwd_exposed_ratio", "ag_bwd_exposed_ratio", "rs_exposed_ratio"]:
         vs = [getattr(m, attr) for m in metrics_list]
         vals.append(round(sum(vs) / len(vs), 3) if vs else 0)
     return json.dumps({"labels": labels, "values": vals})
@@ -153,18 +153,16 @@ def _phase_metrics_table(aggregated: dict, num_layers: int) -> str:
 
     rows = ""
     for label, key, color in phases:
-        per = aggregated.get(key, 0)
-        tot = per * num_layers
-        pct = per / total * 100 if total > 0 else 0
-        rows += f"<tr><td><span class='legend-dot' style='background:{color}'></span> {label}</td><td>{_format_us(per)}</td><td>{_format_us(tot)}</td><td>{pct:.1f}%</td></tr>\n"
+        avg = aggregated.get(key, 0)
+        pct = avg / total * 100 if total > 0 else 0
+        rows += f"<tr><td><span class='legend-dot' style='background:{color}'></span> {label}</td><td>{_format_us(avg)}</td><td>{pct:.1f}%</td></tr>\n"
 
-    rows += f"<tr style='border-top:1px solid #ccc'><td><strong>FSDP total</strong></td><td>{_format_us(total_gpu)}</td><td>{_format_us(total_gpu * num_layers)}</td><td></td></tr>\n"
-    rows += f"<tr><td><strong>TP total</strong></td><td>{_format_us(tp_total)}</td><td>{_format_us(tp_total * num_layers)}</td><td></td></tr>\n"
-    rows += f"<tr><td><strong>Total (incl. TP)</strong></td><td>{_format_us(total_gpu + tp_total)}</td><td>{_format_us((total_gpu + tp_total) * num_layers)}</td><td>100.0%</td></tr>\n"
-    rows += f"<tr><td>Total CPU</td><td>{_format_us(aggregated.get('total_cpu_us', 0))}</td><td></td><td></td></tr>\n"
+    rows += f"<tr style='border-top:1px solid #ccc'><td><strong>FSDP total</strong></td><td>{_format_us(total_gpu)}</td><td></td></tr>\n"
+    rows += f"<tr><td><strong>TP total</strong></td><td>{_format_us(tp_total)}</td><td>100.0%</td></tr>\n"
+    rows += f"<tr><td>Total CPU (dispatch)</td><td>{_format_us(aggregated.get('total_cpu_us', 0))}</td><td></td></tr>\n"
 
     return f"""<table>
-<tr><th>Phase</th><th>Per unit</th><th>Total</th><th>% GPU</th></tr>
+<tr><th>Phase</th><th>Avg GPU / layer</th><th>% GPU cycles</th></tr>
 {rows}
 </table>"""
 
@@ -175,7 +173,7 @@ def _efficiency_table(aggregated: dict, metrics_list: list) -> str:
     fsdp_comm = aggregated.get("ag_fwd_gpu_us", 0) + aggregated.get("ag_bwd_gpu_us", 0) + aggregated.get("rs_gpu_us", 0)
     comp = aggregated.get("fwd_cmp_gpu_us", 0) + aggregated.get("bwd_cmp_gpu_us", 0)
     true_comp = comp - tp_total
-    avg_util = sum(m.gpu_util for m in metrics_list) / len(metrics_list) if metrics_list else 0
+    avg_util = sum(m.gpu_busy for m in metrics_list) / len(metrics_list) if metrics_list else 0
     avg_ctc = sum(m.compute_to_comm_ratio for m in metrics_list) / len(metrics_list) if metrics_list else 0
     max_span = max(m.layer_span for m in metrics_list) if metrics_list else 0
     min_span = min(m.layer_span for m in metrics_list if m.layer_span > 0) or max_span
@@ -184,7 +182,7 @@ def _efficiency_table(aggregated: dict, metrics_list: list) -> str:
     avg_bwd_ov = sum(m.bwd_comp_comm_overlap for m in metrics_list) / max(len(metrics_list), 1)
     ov = aggregated.get("overlap_ratio", 0)
     idle = aggregated.get("idle_ratio", 0)
-    serial = aggregated.get("serial_exec_efficiency", 0)
+    serial = aggregated.get("serial_ratio", 0)
 
     return f"""<table>
 <tr><th>Metric</th><th>Value</th></tr>
@@ -192,7 +190,7 @@ def _efficiency_table(aggregated: dict, metrics_list: list) -> str:
 <tr><td>FSDP communication</td><td>{fsdp_comm / total:.1%}</td></tr>
 <tr><td>TP communication</td><td>{tp_total / total:.1%}</td></tr>
 <tr><td>Optimizer</td><td>{aggregated.get('optimizer_ratio', 0):.1%}</td></tr>
-<tr><td>Avg GPU utilization</td><td>{avg_util:.1%}</td></tr>
+<tr><td>Avg GPU busy</td><td>{avg_util:.1%}</td></tr>
 <tr><td>Compute-to-comm ratio</td><td>{avg_ctc:.2f}x</td></tr>
 <tr><td>Layer span imbalance</td><td>{imbalance:.1f}x</td></tr>
 <tr style='border-top:1px solid #ccc'><td>Pipeline overlap</td><td>{ov:.1%}</td></tr>
@@ -206,7 +204,7 @@ def _efficiency_table(aggregated: dict, metrics_list: list) -> str:
 def _per_unit_table(metrics_list: list) -> str:
     mem_avail = any(m.memory_has_data for m in metrics_list)
     cols = ["Layer", "AG fwd", "Fwd cmp", "AG bwd", "Bwd cmp", "RS", "Opt",
-            "Total", "Util", "CtC", "ExpC", "Span", "K#", "AvgK"]
+            "Total", "Busy", "CtC", "ExpC", "Span", "K#", "AvgK"]
     if mem_avail:
         cols.append("Mem")
     cols.append("Issues")
@@ -216,7 +214,7 @@ def _per_unit_table(metrics_list: list) -> str:
     numeric_keys = [
         "ag_fwd_gpu_us", "fwd_cmp_gpu_us", "ag_bwd_gpu_us", "bwd_cmp_gpu_us",
         "rs_gpu_us", "optimizer_gpu_us", "total_gpu_us", "layer_span_us",
-        "gpu_util", "compute_to_comm_ratio", "exposed_comm_fraction",
+        "gpu_busy", "compute_to_comm_ratio", "avg_exposed_ratio",
         "kernel_count", "avg_kernel_dur_us",
     ]
     col_values = {k: [] for k in numeric_keys}
@@ -247,7 +245,7 @@ def _per_unit_table(metrics_list: list) -> str:
         issues = Bottlenecks.detect(m)
         ctc = d.get('compute_to_comm_ratio', 0)
         ctc_str = f"{ctc:.2f}x" if ctc != float('inf') else "inf"
-        exp = d.get('exposed_comm_fraction', 0)
+        exp = d.get('avg_exposed_ratio', 0)
         mem_str = ""
         if mem_avail and d.get('memory_peak', 0) > 0:
             mem_str = f"{d['memory_peak']/(1024**3):.1f}G"
@@ -283,9 +281,9 @@ def _per_unit_table(metrics_list: list) -> str:
 {_cell(d['rs_gpu_us'], _format_us(d['rs_gpu_us']), 'rs_gpu_us')}
 {_cell(d['optimizer_gpu_us'], _format_us(d['optimizer_gpu_us']), 'optimizer_gpu_us')}
 {_cell(d['total_gpu_us'], _format_us(d['total_gpu_us']), 'total_gpu_us')}
-{_cell(d['gpu_util'], f"{d['gpu_util']:.1%}", 'gpu_util')}
+{_cell(d['gpu_busy'], f"{d['gpu_busy']:.1%}", 'gpu_busy')}
 {_cell(ctc, ctc_str, 'compute_to_comm_ratio')}
-{_cell(exp, f"{exp:.1%}", 'exposed_comm_fraction')}
+{_cell(exp, f"{exp:.1%}", 'avg_exposed_ratio')}
 {_cell(d['layer_span_us'], _format_us(d['layer_span_us']), 'layer_span_us')}
 {_cell(d['kernel_count'], str(d['kernel_count']), 'kernel_count')}
 {_cell(d['avg_kernel_dur_us'], f"{d['avg_kernel_dur_us']:.1f}us", 'avg_kernel_dur_us')}
@@ -449,7 +447,7 @@ def generate_html_report(trace_file: str, output_path: str = None, model_config:
     # Serialise chart data to JSON
     chart_data = {
         "phasePie": json.loads(_phase_pie_chart_data(aggregated)),
-        "utilChart": json.loads(_util_chart_data(metrics_list)),
+        "busyChart": json.loads(_busy_chart_data(metrics_list)),
         "compCommChart": json.loads(_comp_comm_chart_data(metrics_list, aggregated)),
         "overlapChart": json.loads(_overlap_chart_data(metrics_list)),
         "ctcChart": json.loads(_ctc_chart_data(metrics_list)),
@@ -518,7 +516,7 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
     summary_cards = ""
     for i, (label, agg, metrics, steps, tp) in enumerate(all_results):
         wall = agg.get("step_wall", 0)
-        util = sum(m.gpu_util for m in metrics) / max(len(metrics), 1)
+        busy = sum(m.gpu_busy for m in metrics) / max(len(metrics), 1)
         ctc = sum(m.compute_to_comm_ratio for m in metrics) / max(len(metrics), 1)
         ctc_s = f"{ctc:.2f}x" if ctc != float('inf') else "inf"
         mfu = tp.get("mfu", 0)
@@ -536,7 +534,7 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
 <tr><td>Step wall</td><td>{_format_us(wall)}</td></tr>
 <tr><td>Layers</td><td>{len(metrics)}</td></tr>
 <tr><td>Steps/s</td><td>{steps_s}</td></tr>
-<tr><td>GPU util</td><td>{util:.1%}</td></tr>
+<tr><td>GPU busy</td><td>{busy:.1%}</td></tr>
 <tr><td>Comp:Comm</td><td>{ctc_s}</td></tr>
 {extras}
 </table></div>"""
@@ -559,15 +557,15 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
         }
 
     # Key metrics chart
-    km_labels = ["GPU Util", "Pipeline Overlap", "Serial Exec", "Comm Ratio", "ExpC"]
+    km_labels = ["GPU Busy", "Pipeline Overlap", "Serial Exec", "Comm Ratio", "ExpC"]
     km_datasets = []
     for i, (label, agg, metrics, steps, tp) in enumerate(all_results):
         vals = [
-            _avg([m.gpu_util for m in metrics]),
+            _avg([m.gpu_busy for m in metrics]),
             agg.get("overlap_ratio", 0),
-            agg.get("serial_exec_efficiency", 0),
+            agg.get("serial_ratio", 0),
             agg.get("comm_ratio", 0),
-            _avg([m.exposed_comm_fraction for m in metrics]),
+            _avg([m.avg_exposed_ratio for m in metrics]),
         ]
         km_datasets.append({"label": label, "data": [round(v * 100, 1) for v in vals], "backgroundColor": colors[i]})
 
@@ -630,7 +628,7 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
     def _fmt_metric(name, raw_val):
         if raw_val is None:
             return "N/A"
-        if name in ("GPU util", "Comm ratio", "FSDP comm ratio", "TP comm ratio",
+        if name in ("GPU busy", "Comm ratio", "FSDP comm ratio", "TP comm ratio",
                      "Pipeline overlap", "Serial efficiency", "Pipeline idle",
                      "Exposed comm fraction", "AG overlap efficiency",
                      "Fwd TP overlap", "Bwd TP overlap", "MFU", "HFU"):
@@ -670,7 +668,7 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
     COMPARE_METRICS.append(("Total CPU", lambda r, m: r.get("total_cpu_us", 0), "lower", True))
 
     # Utilization & ratios
-    COMPARE_METRICS.append(("GPU util", lambda r, m: sum(x.gpu_util for x in m) / max(len(m), 1), "higher", True))
+    COMPARE_METRICS.append(("GPU busy", lambda r, m: sum(x.gpu_busy for x in m) / max(len(m), 1), "higher", True))
     COMPARE_METRICS.append(("Compute-to-comm ratio", lambda r, m: sum(x.compute_to_comm_ratio for x in m) / max(len(m), 1), "higher", True))
 
     # MFU/HFU
@@ -685,12 +683,12 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
 
     # Overlap & pipeline
     COMPARE_METRICS.append(("Pipeline overlap", lambda r, m: r.get("overlap_ratio", 0), "higher", True))
-    COMPARE_METRICS.append(("Serial efficiency", lambda r, m: r.get("serial_exec_efficiency", 0), "higher", True))
+    COMPARE_METRICS.append(("Serial ratio", lambda r, m: r.get("serial_ratio", 0), "higher", True))
     COMPARE_METRICS.append(("Pipeline idle", lambda r, m: r.get("idle_ratio", 0), "lower", True))
 
     # Efficiency
-    COMPARE_METRICS.append(("Exposed comm fraction", lambda r, m: sum(x.exposed_comm_fraction for x in m) / max(len(m), 1), "lower", True))
-    COMPARE_METRICS.append(("AG overlap efficiency", lambda r, m: sum(x.ag_fwd_overlap_efficiency for x in m) / max(len(m), 1), "lower", True))
+    COMPARE_METRICS.append(("Avg exposed ratio", lambda r, m: sum(x.avg_exposed_ratio for x in m) / max(len(m), 1), "lower", True))
+    COMPARE_METRICS.append(("AG fwd exposed ratio", lambda r, m: sum(x.ag_fwd_exposed_ratio for x in m) / max(len(m), 1), "lower", True))
     COMPARE_METRICS.append(("Fwd TP overlap", lambda r, m: sum(x.fwd_comp_comm_overlap for x in m) / max(len(m), 1), "higher", True))
     COMPARE_METRICS.append(("Bwd TP overlap", lambda r, m: sum(x.bwd_comp_comm_overlap for x in m) / max(len(m), 1), "higher", True))
 

@@ -320,8 +320,8 @@
     if (DATA.phasePie) {
       doughnutChart('phasePie', DATA.phasePie.labels, DATA.phasePie.values, DATA.phasePie.colors);
     }
-    if (DATA.utilChart) {
-      barChart('utilChart', DATA.utilChart.labels, [{ label: 'GPU util', data: DATA.utilChart.values, backgroundColor: DATA.utilChart.values.map(v => v >= 100 ? '#4e79a7' : v >= 70 ? '#76b7b2' : '#e15759') }]);
+    if (DATA.busyChart) {
+      barChart('busyChart', DATA.busyChart.labels, [{ label: 'GPU busy', data: DATA.busyChart.values, backgroundColor: DATA.busyChart.values.map(v => v >= 90 ? '#4e79a7' : v >= 50 ? '#76b7b2' : '#e15759') }]);
     }
     if (DATA.compCommChart) {
       barChart('compCommChart', DATA.compCommChart.labels, DATA.compCommChart.datasets, { legend: true });

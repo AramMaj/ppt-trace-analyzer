@@ -27,7 +27,7 @@ CUDA stream thread (tid=24759) than forward (tid=24529), forward compute
 scans only the profiler thread and backward compute filters it out.
 """
 
-from typing import Dict, List, Optional, Tuple, Set, Iterator, Any
+from typing import List, Optional, Tuple
 
 from trace_parser import LogicalOperation, TraceParserHelper
 
@@ -136,25 +136,7 @@ class FSDP:
         """Total CPU duration of Optimizer.step nodes (µs)."""
         return sum(n.cpu_duration for n in self.optimizer_step)
 
-    @property
-    def optimizer_wall(self) -> float:
-        """Wall-clock span covering all optimizer-step nodes (µs)."""
-        if not self.optimizer_step:
-            return 0.0
-        start = min(n.start_time for n in self.optimizer_step)
-        end = max(n.end_time for n in self.optimizer_step)
-        return end - start
 
-    @property
-    def optimizer_step_gpu_kernels(self) -> List[dict]:
-        """Collect all GPU kernel events under all Optimizer.step nodes (recursive)."""
-        kernels = []
-        for n in self.optimizer_step:
-            kernels.extend(n.direct_gpu_kernels if isinstance(n.direct_gpu_kernels, list) else [])
-            for ch in _iter_logical(n):
-                if ch.direct_gpu_kernels:
-                    kernels.extend(ch.direct_gpu_kernels if isinstance(ch.direct_gpu_kernels, list) else [])
-        return kernels
 
     @property
     def step_wall(self) -> float:
@@ -269,17 +251,6 @@ def _pick_latest_with_allgather(nodes: List[LogicalOperation]) -> LogicalOperati
     picks = [n for n in nodes if any('all_gather' in ch.name and _has_fsdp_prefix(ch.name) for ch in n.children)]
     return max(picks, key=lambda n: n.start_time) if picks else max(nodes, key=lambda n: n.start_time)
 
-
-def _match_gpu_by_interval(gpu_events: List[dict], start: float, end: float) -> List[dict]:
-    """GPU events fully contained in [start, end].  Debugging helper, not used in the main pipeline."""
-    out = []
-    ts = start
-    for ev in gpu_events:
-        ev_start = ev.get('ts', 0)
-        ev_dur = ev.get('dur', 0)
-        if ev_start >= ts and (ev_start + ev_dur) <= end:
-            out.append(ev)
-    return out
 
 
 class StandardFSDPDetector:

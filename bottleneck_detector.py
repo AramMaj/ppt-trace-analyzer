@@ -15,7 +15,7 @@ Six sections:
 """
 
 import json
-from typing import Dict, List, Optional, Set, Iterator, Tuple, Any
+from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
 from trace_parser import LogicalOperation
@@ -132,7 +132,8 @@ def _compute_overlap_metrics(units: List['FSDPUnit']) -> dict:
 
     if not start_end_pairs:
         return {'overlap_time': 0.0, 'serial_time': 0.0, 'idle_time': 0.0,
-                'step_wall': 0.0, 'overlap_ratio': 0.0, 'serial_exec_efficiency': 1.0}
+                'step_wall': 0.0, 'overlap_ratio': 0.0, 'serial_ratio': 1.0,
+                'idle_ratio': 0.0}
 
     events = []
     for start, end in start_end_pairs:
@@ -167,7 +168,7 @@ def _compute_overlap_metrics(units: List['FSDPUnit']) -> dict:
         'idle_time': idle_time,
         'step_wall': step_wall,
         'overlap_ratio': overlap_time / (serial_time + overlap_time) if (serial_time + overlap_time) > 0 else 0.0,
-        'serial_exec_efficiency': serial_time / total if total > 0 else 1.0,
+        'serial_ratio': serial_time / total if total > 0 else 1.0,
         'idle_ratio': idle_time / total if total > 0 else 0.0,
     }
 
@@ -231,26 +232,36 @@ def _compute_cross_layer_overlap(units):
 
 
 def _collect_memory(unit: 'FSDPUnit', metrics: 'Metrics'):
-    """Sum ``memory_delta`` (activation memory, parameter memory, gradient buffers)
-    across all FSDP phase nodes.  Peak is max(allocated, freed), approximating
-    ``torch.cuda.max_memory_allocated`` per layer.  Only meaningful when
+    """Track running peak memory from ``memory_delta`` events.
+
+    Walks all phase nodes in chronological order, applies each ``memory_delta``
+    to a running counter, and records the maximum.  Only meaningful when
     ``profile_memory=True`` in ``torch.profiler`` — guarded by ``memory_has_data``.
     """
-    all_nodes = (unit.all_gather_fwd + unit.fwd_compute + unit.all_gather_bwd
-                 + unit.bwd_compute + unit.reduce_scatter)
+    all_nodes = sorted(
+        unit.all_gather_fwd + unit.fwd_compute + unit.all_gather_bwd
+        + unit.bwd_compute + unit.reduce_scatter,
+        key=lambda n: n.start_time,
+    )
     total_alloc = 0
     total_free = 0
+    running = 0
+    peak = 0
     for n in all_nodes:
         delta = n.memory_delta
         if delta > 0:
             total_alloc += delta
+            running += delta
         elif delta < 0:
             total_free += -delta
+            running += delta
+        if running > peak:
+            peak = running
     if total_alloc > 0 or total_free > 0:
         metrics.memory_has_data = True
         metrics.memory_allocated = total_alloc
         metrics.memory_freed = total_free
-        metrics.memory_peak = max(total_alloc, total_free)
+        metrics.memory_peak = peak
 
 
 # ---------------------------------------------------------------------------
@@ -325,9 +336,10 @@ class ModelConfig:
         ffn = self.intermediate_dim
 
         # Per-token, per-layer FLOPs
-        attn_flops = 4 * h * h          # QKV projection + output projection (ignoring heads)
+        attn_proj = 4 * h * h           # QKV projection + output projection
+        attn_scores = 4 * s * h         # QK^T + PV (attention score computation)
         mlp_flops = 3 * 2 * h * ffn     # gate_proj + up_proj + down_proj (×2 for FWD)
-        per_layer_flops = attn_flops + mlp_flops
+        per_layer_flops = attn_proj + attn_scores + mlp_flops
 
         # Embedding + LM head (if vocab_size > 0)
         embed_flops = 2 * h * self.vocab_size if self.vocab_size > 0 else 0
@@ -402,34 +414,39 @@ class Metrics:
         # --- Communication vs compute ratio ---
         comm_gpu = self.ag_fwd_gpu + self.ag_bwd_gpu + self.rs_gpu  # FSDP NCCL
         comp_gpu = self.fwd_cmp_gpu + self.bwd_cmp_gpu  # attn/MLP/norm
-        self.comm_ratio = comm_gpu / self.total_gpu if self.total_gpu > 0 else 0.0
         self.comp_ratio = comp_gpu / self.total_gpu if self.total_gpu > 0 else 0.0
 
         self.optimizer_ratio = self.optimizer_gpu / self.total_gpu if self.total_gpu > 0 else 0.0
 
-        # --- Per-phase overlap efficiency ---
-        # How well each collective is hidden behind compute:
+        # --- Per-phase exposed ratio ---
+        # How much of each collective's wall span is occupied by its GPU work.
         #   GPU time / CPU wall span → 1.0 = fully exposed (no overlap),
         #   << 1.0 = well hidden (GPU execution overlaps with other work).
         # Values > 1.0 are capped at 1.0 because async NCCL and ac2g copy-out
         # streams routinely produce GPU_time > CPU_wall (NCCL kernel dispatched
-        # in 0.4ms CPU, runs 24ms on GPU).  Capping keeps exposed_comm_fraction
-        # in [0, 1] and prevents negative comm_hiding_efficiency in the report.
-        self.ag_fwd_overlap_efficiency = min(1.0, (
+        # in 0.4ms CPU, runs 24ms on GPU).  Capping keeps avg_exposed_ratio
+        # in [0, 1].
+        self.ag_fwd_exposed_ratio = min(1.0, (
             self.ag_fwd_gpu / self.ag_fwd_wall if self.ag_fwd_wall > 0 else 0.0
         ))
-        self.rs_overlap_efficiency = min(1.0, (
+        self.rs_exposed_ratio = min(1.0, (
             self.rs_gpu / self.rs_wall if self.rs_wall > 0 else 0.0
         ))
-        self.ag_bwd_overlap_efficiency = min(1.0, (
+        self.ag_bwd_exposed_ratio = min(1.0, (
             self.ag_bwd_gpu / self.ag_bwd_wall if self.ag_bwd_wall > 0 else 0.0
         ))
 
-        # --- Layer wall span + GPU utilisation ---
+        # --- Layer wall span + GPU busy fraction ---
+        # GPU busy = fraction of the layer's CPU wall span where at least one
+        # GPU kernel (attributed to this layer) was active.  Uses the union of
+        # GPU kernel intervals, NOT the sum of their durations, so it is always
+        # ∈ [0, 1].  Values < 1.0 mean the GPU was idle for part of the span.
         all_events = (unit.all_gather_fwd + unit.fwd_compute + unit.all_gather_bwd
                       + unit.bwd_compute + unit.reduce_scatter)
         self.layer_span = _phase_wall_time(all_events) if all_events else 0.0
-        self.gpu_util = self.total_gpu / self.layer_span if self.layer_span > 0 else 0.0
+        gpu_span = _get_layer_gpu_span(unit)
+        gpu_active_us = (gpu_span[1] - gpu_span[0]) if gpu_span else 0.0
+        self.gpu_busy = min(1.0, gpu_active_us / self.layer_span) if self.layer_span > 0 else 0.0
 
         # --- TP metrics (evenly split across layers) ---
         self.tp_ag_gpu = global_tp_ag_gpu / num_units if num_units > 0 else 0.0
@@ -471,7 +488,7 @@ class Metrics:
 
         # --- Overlap (backfilled by Report._compute_aggregated) ---
         self.overlap_ratio = 0.0
-        self.serial_exec_efficiency = 1.0
+        self.serial_ratio = 1.0
         self.idle_ratio = 0.0
         self.step_wall = 0.0
 
@@ -489,18 +506,17 @@ class Metrics:
         comp = self.fwd_cmp_gpu + self.bwd_cmp_gpu
         self.compute_to_comm_ratio = comp / all_comm if all_comm > 0 else float('inf')
 
-        # --- Exposed communication fraction ---
-        # Fraction of FSDP communication that is NOT hidden behind compute.
-        # Computed from overlap efficiency: if AG runs in 100µs but spans 900µs
-        # of wall time, only 100/900 = 11% is "exposed" (the rest overlaps
-        # with other streams / compute).  Exposed = 1 - efficiency.
-        # Higher exposed_comm → worse overlap → more pipeline bubble.
-        self.exposed_comm_fraction = 0.0
-        effs = [self.ag_fwd_overlap_efficiency, self.rs_overlap_efficiency,
-                self.ag_bwd_overlap_efficiency]
-        valid = [e for e in effs if e > 0]
+        # --- Average exposed ratio ---
+        # Average of the three per-phase exposed ratios (ag_fwd, rs, ag_bwd).
+        # Each exposed ratio = gpu_time / wall_time for that collective:
+        #   high (near 1.0) = collective's GPU fills its entire wall span = exposed
+        #   low  (near 0.0) = collective squeezed into a small GPU window = hidden
+        self.avg_exposed_ratio = 0.0
+        ratios = [self.ag_fwd_exposed_ratio, self.rs_exposed_ratio,
+                  self.ag_bwd_exposed_ratio]
+        valid = [r for r in ratios if r > 0]
         if valid:
-            self.exposed_comm_fraction = sum(valid) / len(valid)
+            self.avg_exposed_ratio = sum(valid) / len(valid)
 
         # --- Bottleneck sub-metrics ---
         self._compute_kernel_metrics(unit)
@@ -628,8 +644,9 @@ class Metrics:
             1 for k in comp_kernels
             if any(p in k.get('name', '').lower() for p in ('copy', 'memcpy', 'memset'))
         )
-        # Total bytes estimate: assume ~2 bytes per FLOP for bf16 matmul
-        self.estimated_bytes_moved = self.comp_kernel_count * self.comp_kernel_avg_dur_us * 2e9 / 1e6  # rough
+        # ``estimated_bytes_moved`` removed — the previous heuristic was
+        # meaningless (kernel_count × avg_dur × 2000).  Accurate estimation
+        # requires knowledge of kernel input shapes (not available in traces).
 
     def to_dict(self) -> Dict[str, float]:
         return {
@@ -648,10 +665,10 @@ class Metrics:
             "comm_ratio": self.comm_ratio,
             "comp_ratio": self.comp_ratio,
             "optimizer_ratio": self.optimizer_ratio,
-            "gpu_util": self.gpu_util,
+            "gpu_busy": self.gpu_busy,
             "layer_span_us": self.layer_span,
             "overlap_ratio": self.overlap_ratio,
-            "serial_exec_efficiency": self.serial_exec_efficiency,
+            "serial_ratio": self.serial_ratio,
             "idle_ratio": self.idle_ratio,
             "memory_peak": self.memory_peak,
             "memory_allocated": self.memory_allocated,
@@ -669,10 +686,10 @@ class Metrics:
             "cpu_wall_to_gpu_ratio": self.cpu_wall_to_gpu_ratio,
             # New universal metrics
             "compute_to_comm_ratio": self.compute_to_comm_ratio,
-            "ag_fwd_overlap_efficiency": self.ag_fwd_overlap_efficiency,
-            "rs_overlap_efficiency": self.rs_overlap_efficiency,
-            "ag_bwd_overlap_efficiency": self.ag_bwd_overlap_efficiency,
-            "exposed_comm_fraction": self.exposed_comm_fraction,
+            "ag_fwd_exposed_ratio": self.ag_fwd_exposed_ratio,
+            "rs_exposed_ratio": self.rs_exposed_ratio,
+            "ag_bwd_exposed_ratio": self.ag_bwd_exposed_ratio,
+            "avg_exposed_ratio": self.avg_exposed_ratio,
             "comp_kernel_count": self.comp_kernel_count,
             "comp_kernel_avg_dur_us": self.comp_kernel_avg_dur_us,
             "nccl_in_comp_count": self.nccl_in_comp_count,
@@ -720,7 +737,7 @@ class Bottlenecks:
     HOST_BOUND_RATIO = 3.0
     COPY_HEAVY_RATIO = 0.50
     FWD_BWD_IMBALANCE = 0.30
-    SERIAL_EXEC_HIGH = 0.85
+    SERIAL_RATIO_HIGH = 0.85
 
     # --- New FSDP2 communication bottleneck thresholds ---
     # Inter-node bandwidth: AG fwd GPU time ≥ 80% of fwd compute → BW-limited
@@ -747,7 +764,7 @@ class Bottlenecks:
     COMM_COMPUTE_UTIL_THRESHOLD = 0.50
     AG_VS_FWD_RATIO = 0.10
     # Exposed communication: GPU idle fraction of wall time
-    # Computed as 1 − min(1.0, gpu_util).  Replaces old overlap-efficiency
+    # Computed as 1 − gpu_busy.  Replaces old overlap-efficiency
     # formula which broke for async NCCL (CPU_wall = dispatch, not execution).
     EXPOSED_COMM_IDLE_THRESHOLD = 0.50
     # Low cross-layer GPU pipeline overlap: consecutive layers' GPU execution
@@ -814,12 +831,10 @@ class Bottlenecks:
                 break
 
         # --- GPU utilisation ---
-        if 0 < metrics.gpu_util < cls.UTIL_LOW_THRESHOLD:
-            issues.append(f"low GPU utilization ({metrics.gpu_util:.1%})")
-        if metrics.gpu_util > 1.0:
-            # GPU time > CPU wall → multi-stream overlap across layers/phases.
-            # This is a positive signal (good pipeline stagger), not a bottleneck.
-            pass
+        if 0 < metrics.gpu_busy < cls.UTIL_LOW_THRESHOLD:
+            issues.append(f"low GPU utilization ({metrics.gpu_busy:.1%})")
+        # gpu_busy is always ≤ 1.0 (capped); values near 1.0 are normal for
+        # well-pipelined FSDP2 steps and do NOT indicate a bottleneck.
 
         # ================================================================
         # Section B — FSDP2 / TP / async TP specific bottlenecks
@@ -833,11 +848,11 @@ class Bottlenecks:
             issues.append(f"small-kernel-bound ({metrics.kernel_count} kernels, avg {metrics.avg_kernel_dur_us:.1f}us)")
 
         # 2. Serial pipeline (FSDP2 shard groups not overlapping)
-        # High serial_exec_efficiency (≥85%) means layers run sequentially
+        # High serial_ratio (≥85%) means layers run sequentially
         # with little overlap — GPU under-utilised.  In a well-pipelined
         # FSDP2 step, most time should be in the overlap region.
-        if metrics.serial_exec_efficiency >= cls.SERIAL_EXEC_HIGH:
-            issues.append(f"serial pipeline ({metrics.serial_exec_efficiency:.1%} serial)")
+        if metrics.serial_ratio >= cls.SERIAL_RATIO_HIGH:
+            issues.append(f"serial pipeline ({metrics.serial_ratio:.1%} serial)")
 
         # 3. Async TP overlap gap
         # Only meaningful when TP is configured (mesh_tp).  Low
@@ -904,11 +919,11 @@ class Bottlenecks:
         # compute kernels themselves are memory-bandwidth-limited (short
         # kernels hitting HBM BW ceiling rather than compute-bound).
         if (metrics.comp_ratio >= cls.COMP_HEAVY_THRESHOLD
-                and metrics.gpu_util < cls.HBM_BOUND_GPU_UTIL
+                and metrics.gpu_busy < cls.HBM_BOUND_GPU_UTIL
                 and metrics.comp_kernel_avg_dur_us < cls.HBM_BOUND_AVG_KERNEL_US):
             issues.append(f"HBM bandwidth-bound "
                           f"(comp kernels avg {metrics.comp_kernel_avg_dur_us:.1f}us, "
-                          f"util {metrics.gpu_util:.1%})")
+                          f"busy {metrics.gpu_busy:.1%})")
 
         # 9. Gradient accumulation / injection bandwidth pressure
         # Reduce-scatter consumes significant GPU time relative to backward
@@ -949,9 +964,9 @@ class Bottlenecks:
         # of overlap efficiency because async NCCL's CPU_wall is just dispatch.
         if metrics.fwd_cmp_gpu > 0:
             ag_vs_fwd = metrics.ag_fwd_gpu / metrics.fwd_cmp_gpu
-            if ag_vs_fwd >= cls.AG_VS_FWD_RATIO and metrics.gpu_util < cls.COMM_COMPUTE_UTIL_THRESHOLD:
+            if ag_vs_fwd >= cls.AG_VS_FWD_RATIO and metrics.gpu_busy < cls.COMM_COMPUTE_UTIL_THRESHOLD:
                 issues.append(f"no comm/compute overlap "
-                              f"(util={metrics.gpu_util:.1%}, AG={ag_vs_fwd:.1%} of fwd)")
+                              f"(busy={metrics.gpu_busy:.1%}, AG={ag_vs_fwd:.1%} of fwd)")
 
         # 13. Exposed communication (general overlap quality)
         # Fraction of wall time with no GPU activity of any kind.  Uses GPU
@@ -961,7 +976,7 @@ class Bottlenecks:
         # (otherwise low utilisation is pipeline warmup, not exposed comm).
         # Replaces the old overlap-efficiency-based formula which broke for
         # async NCCL operations (CPU_wall = dispatch time, not execution).
-        gpu_idle = 1.0 - min(1.0, metrics.gpu_util)
+        gpu_idle = 1.0 - metrics.gpu_busy
         if (gpu_idle > cls.EXPOSED_COMM_IDLE_THRESHOLD
                 and metrics.fwd_cmp_gpu > 0 and metrics.bwd_cmp_gpu > 0):
             issues.append(f"exposed communication "
@@ -1039,15 +1054,17 @@ class Report:
                 "tp_ar_gpu_us", "tp_total_gpu_us",
                 "total_gpu_us", "total_cpu_us",
                 "comm_ratio", "comp_ratio", "optimizer_ratio",
-                "overlap_ratio", "serial_exec_efficiency", "idle_ratio"]
+                "overlap_ratio", "serial_ratio", "idle_ratio"]
         self.aggregated = {k: 0.0 for k in keys}
         count = len(self.metrics_list)
-        if count == 0:
-            return
 
-        # Compute overlap metrics from actual unit spans
+        # Compute overlap metrics from actual unit spans (needed even when
+        # metrics_list is empty so _build_report_text doesn't crash)
         ov = _compute_overlap_metrics(self.fsdp.units)
         self.overlap_metrics = ov
+
+        if count == 0:
+            return
 
         for m in self.metrics_list:
             d = m.to_dict()
@@ -1055,7 +1072,7 @@ class Report:
                 self.aggregated[k] += d.get(k, 0.0)
             # Set overlap fields on each Metrics instance
             m.overlap_ratio = ov['overlap_ratio']
-            m.serial_exec_efficiency = ov['serial_exec_efficiency']
+            m.serial_ratio = ov['serial_ratio']
             m.idle_ratio = ov['idle_ratio']
             m.step_wall = ov['step_wall']
 
@@ -1063,7 +1080,7 @@ class Report:
             self.aggregated[k] /= count
         self.aggregated["num_units"] = count
         self.aggregated["overlap_ratio"] = ov['overlap_ratio']
-        self.aggregated["serial_exec_efficiency"] = ov['serial_exec_efficiency']
+        self.aggregated["serial_ratio"] = ov['serial_ratio']
         self.aggregated["idle_ratio"] = ov['idle_ratio']
         self.aggregated["step_wall"] = ov['step_wall']
         self.aggregated["overlap_time"] = ov['overlap_time']
@@ -1096,20 +1113,17 @@ class Report:
         if step_wall_us <= 0:
             return
 
-        for m in self.metrics_list:
-            m.compute_throughput_metrics(cfg)
-
-        tps = sum(getattr(m, 'tokens_per_second_per_gpu', 0.0) for m in self.metrics_list)
-        avg_tps = tps / len(self.metrics_list) if self.metrics_list else 0.0
-        avg_mfu = sum(getattr(m, 'mfu', 0.0) for m in self.metrics_list) / len(self.metrics_list) if self.metrics_list else 0.0
-        avg_hfu = sum(getattr(m, 'hfu', 0.0) for m in self.metrics_list) / len(self.metrics_list) if self.metrics_list else 0.0
-        flops = self.metrics_list[0].estimated_flops_per_step if self.metrics_list else 0.0
+        # Compute throughput on first layer (step-level metrics, identical across all layers)
+        first = self.metrics_list[0] if self.metrics_list else None
+        if first is None:
+            return
+        first.compute_throughput_metrics(cfg)
 
         self.throughput_metrics = {
-            'tokens_per_second_per_gpu': avg_tps,
-            'mfu': avg_mfu,
-            'hfu': avg_hfu,
-            'estimated_flops_per_step': flops,
+            'tokens_per_second_per_gpu': first.tokens_per_second_per_gpu,
+            'mfu': first.mfu,
+            'hfu': first.hfu,
+            'estimated_flops_per_step': first.estimated_flops_per_step,
         }
 
     def _build_report_text(self) -> str:
@@ -1127,6 +1141,12 @@ class Report:
         opt_gpu = self.fsdp.optimizer_gpu
         step_wall = self.aggregated.get("step_wall", self.fsdp.step_wall)
 
+        if num_units == 0 or not self.metrics_list:
+            lines.append("  No FSDP units detected — trace may be CPU-only or non-FSDP.")
+            if step_wall > 0:
+                lines.append(f"  Step wall time:       {_format_us(step_wall)}")
+            return "\n".join(lines), []
+
         # Step Summary
         lines.append("--- Step Summary ---")
         lines.append(f"  Number of layers:     {int(num_units)}")
@@ -1136,7 +1156,10 @@ class Report:
         lines.append("")
 
         # Aggregated phase metrics
-        lines.append("--- Phase Metrics ---")
+        # All values are AVERAGE GPU time per layer (sum of kernel durations,
+        # NOT a union — so phases can overlap on different CUDA streams and
+        # percentages reflect GPU-cycle share, not wall-time share).
+        lines.append("--- Phase Metrics (avg GPU cycles per layer) ---")
         phase_keys = [
             ("ag_fwd_gpu_us", "All-gather fwd"),
             ("fwd_cmp_gpu_us", "Fwd compute"),
@@ -1149,19 +1172,17 @@ class Report:
             ("optimizer_gpu_us", "Optimizer step"),
         ]
         total_gpu = self.aggregated.get("total_gpu_us", 0)
-        lines.append(f"  {'Phase':25s} {'Per unit':>10s} {'Total':>10s} {'% GPU':>8s}")
-        lines.append(f"  {'-----':25s} {'--------':>10s} {'-----':>10s} {'-----':>8s}")
+        tp_total = self.aggregated.get("tp_total_gpu_us", 0)
+        lines.append(f"  {'Phase':25s} {'Avg':>10s} {'% GPU cycles':>14s}")
+        lines.append(f"  {'-----':25s} {'---':>10s} {'------------':>14s}")
         for key, label in phase_keys:
-            per_unit = self.aggregated.get(key, 0)
-            total = per_unit * num_units
-            pct = per_unit / total_gpu * 100 if total_gpu > 0 else 0
-            lines.append(f"  {label:25s} {_format_us(per_unit):>10s} {_format_us(total):>10s} {pct:>7.1f}%")
-        lines.append(f"  {'-----':25s} {'--------':>10s} {'-----':>10s} {'-----':>8s}")
-        tp_per_unit = self.aggregated.get("tp_total_gpu_us", 0)
-        lines.append(f"  {'FSDP total':25s} {_format_us(total_gpu):>10s} {_format_us(total_gpu * num_units):>10s}")
-        lines.append(f"  {'TP total':25s} {_format_us(tp_per_unit):>10s} {_format_us(tp_per_unit * num_units):>10s}")
-        lines.append(f"  {'Total (incl. TP)':25s} {_format_us(total_gpu + tp_per_unit):>10s} {_format_us((total_gpu + tp_per_unit) * num_units):>10s} {100.0:>7.1f}%")
-        lines.append(f"  {'Total CPU':25s} {_format_us(self.aggregated.get('total_cpu_us', 0)):>10s}")
+            avg = self.aggregated.get(key, 0)
+            pct = avg / (total_gpu + tp_total) * 100 if (total_gpu + tp_total) > 0 else 0
+            lines.append(f"  {label:25s} {_format_us(avg):>10s} {pct:>13.1f}%")
+        lines.append(f"  {'-----':25s} {'---':>10s} {'------------':>14s}")
+        lines.append(f"  {'FSDP total':25s} {_format_us(total_gpu):>10s}")
+        lines.append(f"  {'TP total':25s} {_format_us(tp_total):>10s} {100.0:>13.1f}%")
+        lines.append(f"  {'Total CPU (dispatch)':25s} {_format_us(self.aggregated.get('total_cpu_us', 0)):>10s}")
         lines.append("")
 
         # Throughput (MFU / HFU / tokens/sec) — requires ModelConfig
@@ -1184,43 +1205,47 @@ class Report:
         opt_ratio = self.aggregated.get('optimizer_ratio', 0)
         true_comp = comp_gpu - tp_total
         total = total_gpu + tp_total
-        lines.append(f"  True compute:         {true_comp / total:.1%} (ex-TP)")
-        lines.append(f"  TP communication:     {tp_total / total:.1%}")
-        lines.append(f"  FSDP communication:   {fsdp_comm / total:.1%}")
+        if total > 0:
+            lines.append(f"  True compute:         {true_comp / total:.1%} (ex-TP)")
+            lines.append(f"  TP communication:     {tp_total / total:.1%}")
+            lines.append(f"  FSDP communication:   {fsdp_comm / total:.1%}")
+        else:
+            lines.append(f"  GPU time:             0.0 (no GPU events)")
         lines.append(f"  Optimizer:            {opt_ratio:.1%}")
-        avg_util = sum(m.gpu_util for m in self.metrics_list) / len(self.metrics_list) if self.metrics_list else 0.0
-        lines.append(f"  Avg GPU utilization:  {avg_util:.1%} (per-layer GPU busy / layer span)")
+        avg_busy = sum(m.gpu_busy for m in self.metrics_list) / len(self.metrics_list) if self.metrics_list else 0.0
+        lines.append(f"  Avg GPU busy:         {avg_busy:.1%} (per-layer GPU active / layer span)")
         max_span = max(m.layer_span for m in self.metrics_list) if self.metrics_list else 0.0
-        min_span = min(m.layer_span for m in self.metrics_list if m.layer_span > 0) or max_span
-        lines.append(f"  Layer span imbalance: {max_span / min_span:.1f}x (max/min layer span ratio)")
+        non_zero = [m.layer_span for m in self.metrics_list if m.layer_span > 0]
+        min_span = min(non_zero) if non_zero else max_span
+        lines.append(f"  Layer span imbalance: {max_span / min_span:.1f}x (max/min layer span ratio)" if max_span > 0 and min_span > 0 else "  Layer span imbalance: N/A (no nonzero span)")
 
         # Compute-to-communicate ratio
         avg_ctc = sum(m.compute_to_comm_ratio for m in self.metrics_list) / len(self.metrics_list) if self.metrics_list else 0.0
         lines.append(f"  Compute-to-comm:      {avg_ctc:.2f}× (compute GPU / comm GPU)")
         lines.append("")
 
-        # Per-phase overlap efficiency
-        lines.append("--- Comm Overlap Efficiency ---")
-        lines.append(f"  {'Phase':25s} {'Avg eff':>10s} {'Min':>10s} {'Max':>10s} {'Interpretation':>35s}")
+        # Per-phase exposed ratio
+        lines.append("--- Comm Exposed Ratio ---")
+        lines.append(f"  {'Phase':25s} {'Avg exp':>10s} {'Min':>10s} {'Max':>10s} {'Interpretation':>35s}")
         lines.append(f"  {'-----':25s} {'--------':>10s} {'---':>10s} {'---':>10s} {'---------------':>35s}")
-        for label, attr in [("AG fwd", "ag_fwd_overlap_efficiency"),
-                            ("AG bwd", "ag_bwd_overlap_efficiency"),
-                            ("RS", "rs_overlap_efficiency")]:
+        for label, attr in [("AG fwd", "ag_fwd_exposed_ratio"),
+                            ("AG bwd", "ag_bwd_exposed_ratio"),
+                            ("RS", "rs_exposed_ratio")]:
             vals = [getattr(m, attr) for m in self.metrics_list]
             avg = sum(vals) / len(vals) if vals else 0.0
             mn = min(vals) if vals else 0.0
             mx = max(vals) if vals else 0.0
             interp = "exposed" if avg >= 0.7 else "hidden" if avg < 0.3 else "partial"
             lines.append(f"  {label:25s} {avg:>9.1%} {mn:>9.1%} {mx:>9.1%}  {interp:>35s}")
-        exp = sum(m.exposed_comm_fraction for m in self.metrics_list) / len(self.metrics_list) if self.metrics_list else 0.0
-        lines.append(f"  {'Exposed comm (avg)':25s} {exp:>9.1%}")
+        avg_exp = sum(m.avg_exposed_ratio for m in self.metrics_list) / len(self.metrics_list) if self.metrics_list else 0.0
+        lines.append(f"  {'Avg exposed ratio':25s} {avg_exp:>9.1%}")
         lines.append("")
 
-        # Overlap / Serial Execution Efficiency
+        # Overlap & Pipeline
         lines.append("--- Overlap & Pipeline ---")
         ov = self.overlap_metrics
         lines.append(f"  Overlap time:         {_format_us(ov['overlap_time'])} ({ov['overlap_ratio']:.1%} of non-idle)")
-        lines.append(f"  Serial execution:     {_format_us(ov['serial_time'])} ({ov['serial_exec_efficiency']:.1%} of step)")
+        lines.append(f"  Serial execution:     {_format_us(ov['serial_time'])} ({ov['serial_ratio']:.1%} of step)")
         lines.append(f"  Idle/Gap time:        {_format_us(ov['idle_time'])} ({ov['idle_ratio']:.1%} of step)")
         lines.append(f"  Communication ratio:  {fsdp_comm / total:.1%} FSDP + {tp_total / total:.1%} TP = {self.aggregated.get('comm_ratio', 0):.1%} total")
         avg_fwd_ov = sum(m.fwd_comp_comm_overlap for m in self.metrics_list) / max(len(self.metrics_list), 1)
@@ -1252,7 +1277,7 @@ class Report:
         header = (f"{'Layer':25s} {'AG fwd':>10s} {'Fwd cmp':>10s} {'TP AG':>9s} {'TP RS':>9s} "
                   f"{'TP AR':>9s} {'AG bwd':>10s} {'Bwd cmp':>10s} {'RS':>10s} "
                   f"{'Opt':>10s} {'Total':>10s} "
-                  f"{'Util':>6s}{'CtC':>6s}{'ExpC':>6s}"
+                  f"{'Busy':>6s}{'CtC':>6s}{'ExpC':>6s}"
                   f"{'Span':>9s}{'F-Ovl':>8s}{'B-Ovl':>8s}{'P-Ovl':>7s} "
                   f"{'K#':>7s}{'AvgK':>7s}{mem_col:>10s}  {'Bottleneck'}")
         lines.append(header)
@@ -1268,7 +1293,7 @@ class Report:
                 mem_str = f"{'N/A':>9s}"
             ctc = d.get('compute_to_comm_ratio', 0)
             ctc_str = f"{ctc:.1f}x" if ctc != float('inf') else "inf"
-            exp_comm = d.get('exposed_comm_fraction', 0)
+            exp_comm = d.get('avg_exposed_ratio', 0)
             lines.append(
                 f"{m.layer_name:25s} "
                 f"{_format_us(d['ag_fwd_gpu_us']):>10s} "
@@ -1281,7 +1306,7 @@ class Report:
                 f"{_format_us(d['rs_gpu_us']):>10s} "
                 f"{_format_us(d['optimizer_gpu_us']):>10s} "
                 f"{_format_us(d['total_gpu_us']):>10s} "
-                f"{d['gpu_util']:>5.1%} "
+                f"{d['gpu_busy']:>5.1%} "
                 f"{ctc_str:>5s} "
                 f"{exp_comm:>5.1%} "
                 f"{_format_us(d['layer_span_us']):>9s}"

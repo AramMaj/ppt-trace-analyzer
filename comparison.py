@@ -16,7 +16,7 @@ from collections import defaultdict
 from bottleneck_detector import Bottlenecks, _format_us
 
 
-def _format_bottleneck_summary(metrics_list, aggregated) -> str:
+def _format_bottleneck_summary(metrics_list) -> str:
     """One-line bottleneck summary (top 3 issues by prevalence) for the comparison table.
     ``; ``-separated for compact display — avoids multi-line wraps in the terminal table.
     """
@@ -72,7 +72,7 @@ def compare_traces(trace_files, output_file=None, model_config=None):
         "Trace", "Layers",
         "Step wall", "AG forward", "Forward compute", "AG backward", "Backward compute",
         "Reduce scatter", "Optimizer", "TP total", "Total GPU",
-        "GPU util", "Compute-to-comm ratio", "MFU", "HFU",
+        "GPU busy", "Compute-to-comm ratio", "MFU", "HFU",
         "Comm ratio", "FSDP comm ratio", "TP comm ratio",
         "Pipeline overlap", "Serial efficiency", "Pipeline idle",
         "Exposed comm fraction", "AG overlap efficiency",
@@ -94,18 +94,18 @@ def compare_traces(trace_files, output_file=None, model_config=None):
         tp_total = agg.get("tp_total_gpu_us", 0)
         total_gpu = agg.get("total_gpu_us", 0) + tp_total
 
-        avg_util = sum(m.gpu_util for m in metrics_list) / max(len(metrics_list), 1)
+        avg_busy = sum(m.gpu_busy for m in metrics_list) / max(len(metrics_list), 1)
         mfu = report.throughput_metrics.get('mfu', 0) if hasattr(report, 'throughput_metrics') else 0
         hfu = report.throughput_metrics.get('hfu', 0) if hasattr(report, 'throughput_metrics') else 0
         # New universal metrics (compute-to-comm, exposed comm, AG overlap eff)
         ctc_vals = [m.compute_to_comm_ratio for m in metrics_list]
         non_inf = [v for v in ctc_vals if v != float('inf')]
         avg_ctc = sum(non_inf) / max(len(non_inf), 1) if non_inf else float('inf')
-        avg_expc = sum(m.exposed_comm_fraction for m in metrics_list) / max(len(metrics_list), 1)
-        avg_ag_ovl = sum(m.ag_fwd_overlap_efficiency for m in metrics_list) / max(len(metrics_list), 1)
+        avg_expc = sum(m.avg_exposed_ratio for m in metrics_list) / max(len(metrics_list), 1)
+        avg_ag_ovl = sum(m.ag_fwd_exposed_ratio for m in metrics_list) / max(len(metrics_list), 1)
 
         overlap_ratio = agg.get("overlap_ratio", 0)
-        serial_eff = agg.get("serial_exec_efficiency", 0)
+        serial_eff = agg.get("serial_ratio", 0)
         idle_ratio = agg.get("idle_ratio", 0)
 
         avg_fwd_ovl = sum(m.fwd_comp_comm_overlap for m in metrics_list) / max(len(metrics_list), 1)
@@ -116,7 +116,7 @@ def compare_traces(trace_files, output_file=None, model_config=None):
         tp_comm_ratio = sum(m.tp_comm_ratio for m in metrics_list) / max(len(metrics_list), 1)
 
         mem_peak_gib = max((m.memory_peak for m in metrics_list if m.memory_has_data), default=0) / (1024**3)
-        bneck = _format_bottleneck_summary(metrics_list, agg)
+        bneck = _format_bottleneck_summary(metrics_list)
 
         rows.append({
             "Trace": label,
@@ -130,7 +130,7 @@ def compare_traces(trace_files, output_file=None, model_config=None):
             "Optimizer": opt,
             "TP total": tp_total,
             "Total GPU": total_gpu,
-            "GPU util": avg_util,
+            "GPU busy": avg_busy,
             "Compute-to-comm ratio": avg_ctc,
             "MFU": mfu,
             "HFU": hfu if hfu else 0,
@@ -154,7 +154,7 @@ def compare_traces(trace_files, output_file=None, model_config=None):
     def _fmt_val(row, header) -> str:
         v = row[header]
         if isinstance(v, float):
-            if header in ("GPU util", "Comm ratio", "FSDP comm ratio", "TP comm ratio",
+            if header in ("GPU busy", "Comm ratio", "FSDP comm ratio", "TP comm ratio",
                           "Pipeline overlap", "Serial efficiency", "Pipeline idle",
                           "Exposed comm fraction", "AG overlap efficiency",
                           "Fwd TP overlap", "Bwd TP overlap"):

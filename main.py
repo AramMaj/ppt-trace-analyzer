@@ -24,7 +24,7 @@ from trace_parser import TraceParser
 from fsdp_detector import StandardFSDPDetector
 from bottleneck_detector import Report
 
-from pipeline import process_trace, select_profiler_step, sanitize_optimizer
+from pipeline import select_profiler_step, sanitize_optimizer
 from timeline import print_timeline
 from comparison import compare_traces
 

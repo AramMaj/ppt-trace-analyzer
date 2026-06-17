@@ -590,7 +590,7 @@ def _analyze_step(
 # Cross-step annotation generation (one TID per layer, steps go right)
 # ---------------------------------------------------------------------------
 
-def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0,
+def annotate_trace(trace_file: str, output_file: str,
                    model_config: Optional[ModelConfig] = None):
     """Analyse each ProfilerStep and append phase/flow/counter/bottleneck events
     to the Chrome Trace JSON.  All steps share PID=9999; each layer gets its
@@ -633,9 +633,6 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0,
         print("  No ProfilerStep markers found, annotating full trace as one step.")
     else:
         print(f"  Found {len(steps)} ProfilerStep(s)")
-
-    if max_steps and max_steps < len(steps):
-        steps = steps[-max_steps:]
 
     # 3a. Build ac2g-based all-gather copy-out GPU spans (across all steps)
     raw_events = trace_json.get("traceEvents", [])
@@ -901,13 +898,13 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0,
                     "issues_full": "; ".join(issues),
                     "comm_ratio": round(metric.comm_ratio, 3),
                     "comp_ratio": round(metric.comp_ratio, 3),
-                    "gpu_util": round(metric.gpu_util, 3),
+                    "gpu_busy": round(metric.gpu_busy, 3),
                     "comm_ratio_pct": f"{metric.comm_ratio:.1%}",
                     "comp_ratio_pct": f"{metric.comp_ratio:.1%}",
                     "compute_to_comm": ctc_str,
-                    "exposed_comm": round(metric.exposed_comm_fraction, 3),
-                    "ag_overlap_eff": round(metric.ag_fwd_overlap_efficiency, 3),
-                    "rs_overlap_eff": round(metric.rs_overlap_efficiency, 3),
+                    "exposed_comm": round(metric.avg_exposed_ratio, 3),
+                    "ag_overlap_eff": round(metric.ag_fwd_exposed_ratio, 3),
+                    "rs_overlap_eff": round(metric.rs_exposed_ratio, 3),
                     "step": step_name,
                 },
                 "s": "t", "cname": "#FF5722",

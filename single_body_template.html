@@ -11,9 +11,9 @@
 </div>
 
 <div class="section">
-<h2>GPU Utilization per Layer</h2>
-<div class="chart-box tall"><canvas id="utilChart"></canvas></div>
-<p style="font-size:.8em;color:#888;margin-top:4px">Values &gt;100% indicate multi-stream concurrency (compute + NCCL on different streams).</p>
+<h2>GPU Busy per Layer</h2>
+<div class="chart-box tall"><canvas id="busyChart"></canvas></div>
+<p style="font-size:.8em;color:#888;margin-top:4px">GPU busy = fraction of CPU wall span where at least one GPU kernel was active (union of intervals, capped at 100%).</p>
 </div>
 
 <div class="section">
