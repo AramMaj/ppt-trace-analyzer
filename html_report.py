@@ -1082,6 +1082,17 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
                   "Forward TP overlap ratio", "Backward TP overlap ratio",
                   "Model FLOPs utilization (MFU)", "Hardware FLOPs utilization (HFU)"}
 
+    def _diff_magnitude(name, vals):
+        max_v = max(vals)
+        min_v = min(vals)
+        if max_v == min_v:
+            return 0.0
+        if name in _pct_names:
+            return (max_v - min_v) * 100  # percentage-point span
+        if min_v > 0:
+            return (max_v - min_v) / min_v * 100  # relative % span
+        return 0.0
+
     def _format_delta(val, bval, name):
         if bval is None or val is None or bval == 0 or val == bval:
             return ""
@@ -1120,6 +1131,69 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
                     formatted += _format_delta(val, bval, name)
             cells += f"<td{cell_class}>{formatted}</td>"
         table_rows += f"<tr>{cells}</tr>\n"
+
+    # Key differences: find metrics with the largest span across traces
+    diffs = []
+    for name, fn, direction, do_color in COMPARE_METRICS:
+        if not do_color or name in ("Bottlenecks",) or name.endswith("speedup"):
+            continue
+        vals = [(ri, trace_values[ri].get(name)) for ri in range(len(trace_values))]
+        vals = [(ri, v) for ri, v in vals if isinstance(v, (int, float))]
+        if len(vals) < 2:
+            continue
+        unique_vals = set(round(v, 4) for _, v in vals)
+        if len(unique_vals) < 2:
+            continue
+        mag = _diff_magnitude(name, [v for _, v in vals])
+        if mag < 1.0:
+            continue
+        min_ri = min(vals, key=lambda x: x[1])[0]
+        max_ri = max(vals, key=lambda x: x[1])[0]
+        min_lab = trace_labels[min_ri]
+        max_lab = trace_labels[max_ri]
+        min_s = _fmt_metric(name, min(v for _, v in vals))
+        max_s = _fmt_metric(name, max(v for _, v in vals))
+        pct_s = f"{mag:.0f}%" if name not in _pct_names else f"{mag:.1f}pp"
+        direction_word = "higher" if direction == "higher" else "lower"
+        diffs.append((mag, name, min_lab, max_lab, min_s, max_s, pct_s, direction_word))
+
+    diffs.sort(key=lambda x: -x[0])
+    top_diffs = diffs[:12]
+
+    key_diff_items = ""
+    if top_diffs:
+        rows = ""
+        for mag, name, min_lab, max_lab, min_s, max_s, pct_s, dw in top_diffs:
+            rows += (
+                f"<tr>"
+                f"<td style='font-weight:600;white-space:nowrap'>{name}</td>"
+                f"<td>{max_s} <span style='color:#888;font-size:11px'>({max_lab})</span></td>"
+                f"<td>{min_s} <span style='color:#888;font-size:11px'>({min_lab})</span></td>"
+                f"<td style='font-weight:600'>{pct_s}</td>"
+                f"<td style='color:#666;font-size:12px'>{'Lower is better' if dw == 'lower' else 'Higher is better'}</td>"
+                f"</tr>\n"
+            )
+        key_diff_html = f"""
+<div style="margin-top:20px">
+<h3>Largest Differences</h3>
+<p style="font-size:11px;color:#888;margin-bottom:8px">Metrics with the widest span across traces, sorted largest first.</p>
+<div class="table-wrap">
+<table class="cmp-table">
+<thead><tr>
+<th>Metric</th>
+<th>Highest</th>
+<th>Lowest</th>
+<th>Range</th>
+<th>Direction</th>
+</tr></thead>
+<tbody>
+{rows}
+</tbody>
+</table>
+</div>
+</div>"""
+    else:
+        key_diff_html = ""
 
     # Bottleneck summary per trace
     bneck_legend = ('<div style="font-size:10px;color:#888;margin-bottom:8px">'
@@ -1172,6 +1246,7 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
         BASELINE=trace_labels[0],
         TRACE_TABS=trace_tabs,
         CONSISTENCY_WARNINGS=consistency_warnings,
+        KEY_DIFFERENCES=key_diff_html,
         SUMMARY_CARDS=summary_cards,
         MFU_CHART=mfu_chart,
         TABLE_HEAD="".join(thead_parts),
