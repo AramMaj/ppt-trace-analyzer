@@ -299,6 +299,308 @@ def _per_unit_table(metrics_list: list) -> str:
 </table>{info}</div>"""
 
 
+# ---------------------------------------------------------------------------
+# Trace diagnostics — step timing, kernel stats, and consistency warnings
+# surfaced in both single-trace and comparison HTML reports.
+# ---------------------------------------------------------------------------
+
+_GPU_ARCH_KEYWORDS = [
+    ("ampere", "NVIDIA Ampere (A100/A30/A10/RTX 3090)"),
+    ("hopper", "NVIDIA Hopper (H100/H200)"),
+    ("blackwell", "NVIDIA Blackwell (B100/B200)"),
+    ("turing", "NVIDIA Turing (T4/RTX 2080)"),
+    ("volta", "NVIDIA Volta (V100)"),
+]
+
+
+def _detect_gpu_architecture(trace_file: str) -> str:
+    """Scan trace events for GPU architecture clues in kernel names.
+
+    Checks the first 2000 kernel events for known architecture keywords
+    (``ampere``, ``hopper``, ``blackwell``, etc.) and returns a human-readable
+    label like ``"NVIDIA Ampere (A100/A30/A10/RTX 3090)"`` or ``"unknown"``.
+    """
+    try:
+        with open(trace_file) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError, OSError):
+        return "unknown"
+
+    events = data.get("traceEvents") if isinstance(data, dict) else None
+    if not isinstance(events, list):
+        return "unknown"
+
+    checked = 0
+    for ev in events:
+        if ev.get("cat") not in ("kernel",):
+            continue
+        name = ev.get("name", "")
+        name_lower = name.lower()
+        for kw, label in _GPU_ARCH_KEYWORDS:
+            if kw in name_lower:
+                return label
+        checked += 1
+        if checked >= 2000:
+            break
+    return "unknown"
+
+
+def _trace_step_diagnostics(trace_file: str) -> dict:
+    """Read the trace JSON directly to find CPU and GPU ProfilerStep boundaries.
+
+    Returns a dict with:
+      ``cpu_dur_us`` — duration of the last CPU ProfilerStep
+      ``gpu_dur_us`` — duration of the last GPU ProfilerStep (gpu_user_annotation)
+      ``gap_us`` — how much GPU extends beyond CPU (positive = GPU tail)
+      ``num_cpu_steps`` — total CPU ProfilerSteps found
+      ``warnings`` — list of human-readable warning strings
+
+    Uses the same lightweight ``json.load`` pattern as ``_find_profiler_steps`` in
+    ``trace_annotator.py`` — no full ``TraceParser.load`` needed.
+    """
+    try:
+        with open(trace_file) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError):
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+    events = data.get("traceEvents")
+    if not isinstance(events, list):
+        return {}
+
+    cpu_steps: list[tuple[int, int]] = []
+    gpu_steps: list[tuple[int, int]] = []
+
+    for ev in events:
+        name = ev.get("name", "")
+        if not name.startswith("ProfilerStep#"):
+            continue
+        ph = ev.get("ph", "")
+        cat = ev.get("cat", "")
+        if ph != "X":
+            continue
+        ts = ev.get("ts", 0)
+        dur = ev.get("dur", 0)
+        if cat in ("cpu_op", "user_annotation"):
+            cpu_steps.append((ts, ts + dur))
+        elif cat == "gpu_user_annotation":
+            gpu_steps.append((ts, ts + dur))
+
+    if not cpu_steps:
+        return {"num_cpu_steps": 0, "warnings": ["No ProfilerStep markers found."]}
+
+    cpu_steps.sort(key=lambda x: x[0])
+    gpu_steps.sort(key=lambda x: x[0])
+
+    last_cpu = cpu_steps[-1]
+    cpu_start, cpu_end = last_cpu
+    cpu_dur = cpu_end - cpu_start
+
+    gpu_dur = None
+    gap = None
+    warnings = []
+
+    if gpu_steps:
+        last_gpu = gpu_steps[-1]
+        gpu_dur = last_gpu[1] - last_gpu[0]
+        gap = last_gpu[1] - cpu_end
+        if gap > cpu_dur * 0.1:
+            warnings.append(
+                f"GPU ProfilerStep extends {_format_us(gap)} beyond CPU step "
+                f"({gap * 100 // cpu_dur}% of CPU duration) — "
+                "some GPU events may be misattributed or clipped."
+            )
+    else:
+        warnings.append(
+            "No GPU ProfilerStep (gpu_user_annotation) found — "
+            "cannot verify GPU event window completeness."
+        )
+
+    if len(cpu_steps) > 1:
+        warnings.append(
+            f"Multi-step trace: {len(cpu_steps)} ProfilerSteps found, "
+            "analysing the last step only."
+        )
+
+    gpu_arch = _detect_gpu_architecture(trace_file)
+
+    result = {
+        "num_cpu_steps": len(cpu_steps),
+        "cpu_dur_us": cpu_dur,
+        "gpu_dur_us": gpu_dur,
+        "gap_us": gap,
+        "gpu_architecture": gpu_arch,
+        "warnings": warnings,
+    }
+    return result
+
+
+def _kernel_stats_diagnostics(aggregated: dict, metrics_list: list) -> dict:
+    """Compute kernel-level stats from already-aggregated phase data.
+
+    Returns a dict with:
+      ``total_kernels`` — sum of kernel_count across all layers
+      ``avg_kernel_dur_us`` — duration-weighted average
+      ``nccl_total_us`` — NCCL phase total (AG fwd + AG bwd + RS + TP phases)
+      ``compute_total_us`` — compute phase total (fwd + bwd)
+      ``opt_total_us`` — optimiser phase total
+      ``granular_total_us`` — sum of the three categories above
+    """
+    total_kernels = sum(m.kernel_count for m in metrics_list)
+    weighted_dur = sum(m.avg_kernel_dur_us * m.kernel_count for m in metrics_list)
+    avg_dur = weighted_dur / max(total_kernels, 1)
+
+    nccl = (aggregated.get("ag_fwd_gpu_us", 0) + aggregated.get("ag_bwd_gpu_us", 0)
+            + aggregated.get("rs_gpu_us", 0) + aggregated.get("tp_ag_gpu_us", 0)
+            + aggregated.get("tp_rs_gpu_us", 0) + aggregated.get("tp_ar_gpu_us", 0))
+    comp = aggregated.get("fwd_cmp_gpu_us", 0) + aggregated.get("bwd_cmp_gpu_us", 0)
+    opt = aggregated.get("optimizer_gpu_us", 0)
+
+    return {
+        "total_kernels": total_kernels,
+        "avg_kernel_dur_us": avg_dur,
+        "nccl_total_us": nccl,
+        "compute_total_us": comp,
+        "opt_total_us": opt,
+        "granular_total_us": nccl + comp + opt,
+    }
+
+
+def _render_diagnostics_section(diag: dict, kstats: dict) -> str:
+    """Render a compact diagnostics card for single-trace HTML."""
+    parts = []
+
+    # Step timing block
+    if diag.get("cpu_dur_us"):
+        cpu_str = _format_us(diag["cpu_dur_us"])
+        gpu_str = _format_us(diag["gpu_dur_us"]) if diag.get("gpu_dur_us") else "N/A"
+        gap_str = _format_us(diag["gap_us"]) if diag.get("gap_us") else "N/A"
+        gap_flag = ""
+        if diag.get("gap_us") and diag.get("cpu_dur_us") and diag["gap_us"] > diag["cpu_dur_us"] * 0.1:
+            gap_flag = ' <span class="tag tag-high">large GPU tail</span>'
+        arch_label = diag.get("gpu_architecture", "")
+        arch_row = f"<tr><td>GPU architecture</td><td>{arch_label}</td></tr>" if arch_label and arch_label != "unknown" else ""
+        parts.append(
+            f"<tr><td>CPU ProfilerStep</td><td>{cpu_str}</td></tr>"
+            f"<tr><td>GPU ProfilerStep</td><td>{gpu_str}</td></tr>"
+            f"<tr><td>GPU step gap</td><td>{gap_str}{gap_flag}</td></tr>"
+            f"{arch_row}"
+        )
+        if diag.get("num_cpu_steps", 0) > 1:
+            parts.append(f"<tr><td>ProfilerSteps</td><td>{diag['num_cpu_steps']} (last analysed)</td></tr>")
+
+    # Kernel stats block
+    if kstats:
+        kc = kstats["total_kernels"]
+        nccl_s = _format_us(kstats["nccl_total_us"])
+        cmp_s = _format_us(kstats["compute_total_us"])
+        opt_s = _format_us(kstats["opt_total_us"])
+        avg_s = f"{kstats['avg_kernel_dur_us']:.1f}µs"
+        parts.append(
+            f"<tr><td>Total GPU kernels</td><td>{kc:,}</td></tr>"
+            f"<tr><td>NCCL / compute / optimizer</td><td>{nccl_s} / {cmp_s} / {opt_s}</td></tr>"
+            f"<tr><td>Avg kernel duration</td><td>{avg_s}</td></tr>"
+        )
+
+    rows = "".join(parts)
+    if not rows:
+        return ''
+
+    # Warnings
+    warns = diag.get("warnings", [])
+    warn_html = ""
+    if warns:
+        items = "".join(f'<li style="margin:4px 0;font-size:12px">{w}</li>' for w in warns)
+        warn_html = f'<div style="background:#fef3cd;border:1px solid #ffc107;border-radius:6px;padding:8px 12px;margin-top:8px"><strong style="font-size:13px">&#9888; Diagnostics</strong><ul style="margin:4px 0 0 16px;padding:0">{items}</ul></div>'
+
+    return f"""<div class="section">
+<h2>Trace Diagnostics</h2>
+<div style="display:flex;gap:24px;flex-wrap:wrap">
+<table style="min-width:auto"><tr><th colspan="2" style="text-align:left">Step Timing</th></tr>
+{rows}
+</table>
+</div>
+{warn_html}
+</div>"""
+
+
+def _render_consistency_warnings(all_results: list, trace_files: list = None) -> str:
+    """Check per-trace kernel stats for consistency and emit warnings for the comparison page."""
+    if len(all_results) < 2:
+        return ""
+
+    n_traces = len(all_results)
+
+    # Collect nccl_total_us per trace
+    nccl_totals = []
+    comp_totals = []
+    labels = []
+    for label, agg, metrics, steps, tp in all_results:
+        kstats = _kernel_stats_diagnostics(agg, metrics)
+        nccl_totals.append(kstats["nccl_total_us"])
+        comp_totals.append(kstats["compute_total_us"])
+        labels.append(label)
+
+    warnings = []
+    if nccl_totals:
+        mx = max(nccl_totals)
+        mn = min(nccl_totals)
+        if mn > 0 and mx / mn > 1.5:
+            slow = labels[nccl_totals.index(mx)]
+            fast = labels[nccl_totals.index(mn)]
+            warnings.append(
+                f"NCCL kernel time varies {mx/mn:.1f}x across traces "
+                f"({slow}: {_format_us(mx)} vs {fast}: {_format_us(mn)}). "
+                "If compute kernel times are similar, the NCCL variance is likely a "
+                "profiler recording artifact (dropped CUPTI activity records), "
+                "not genuine performance variation."
+            )
+
+    if comp_totals:
+        mx = max(comp_totals)
+        mn = min(comp_totals)
+        if mn > 0 and mx / mn > 1.2:
+            slow = labels[comp_totals.index(mx)]
+            fast = labels[comp_totals.index(mn)]
+            warnings.append(
+                f"Compute kernel time varies {mx/mn:.1f}x across traces "
+                f"({slow}: {_format_us(mx)} vs {fast}: {_format_us(mn)}). "
+                "Identical models should have near-identical compute times — "
+                "investigate if model configs differ."
+            )
+
+    # Info header: trace count + GPU arch
+    info_parts = [f"{n_traces} trace files"]
+    if trace_files:
+        arch = _detect_gpu_architecture(trace_files[0])
+        if arch != "unknown":
+            info_parts.append(arch)
+    info_line = " &middot; ".join(info_parts)
+
+    if not warnings:
+        return f"""<div class="section">
+<h2>Trace Consistency</h2>
+<div style="background:#e8f5e9;border:1px solid #4caf50;padding:10px 16px">
+<strong style="font-size:14px">Traces consistent</strong>
+<div style="margin-top:6px;font-size:13px;color:#555">{info_line}</div>
+</div>
+</div>"""
+
+    items = "".join(
+        f'<li style="margin:6px 0;font-size:13px">{w}</li>' for w in warnings
+    )
+    return f"""<div class="section">
+<h2>Trace Consistency</h2>
+<div style="background:#fef3cd;border:1px solid #ffc107;padding:10px 16px">
+<strong style="font-size:14px">Inconsistencies detected</strong>
+<div style="margin-top:6px;font-size:13px;color:#555">{info_line}</div>
+<ul style="margin:8px 0 0 16px;padding:0">{items}</ul>
+</div>
+</div>"""
+
+
 BOTTLENECK_DESCRIPTIONS = {
     "I/O or pipeline bubble":
         "Wall time with no active FSDP work. May indicate a data-loading stall, Python GIL contention, "
@@ -444,6 +746,11 @@ def generate_html_report(trace_file: str, output_path: str = None, model_config:
     title = f"Trace Analysis — {os.path.basename(trace_file)}"
     num_layers = len(metrics_list)
 
+    # Trace diagnostics
+    step_diag = _trace_step_diagnostics(trace_file)
+    kstats = _kernel_stats_diagnostics(aggregated, metrics_list)
+    diag_section = _render_diagnostics_section(step_diag, kstats)
+
     # Serialise chart data to JSON
     chart_data = {
         "phasePie": json.loads(_phase_pie_chart_data(aggregated)),
@@ -458,6 +765,7 @@ def generate_html_report(trace_file: str, output_path: str = None, model_config:
         TITLE=title,
         SUBTITLE=f"{os.path.basename(trace_file)} — {num_layers} layers",
         DASHBOARD_CARDS=_dashboard_cards(aggregated, metrics_list, report.throughput_metrics),
+        DIAGNOSTICS_SECTION=diag_section,
         PHASE_METRICS_TABLE=_phase_metrics_table(aggregated, num_layers),
         EFFICIENCY_TABLE=_efficiency_table(aggregated, metrics_list),
         BOTTLENECK_TAGS=_bottleneck_tags(metrics_list),
@@ -522,11 +830,22 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
         mfu = tp.get("mfu", 0)
         tps = tp.get("tokens_per_second_per_gpu", 0)
         steps_s = f"{1e6 / wall:.1f}" if wall > 0 else "N/A"
+        kstats = _kernel_stats_diagnostics(agg, metrics)
+        total_kernels = kstats["total_kernels"]
 
         extras = ""
         if mfu > 0:
             extras += f"<tr><td>MFU</td><td>{mfu:.1%}</td></tr>"
             extras += f"<tr><td>Tok/s/GPU</td><td>{tps:.1f}</td></tr>"
+        arch = _detect_gpu_architecture(trace_files[i])
+        arch_row = f"<tr><td>GPU</td><td>{arch}</td></tr>" if arch != "unknown" else ""
+        extras += (
+            f"<tr><td>GPU kernels</td><td>{total_kernels:,}</td></tr>"
+            f"<tr><td>NCCL total</td><td>{_format_us(kstats['nccl_total_us'])}</td></tr>"
+            f"<tr><td>Compute total</td><td>{_format_us(kstats['compute_total_us'])}</td></tr>"
+            f"<tr><td>Avg kernel</td><td>{kstats['avg_kernel_dur_us']:.1f}µs</td></tr>"
+            f"{arch_row}"
+        )
 
         summary_cards += f"""<div class="cmp-card" style="border-top:3px solid {colors[i]}">
 <h3>{label}</h3>
@@ -787,12 +1106,15 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
 <div class="chart-box"><canvas id="cmpMfu"></canvas></div>
 </div>'''
 
+    consistency_warnings = _render_consistency_warnings(all_results, trace_files=trace_files)
+
     body = _fill(
         _load_body("compare_body_template.html"),
         TITLE=title,
         FILES=", ".join(trace_files),
         BASELINE=trace_labels[0],
         TRACE_TABS=trace_tabs,
+        CONSISTENCY_WARNINGS=consistency_warnings,
         SUMMARY_CARDS=summary_cards,
         MFU_CHART=mfu_chart,
         TABLE_HEAD="".join(thead_parts),
