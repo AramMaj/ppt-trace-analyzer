@@ -737,6 +737,21 @@ def _bottleneck_tags(metrics_list: list) -> str:
     return parts
 
 
+def _model_config_card(cfg: ModelConfig) -> str:
+    if not cfg or not cfg.is_configured:
+        return ""
+    parts = [f"<b>{cfg.hidden_dim}</b> hidden, <b>{cfg.num_layers}</b> layers, <b>{cfg.num_heads}</b> heads"]
+    if cfg.num_kv_heads != cfg.num_heads:
+        parts.append(f"<b>{cfg.num_kv_heads}</b> KV heads")
+    if cfg.intermediate_dim and cfg.intermediate_dim != 4 * cfg.hidden_dim:
+        parts.append(f"<b>{cfg.intermediate_dim}</b> intermediate")
+    parts += [f"seq <b>{cfg.seq_len}</b>", f"vocab <b>{cfg.vocab_size}</b>",
+              f"batch <b>{cfg.batch_size}</b>", f"<b>{cfg.num_gpus}</b> GPUs"]
+    if cfg.activation_checkpointing is not None:
+        parts.append(f"act ckpt <b>{cfg.activation_checkpointing:.0%}</b>")
+    return f'<div style="margin:6px 0 14px;padding:8px 14px;border:1px solid #ddd;font-size:13px;color:#555;line-height:1.7"><b>Model config:</b> {", ".join(parts)}</div>\n'
+
+
 def generate_html_report(trace_file: str, output_path: str = None, model_config: ModelConfig = None):
     """Run the full pipeline and write an enhanced HTML report with charts."""
     result = process_trace(trace_file, model_config=model_config)
@@ -771,6 +786,7 @@ def generate_html_report(trace_file: str, output_path: str = None, model_config:
         _load_body("single_body_template.html"),
         TITLE=title,
         SUBTITLE=f"{os.path.basename(trace_file)} — {num_layers} layers",
+        MODEL_CONFIG_CARD=_model_config_card(model_config),
         DASHBOARD_CARDS=_dashboard_cards(aggregated, metrics_list, report.throughput_metrics),
         DIAGNOSTICS_SECTION=diag_section,
         PHASE_METRICS_TABLE=_phase_metrics_table(aggregated, num_layers),
