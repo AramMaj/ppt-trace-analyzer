@@ -379,17 +379,33 @@ def _trace_step_diagnostics(trace_file: str) -> dict:
 
     cpu_steps: list[tuple[int, int]] = []
     gpu_steps: list[tuple[int, int]] = []
+    kernel_dur_buckets = {"<10us": 0, "10-100us": 0, "100us-1ms": 0, "1-10ms": 0, ">10ms": 0}
 
     for ev in events:
         name = ev.get("name", "")
-        if not name.startswith("ProfilerStep#"):
-            continue
         ph = ev.get("ph", "")
         cat = ev.get("cat", "")
+        dur = ev.get("dur", 0)
+
+        # Kernel duration bucketing (skip ProfilerStep markers)
+        if dur > 0 and cat and cat.startswith("gpu") and ph == "X" and not name.startswith("ProfilerStep#"):
+            if dur < 10:
+                kernel_dur_buckets["<10us"] += 1
+            elif dur < 100:
+                kernel_dur_buckets["10-100us"] += 1
+            elif dur < 1000:
+                kernel_dur_buckets["100us-1ms"] += 1
+            elif dur < 10000:
+                kernel_dur_buckets["1-10ms"] += 1
+            else:
+                kernel_dur_buckets[">10ms"] += 1
+            continue
+
+        if not name.startswith("ProfilerStep#"):
+            continue
         if ph != "X":
             continue
         ts = ev.get("ts", 0)
-        dur = ev.get("dur", 0)
         if cat in ("cpu_op", "user_annotation"):
             cpu_steps.append((ts, ts + dur))
         elif cat == "gpu_user_annotation":
@@ -433,12 +449,14 @@ def _trace_step_diagnostics(trace_file: str) -> dict:
 
     gpu_arch = _detect_gpu_architecture(trace_file)
 
+    total_bucketed = sum(kernel_dur_buckets.values())
     result = {
         "num_cpu_steps": len(cpu_steps),
         "cpu_dur_us": cpu_dur,
         "gpu_dur_us": gpu_dur,
         "gap_us": gap,
         "gpu_architecture": gpu_arch,
+        "kernel_dur_buckets": kernel_dur_buckets if total_bucketed > 0 else {},
         "warnings": warnings,
     }
     return result
@@ -505,10 +523,21 @@ def _render_diagnostics_section(diag: dict, kstats: dict) -> str:
         cmp_s = _format_us(kstats["compute_total_us"])
         opt_s = _format_us(kstats["opt_total_us"])
         avg_s = f"{kstats['avg_kernel_dur_us']:.1f}µs"
+        bucket_rows = ""
+        if diag.get("kernel_dur_buckets"):
+            buckets = diag["kernel_dur_buckets"]
+            total_k = sum(buckets.values())
+            items = ", ".join(
+                f"{label}: <b>{buckets[label]:,}</b> ({buckets[label] / total_k:.1%})"
+                for label in ["<10us", "10-100us", "100us-1ms", "1-10ms", ">10ms"]
+                if buckets.get(label, 0) > 0
+            )
+            bucket_rows = f'<tr><td colspan="2" style="font-size:11px;padding-left:20px;color:#666">Kernel duration: {items}</td></tr>'
         parts.append(
             f"<tr><td>Total GPU kernels</td><td>{kc:,}</td></tr>"
             f"<tr><td>NCCL / compute / optimizer</td><td>{nccl_s} / {cmp_s} / {opt_s}</td></tr>"
             f"<tr><td>Avg kernel duration</td><td>{avg_s}</td></tr>"
+            f"{bucket_rows}"
         )
 
     rows = "".join(parts)
@@ -520,7 +549,7 @@ def _render_diagnostics_section(diag: dict, kstats: dict) -> str:
     warn_html = ""
     if warns:
         items = "".join(f'<li style="margin:4px 0;font-size:12px">{w}</li>' for w in warns)
-        warn_html = f'<div style="background:#fef3cd;border:1px solid #ffc107;border-radius:6px;padding:8px 12px;margin-top:8px"><strong style="font-size:13px">&#9888; Diagnostics</strong><ul style="margin:4px 0 0 16px;padding:0">{items}</ul></div>'
+        warn_html = f'<div style="background:#fef3cd;border:1px solid #ffc107;padding:8px 12px;margin-top:8px"><strong style="font-size:13px">Diagnostics</strong><ul style="margin:4px 0 0 16px;padding:0">{items}</ul></div>'
 
     return f"""<div class="section">
 <h2>Trace Diagnostics</h2>
