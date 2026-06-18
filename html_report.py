@@ -1073,6 +1073,32 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
         thead_parts.append(f'<th>{l}</th>')
     thead_parts.append('</tr>')
 
+    # Format a delta string for a cell value vs baseline
+    _pct_names = {"GPU utilization", "Communication ratio", "FSDP communication ratio",
+                  "Tensor-parallel communication ratio",
+                  "Pipeline concurrent execution", "Serial execution ratio",
+                  "Pipeline idle ratio", "Average exposed communication ratio",
+                  "All-gather forward exposed ratio",
+                  "Forward TP overlap ratio", "Backward TP overlap ratio",
+                  "Model FLOPs utilization (MFU)", "Hardware FLOPs utilization (HFU)"}
+
+    def _format_delta(val, bval, name):
+        if bval is None or val is None or bval == 0 or val == bval:
+            return ""
+        # Percentage metrics: absolute percentage-point change
+        if name in _pct_names:
+            diff = (val - bval) * 100
+            if abs(diff) < 0.05:
+                return ""
+            sign = "+" if diff > 0 else ""
+            return f" ({sign}{diff:.1f}pp)"
+        # Everything else: relative percent change
+        rel = (val - bval) / bval * 100
+        if abs(rel) < 0.5:
+            return ""
+        sign = "+" if rel > 0 else ""
+        return f" ({sign}{rel:.0f}%)"
+
     # Color coding: compare traces[1..n] against traces[0]
     baseline_vals = trace_values[0] if trace_values else {}
 
@@ -1090,6 +1116,8 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
                         cell_class = ' class="cmp-better"'
                     elif _worse(val, bval, direction):
                         cell_class = ' class="cmp-worse"'
+                    # Append delta text
+                    formatted += _format_delta(val, bval, name)
             cells += f"<td{cell_class}>{formatted}</td>"
         table_rows += f"<tr>{cells}</tr>\n"
 
