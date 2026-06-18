@@ -74,6 +74,18 @@ def _phase_gpu_time(nodes: List[LogicalOperation]) -> float:
     return sum(n.gpu_duration for n in nodes)
 
 
+def _phase_gpu_time_direct(nodes: List[LogicalOperation]) -> float:
+    """Sum of **direct** (non-overlapping) GPU duration across nodes.
+
+    Unlike :func:`_phase_gpu_time`, this uses ``direct_gpu_duration`` which
+    excludes GPU time from descendant nodes.  When the same node list contains
+    both parent and child CPU operations (as happens with time-window-based
+    phase attribution), ``direct_gpu_duration`` counts each GPU kernel exactly
+    once and avoids double-counting container wrappers.
+    """
+    return sum(n.direct_gpu_duration for n in nodes)
+
+
 def _phase_cpu_time(nodes: List[LogicalOperation]) -> float:
     """Sum of inclusive CPU dispatch duration (µs).  Same caveat: not a union."""
     return sum(n.cpu_duration for n in nodes)
@@ -430,7 +442,7 @@ class Metrics:
         self.ag_fwd_cpu = _phase_cpu_time(unit.all_gather_fwd)
         self.ag_fwd_wall = _phase_wall_time(unit.all_gather_fwd)
 
-        self.fwd_cmp_gpu = _phase_gpu_time(unit.fwd_compute)
+        self.fwd_cmp_gpu = _phase_gpu_time_direct(unit.fwd_compute)
         self.fwd_cmp_cpu = _phase_cpu_time(unit.fwd_compute)
         self.fwd_cmp_wall = _phase_wall_time(unit.fwd_compute, unit.fwd_compute_span)
 
@@ -443,7 +455,7 @@ class Metrics:
             unit.all_gather_bwd + unit.all_gather_bwd_nccl
         )
 
-        self.bwd_cmp_gpu = _phase_gpu_time(unit.bwd_compute)
+        self.bwd_cmp_gpu = _phase_gpu_time_direct(unit.bwd_compute)
         self.bwd_cmp_cpu = _phase_cpu_time(unit.bwd_compute)
         self.bwd_cmp_wall = _phase_wall_time(unit.bwd_compute, unit.bwd_compute_span)
 

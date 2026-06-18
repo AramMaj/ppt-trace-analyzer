@@ -80,6 +80,33 @@ def _has_fsdp_prefix(name: str) -> bool:
     return name.startswith(FSDP_PREFIXES)
 
 
+_COMM_NAMES = {
+    '_c10d_functional::all_gather_into_tensor',
+    '_c10d_functional::reduce_scatter_tensor',
+    '_c10d_functional::all_reduce',
+    '_c10d_functional::wait_tensor',
+    'c10d::allgather_into_tensor_coalesced_',
+    'c10d::reduce_scatter_tensor_coalesced_',
+    'c10d::allreduce_',
+    'c10d::_allgather_base_',
+    'c10d::_reduce_scatter_base_',
+    'record_param_comms',
+    'fsdp::all_gather_copy_in',
+    'Redistribute',
+    'RedistributeBackward',
+    'autograd::engine::evaluate_function: RedistributeBackward',
+    'NestedRedistribute',
+}
+
+
+def _is_comm_node(name: str) -> bool:
+    """Match communication operations (c10d, FSDP2 record_param, etc.) that
+    should be excluded from fwd_compute / bwd_compute phase attribution so
+    their GPU kernel time is not double-counted as compute.
+    """
+    return name in _COMM_NAMES
+
+
 def _fsdp_phase_name(phase: str, layer: str = '') -> List[str]:
     """Return both ``FSDP::`` and ``FullyShardedDataParallel::`` variants of a phase name
     (e.g. ``['FSDP::pre_forward (layers.0)', 'FullyShardedDataParallel::pre_forward (layers.0)']``).
@@ -415,6 +442,8 @@ class StandardFSDPDetector:
                                   'root_post_backward_callback', 'inputs_to_device',
                                   'cast_forward_inputs'):
                         continue
+                    if _is_comm_node(n.name):
+                        continue
                     unit.fwd_compute.append(n)
 
     def _detect_bwd_cmp(self, roots: List[LogicalOperation], fsdp_units: FSDP, profiler_tid: int = None):
@@ -526,6 +555,8 @@ class StandardFSDPDetector:
                     if n.name in ('backward_pass', 'forward_pass', 'root_pre_forward',
                                   'root_post_backward_callback', 'inputs_to_device',
                                   'cast_forward_inputs'):
+                        continue
+                    if _is_comm_node(n.name):
                         continue
                     unit.bwd_compute.append(n)
 
