@@ -341,6 +341,9 @@
       if (DATA.compare.phaseTimes) {
         barChart('cmpPhaseTimes', DATA.compare.phaseTimes.labels, DATA.compare.phaseTimes.datasets, { legend: true, unitY: DATA.compare.phaseTimes.unitY });
       }
+      if (DATA.compare.phaseTimesComm) {
+        barChart('cmpPhaseTimesComm', DATA.compare.phaseTimesComm.labels, DATA.compare.phaseTimesComm.datasets, { legend: true, unitY: DATA.compare.phaseTimesComm.unitY });
+      }
       if (DATA.compare.mfu) {
         barChart('cmpMfu', DATA.compare.mfu.labels, DATA.compare.mfu.datasets, { legend: true, unitY: DATA.compare.mfu.unitY });
       }

@@ -182,6 +182,8 @@ def _efficiency_table(aggregated: dict, metrics_list: list) -> str:
     imbalance = max_span / min_span if min_span > 0 else 1
     avg_fwd_ov = sum(m.fwd_comp_comm_overlap for m in metrics_list) / max(len(metrics_list), 1)
     avg_bwd_ov = sum(m.bwd_comp_comm_overlap for m in metrics_list) / max(len(metrics_list), 1)
+    bwd_to_fwd = (aggregated.get("bwd_cmp_gpu_us", 0) / aggregated.get("fwd_cmp_gpu_us", 1)
+                  if aggregated.get("fwd_cmp_gpu_us", 0) > 0 else 0)
     ov = aggregated.get("overlap_ratio", 0)
     idle = aggregated.get("idle_ratio", 0)
     serial = aggregated.get("serial_ratio", 0)
@@ -195,6 +197,7 @@ def _efficiency_table(aggregated: dict, metrics_list: list) -> str:
 <tr><td>Optimizer step</td><td>{aggregated.get('optimizer_ratio', 0):.1%}</td><td>Share on ADAMW parameter update. Should be &lt;10% with fused optimizer</td></tr>
 <tr><td>Average GPU utilization</td><td>{avg_util:.1%}</td><td>Fraction of wall time with active GPU kernels. Target: &gt;70%</td></tr>
 <tr><td>Compute-to-communication ratio</td><td>{avg_ctc:.2f}x</td><td>Compute time per unit of communication. &gt;2x balanced, &lt;1x communication-bound</td></tr>
+<tr><td>Backward-to-forward compute ratio</td><td>{bwd_to_fwd:.2f}x</td><td>Ratio of backward to forward compute time. ~2x with activation checkpointing; &gt;3x may indicate imbalance or recomputation overhead</td></tr>
 <tr><td>Layer span imbalance</td><td>{imbalance:.1f}x</td><td>Ratio of longest to shortest layer wall span. High imbalance = pipeline serialization</td></tr>
 <tr style='border-top:1px solid #ccc'><td>Pipeline concurrent execution</td><td>{ov:.1%}</td><td>Share of step wall where multiple layers overlapped on GPU. Higher = better overlap</td></tr>
 <tr><td>Serial execution ratio</td><td>{serial:.1%}</td><td>Share where only one layer was active. Lower = better pipeline utilization</td></tr>
@@ -207,7 +210,7 @@ def _efficiency_table(aggregated: dict, metrics_list: list) -> str:
 def _per_unit_table(metrics_list: list) -> str:
     mem_avail = any(m.memory_has_data for m in metrics_list)
     cols = ["Layer", "All-gather\nforward", "Forward\ncompute", "All-gather\nbackward", "Backward\ncompute",
-            "Reduce\nscatter", "Optimizer",
+            "Reduce\nscatter", "Optimizer\n(avg/layer)",
             "Total GPU", "GPU\nutil", "Comp:\nComm", "Exposed\ncomm", "Wall\nspan", "Kernel\ncount", "Avg kernel\nduration"]
     if mem_avail:
         cols.append("Peak\nmemory")
@@ -892,13 +895,17 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
         ]
         km_datasets.append({"label": label, "data": [round(v * 100, 1) for v in vals], "backgroundColor": colors[i]})
 
-    # Phase times chart
-    pt_labels = ["All-gather\nforward", "Forward\ncompute", "All-gather\nbackward", "Backward\ncompute", "Reduce\nscatter", "Optimizer"]
-    pt_datasets = []
+    # Phase times charts (compute and comm split)
+    pt_fwd_bwd_labels = ["Forward\ncompute", "Backward\ncompute"]
+    pt_fwd_bwd_datasets = []
+    pt_comm_labels = ["All-gather\nforward", "All-gather\nbackward", "Reduce\nscatter"]
+    pt_comm_datasets = []
     for i, (label, agg, metrics, steps, tp) in enumerate(all_results):
         ph = _get_phases(agg)
-        vals = [ph[k] / 1000 for k in ["ag_fwd", "fwd_cmp", "ag_bwd", "bwd_cmp", "rs", "opt"]]
-        pt_datasets.append({"label": label, "data": [round(v, 2) for v in vals], "backgroundColor": colors[i]})
+        fwd_bwd_vals = [ph["fwd_cmp"] / 1000, ph["bwd_cmp"] / 1000]
+        pt_fwd_bwd_datasets.append({"label": label, "data": [round(v, 2) for v in fwd_bwd_vals], "backgroundColor": colors[i]})
+        comm_vals = [ph["ag_fwd"] / 1000, ph["ag_bwd"] / 1000, ph["rs"] / 1000]
+        pt_comm_datasets.append({"label": label, "data": [round(v, 2) for v in comm_vals], "backgroundColor": colors[i]})
 
     # MFU chart
     mfu_datasets = None
@@ -931,7 +938,8 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
 
     compare_data = {
         "keyMetrics": {"labels": km_labels, "datasets": km_datasets, "unitY": "%"},
-        "phaseTimes": {"labels": pt_labels, "datasets": pt_datasets, "unitY": "ms"},
+        "phaseTimes": {"labels": pt_fwd_bwd_labels, "datasets": pt_fwd_bwd_datasets, "unitY": "ms"},
+        "phaseTimesComm": {"labels": pt_comm_labels, "datasets": pt_comm_datasets, "unitY": "ms"},
         "commRatios": {"labels": comm_labels, "datasets": comm_datasets, "unitY": "%"},
     }
     if mfu_datasets:
@@ -972,12 +980,15 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
         if name == "Peak memory":
             return f"{raw_val:.1f}G" if raw_val and raw_val > 0 else "N/A"
         # Microsecond metrics
-        us_names = ("Step wall time", "All-gather forward", "Forward compute",
-                    "All-gather backward", "Backward compute", "Reduce scatter",
-                    "Optimizer", "Tensor parallelism (TP) total",
-                    "Total GPU time", "Total CPU dispatch time",
-                    "Tensor-parallel all-gather", "Tensor-parallel all-reduce",
-                    "Tensor-parallel reduce-scatter")
+        us_names = ("Step wall time",
+                    "All-gather forward (avg per layer)", "Forward compute (avg per layer)",
+                    "All-gather backward (avg per layer)", "Backward compute (avg per layer)",
+                    "Reduce scatter (avg per layer)", "Optimizer (avg per layer)",
+                    "TP total (avg per layer)", "Total GPU (avg per layer)",
+                    "CPU dispatch (avg per layer)",
+                    "Tensor-parallel all-gather (avg per layer)",
+                    "Tensor-parallel all-reduce (avg per layer)",
+                    "Tensor-parallel reduce-scatter (avg per layer)")
         if name in us_names:
             return _format_us(raw_val) if isinstance(raw_val, (int, float)) else str(raw_val)
         if name == "Steps per second":
@@ -993,21 +1004,25 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
         ("Steps per second", lambda r, m: 1e6 / r.get("step_wall", 1) if r.get("step_wall", 0) > 0 else 0, "higher", True),
     ]
 
-    # Phase times
-    for label, key in [("All-gather forward", "ag_fwd_gpu_us"), ("Forward compute", "fwd_cmp_gpu_us"),
-                        ("All-gather backward", "ag_bwd_gpu_us"), ("Backward compute", "bwd_cmp_gpu_us"),
-                        ("Reduce scatter", "rs_gpu_us"), ("Optimizer", "optimizer_gpu_us"),
-                        ("Tensor-parallel all-gather", "tp_ag_gpu_us"), ("Tensor-parallel all-reduce", "tp_ar_gpu_us"),
-                        ("Tensor-parallel reduce-scatter", "tp_rs_gpu_us")]:
+    # Phase times (all per-layer averages)
+    for label, key in [("All-gather forward (avg per layer)", "ag_fwd_gpu_us"),
+                        ("Forward compute (avg per layer)", "fwd_cmp_gpu_us"),
+                        ("All-gather backward (avg per layer)", "ag_bwd_gpu_us"),
+                        ("Backward compute (avg per layer)", "bwd_cmp_gpu_us"),
+                        ("Reduce scatter (avg per layer)", "rs_gpu_us"),
+                        ("Optimizer (avg per layer)", "optimizer_gpu_us"),
+                        ("Tensor-parallel all-gather (avg per layer)", "tp_ag_gpu_us"),
+                        ("Tensor-parallel all-reduce (avg per layer)", "tp_ar_gpu_us"),
+                        ("Tensor-parallel reduce-scatter (avg per layer)", "tp_rs_gpu_us")]:
         COMPARE_METRICS.append((label, lambda r, m, k=key: r.get(k, 0), "lower", True))
 
-    COMPARE_METRICS.append(("Tensor parallelism (TP) total", lambda r, m: r.get("tp_total_gpu_us", 0), "lower", True))
-    COMPARE_METRICS.append(("Total GPU time", lambda r, m: r.get("total_gpu_us", 0) + r.get("tp_total_gpu_us", 0), "lower", True))
-    COMPARE_METRICS.append(("Total CPU dispatch time", lambda r, m: r.get("total_cpu_us", 0), "lower", True))
+    COMPARE_METRICS.append(("TP total (avg per layer)", lambda r, m: r.get("tp_total_gpu_us", 0), "lower", True))
+    COMPARE_METRICS.append(("Total GPU (avg per layer)", lambda r, m: r.get("total_gpu_us", 0) + r.get("tp_total_gpu_us", 0), "lower", True))
+    COMPARE_METRICS.append(("CPU dispatch (avg per layer)", lambda r, m: r.get("total_cpu_us", 0), "lower", True))
 
     # Utilization & ratios
     COMPARE_METRICS.append(("GPU utilization", lambda r, m: sum(x.gpu_busy for x in m) / max(len(m), 1), "higher", True))
-    COMPARE_METRICS.append(("Compute-to-communication ratio", lambda r, m: sum(x.compute_to_comm_ratio for x in m) / max(len(m), 1), "higher", True))
+    COMPARE_METRICS.append(("Compute-to-communication ratio (avg per layer)", lambda r, m: sum(x.compute_to_comm_ratio for x in m) / max(len(m), 1), "higher", True))
 
     # MFU/HFU
     COMPARE_METRICS.append(("Model FLOPs utilization (MFU)", lambda r, m, tp=None: tp.get("mfu", 0) if tp else 0, "higher", True))
@@ -1024,11 +1039,11 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
     COMPARE_METRICS.append(("Serial execution ratio", lambda r, m: r.get("serial_ratio", 0), "higher", True))
     COMPARE_METRICS.append(("Pipeline idle ratio", lambda r, m: r.get("idle_ratio", 0), "lower", True))
 
-    # Efficiency
+    # Efficiency (all per-layer averages)
     COMPARE_METRICS.append(("Average exposed communication ratio", lambda r, m: sum(x.avg_exposed_ratio for x in m) / max(len(m), 1), "lower", True))
-    COMPARE_METRICS.append(("All-gather forward exposed ratio", lambda r, m: sum(x.ag_fwd_exposed_ratio for x in m) / max(len(m), 1), "lower", True))
-    COMPARE_METRICS.append(("Forward TP overlap ratio", lambda r, m: sum(x.fwd_comp_comm_overlap for x in m) / max(len(m), 1), "higher", True))
-    COMPARE_METRICS.append(("Backward TP overlap ratio", lambda r, m: sum(x.bwd_comp_comm_overlap for x in m) / max(len(m), 1), "higher", True))
+    COMPARE_METRICS.append(("All-gather forward exposed ratio (avg per layer)", lambda r, m: sum(x.ag_fwd_exposed_ratio for x in m) / max(len(m), 1), "lower", True))
+    COMPARE_METRICS.append(("Forward TP overlap ratio (avg per layer)", lambda r, m: sum(x.fwd_comp_comm_overlap for x in m) / max(len(m), 1), "higher", True))
+    COMPARE_METRICS.append(("Backward TP overlap ratio (avg per layer)", lambda r, m: sum(x.bwd_comp_comm_overlap for x in m) / max(len(m), 1), "higher", True))
 
     # Memory
     COMPARE_METRICS.append(("Peak memory", lambda r, m: max((x.memory_peak for x in m if x.memory_has_data), default=0) / (1024**3), "lower", True))
@@ -1078,8 +1093,8 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
                   "Tensor-parallel communication ratio",
                   "Pipeline concurrent execution", "Serial execution ratio",
                   "Pipeline idle ratio", "Average exposed communication ratio",
-                  "All-gather forward exposed ratio",
-                  "Forward TP overlap ratio", "Backward TP overlap ratio",
+                  "All-gather forward exposed ratio (avg per layer)",
+                  "Forward TP overlap ratio (avg per layer)", "Backward TP overlap ratio (avg per layer)",
                   "Model FLOPs utilization (MFU)", "Hardware FLOPs utilization (HFU)"}
 
     def _diff_magnitude(name, vals):

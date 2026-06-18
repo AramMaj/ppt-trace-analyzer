@@ -17,8 +17,17 @@
 
 <div class="section">
     <h2>Phase Times</h2>
-    <p style="font-size:11px;color:#888;margin-bottom:12px">Average GPU time per layer per phase, in milliseconds. Compare forward/backward compute and FSDP/TP communication across ranks.</p>
-    <div class="chart-box tall"><canvas id="cmpPhaseTimes"></canvas></div>
+    <p style="font-size:11px;color:#888;margin-bottom:12px">Average GPU time per layer per phase, in milliseconds. Compute and communication shown separately so scales don't obscure each other.</p>
+    <div class="comp-row">
+        <div class="comp-col">
+            <h3>Compute</h3>
+            <div class="chart-box"><canvas id="cmpPhaseTimes"></canvas></div>
+        </div>
+        <div class="comp-col">
+            <h3>Communication</h3>
+            <div class="chart-box"><canvas id="cmpPhaseTimesComm"></canvas></div>
+        </div>
+    </div>
 </div>
 
 <div class="comp-row">
