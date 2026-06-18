@@ -540,6 +540,26 @@ def _prune_roots_for_step(roots, step_name, step_start, step_end):
 # Step-level analysis
 # ---------------------------------------------------------------------------
 
+
+def _resolve_gpu_filter_end(parser, step_name, default_end):
+    """Return the end time of the GPU-profile ProfilerStep (``gpu_user_annotation``
+    category) for *step_name*, falling back to *default_end* when absent.
+
+    The GPU-profile step typically extends 600-800 ms beyond the CPU-profile
+    step (``user_annotation`` / ``cpu_op`` category).  Using the CPU step
+    boundary for GPU event filtering clips valid GPU events for layers that
+    finish backward last (layers 0‑N in forward order), producing the
+    illusion that early layers have no backward GPU phases.
+    """
+    for ev in parser.all_events:
+        cat = ev.get('cat', '')
+        name = ev.get('name', '')
+        ph = ev.get('ph', '')
+        if cat == 'gpu_user_annotation' and name == step_name and ph == 'X':
+            return ev['ts'] + ev['dur']
+    return default_end
+
+
 def _analyze_step(
     trace_file: str,
     step_name: str,
@@ -559,7 +579,10 @@ def _analyze_step(
     if not parser.load():
         return None, None, None
 
-    _filter_gpu_events(parser, step_start, step_end)
+    # Extend GPU filtering window to cover gpu_user_annotation ProfilerStep
+    # (the GPU profile typically extends ~600-800 ms beyond the CPU profile).
+    gpu_filter_end = _resolve_gpu_filter_end(parser, step_name, step_end)
+    _filter_gpu_events(parser, step_start, gpu_filter_end)
     roots = parser.build_tree()
     roots = _prune_roots_for_step(roots, step_name, step_start, step_end)
     parser.attribute_gpu_kernel_with_logical_operation(roots)
