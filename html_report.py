@@ -1239,11 +1239,32 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
 
     consistency_warnings = _render_consistency_warnings(all_results, trace_files=trace_files)
 
+    # Verdict card: trace with highest total GPU speedup
+    candidates = [(ri, trace_values[ri].get("Total GPU speedup", 0) or 0) for ri in range(len(trace_values))]
+    best_ri, best_val = max(candidates, key=lambda x: x[1])
+    if best_ri == 0 or best_val <= 1.01:
+        label = trace_labels[0]
+        detail = "(baseline &mdash; no trace is faster)"
+        detail_color = "#888"
+    else:
+        label = trace_labels[best_ri]
+        detail = f"({best_val:.2f}x total GPU speedup vs {trace_labels[0]})"
+        detail_color = "#666"
+    verdict_card = (
+        f'<div style="margin:14px 0 12px;padding:12px 16px;'
+        f'border:1px solid #ccc;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">'
+        f'<span style="font-size:20px;font-weight:700;color:#111">Trace with highest GPU speedup:</span>'
+        f'<span style="font-size:18px;font-weight:600;color:#111">{label}</span>'
+        f'<span style="font-size:14px;color:{detail_color}">{detail}</span>'
+        f'</div>'
+    )
+
     body = _fill(
         _load_body("compare_body_template.html"),
         TITLE=title,
         FILES=", ".join(trace_files),
         BASELINE=trace_labels[0],
+        VERDICT_CARD=verdict_card,
         TRACE_TABS=trace_tabs,
         CONSISTENCY_WARNINGS=consistency_warnings,
         KEY_DIFFERENCES=key_diff_html,
