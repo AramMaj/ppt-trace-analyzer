@@ -5,6 +5,7 @@
 
 <div class="section">
 <h2>Phase Composition</h2>
+<p style="font-size:11px;color:#888;margin-bottom:12px">How GPU cycles are split across forward pass, backward pass, communication collectives, and the optimizer step.</p>
 <div class="chart-row">
   <div class="chart-box"><canvas id="phasePie"></canvas></div>
   <div>{{PHASE_METRICS_TABLE}}</div>
@@ -12,26 +13,26 @@
 </div>
 
 <div class="section">
-<h2>GPU Busy per Layer</h2>
+<h2>GPU Utilization per Layer</h2>
+<p style="font-size:11px;color:#888;margin-bottom:12px">Fraction of each layer&#39;s CPU wall span where at least one GPU kernel was active (union of kernel intervals, capped at 100%). Values below 50% suggest pipeline serialization or GPU idling.</p>
 <div class="chart-box tall"><canvas id="busyChart"></canvas></div>
-<p style="font-size:.8em;color:#888;margin-top:4px">GPU busy = fraction of CPU wall span where at least one GPU kernel was active (union of intervals, capped at 100%).</p>
 </div>
 
 <div class="section">
 <h2>Compute vs Communication per Layer</h2>
+<p style="font-size:11px;color:#888;margin-bottom:12px">GPU time breakdown per layer in microseconds. Forward compute (attention, MLP) and backward compute (gradients) should dominate. FSDP communication (all-gather, reduce-scatter) and TP communication are overhead.</p>
 <div class="chart-box tall"><canvas id="compCommChart"></canvas></div>
 </div>
 
 <div class="section">
-<h2>Efficiency &amp; Overlap</h2>
+<h2>Efficiency and Overlap</h2>
+<p style="font-size:11px;color:#888;margin-bottom:12px">Left: how much of the step wall each communication phase occupies (low = well hidden behind compute). Right: compute time per unit of communication time — higher means more compute relative to communication.</p>
 <div class="chart-row">
   <div>
     <div class="chart-box"><canvas id="overlapChart"></canvas></div>
-    <p style="font-size:.8em;color:#888;margin-top:4px;text-align:center">Comm overlap efficiency (GPU time / wall span). Low = well hidden.</p>
   </div>
   <div>
     <div class="chart-box"><canvas id="ctcChart"></canvas></div>
-    <p style="font-size:.8em;color:#888;margin-top:4px;text-align:center">Compute-to-communication ratio per layer</p>
   </div>
 </div>
 </div>
@@ -42,11 +43,13 @@
 </div>
 
 <div class="section">
-<h2>Per-Unit Details</h2>
+<h2>Per-Unit Breakdown</h2>
+<p style="font-size:11px;color:#888;margin-bottom:8px">GPU time per phase for each FSDP unit (layer), plus utilization, communication exposure, wall span, kernel statistics, and detected bottlenecks.</p>
 {{PER_UNIT_TABLE}}
 </div>
 
 <div class="section">
 <h2>Bottleneck Summary</h2>
+<p style="font-size:11px;color:#888;margin-bottom:8px">Identified performance issues across layers. Widespread items (shown in red) affect &ge;50% of layers and should be prioritized.</p>
 {{BOTTLENECK_TAGS}}
 </div>

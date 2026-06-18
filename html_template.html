@@ -314,37 +314,38 @@
     function barChart(id, labels, datasets, opts) {
       const ctx = document.getElementById(id);
       if (!ctx) return;
-      new Chart(ctx, { type: 'bar', data: { labels, datasets }, options: { responsive: true, maintainAspectRatio: false, scales: { x: { grid: { display: false }, ticks: { font: { size: 10 } } }, y: { beginAtZero: true, grid: { color: '#eee', drawBorder: false }, ticks: { font: { size: 10 } } } }, plugins: { legend: { display: !!opts?.legend, position: 'bottom', labels: { boxWidth: 10, padding: 6, font: { size: 10 } } } } } });
+      const yTickOpts = opts?.unitY ? { font: { size: 10 }, callback: function(value) { return Number.isInteger(value) ? value + (opts.unitY || '') : ''; } } : { font: { size: 10 } };
+      new Chart(ctx, { type: 'bar', data: { labels, datasets }, options: { responsive: true, maintainAspectRatio: false, scales: { x: { grid: { display: false }, ticks: { font: { size: 10 } } }, y: { beginAtZero: true, grid: { color: '#eee', drawBorder: false }, ticks: yTickOpts } }, plugins: { legend: { display: !!opts?.legend, position: 'bottom', labels: { boxWidth: 10, padding: 6, font: { size: 10 } } } } } });
     }
 
     if (DATA.phasePie) {
       doughnutChart('phasePie', DATA.phasePie.labels, DATA.phasePie.values, DATA.phasePie.colors);
     }
     if (DATA.busyChart) {
-      barChart('busyChart', DATA.busyChart.labels, [{ label: 'GPU busy', data: DATA.busyChart.values, backgroundColor: DATA.busyChart.values.map(v => v >= 90 ? '#4e79a7' : v >= 50 ? '#76b7b2' : '#e15759') }]);
+      barChart('busyChart', DATA.busyChart.labels, [{ label: 'GPU busy', data: DATA.busyChart.values, backgroundColor: DATA.busyChart.values.map(v => v >= 90 ? '#4e79a7' : v >= 50 ? '#76b7b2' : '#e15759') }], { unitY: '%' });
     }
     if (DATA.compCommChart) {
-      barChart('compCommChart', DATA.compCommChart.labels, DATA.compCommChart.datasets, { legend: true });
+      barChart('compCommChart', DATA.compCommChart.labels, DATA.compCommChart.datasets, { legend: true, unitY: '\u00B5s' });
     }
     if (DATA.overlapChart) {
-      barChart('overlapChart', DATA.overlapChart.labels, [{ label: 'Efficiency', data: DATA.overlapChart.values, backgroundColor: DATA.overlapChart.values.map(v => v >= 0.7 ? '#e15759' : v >= 0.3 ? '#f28e2b' : '#76b7b2') }], { legend: false });
+      barChart('overlapChart', DATA.overlapChart.labels, [{ label: 'Share of wall span', data: DATA.overlapChart.values, backgroundColor: DATA.overlapChart.values.map(v => v >= 70 ? '#e15759' : v >= 30 ? '#f28e2b' : '#76b7b2') }], { legend: false, unitY: '%' });
     }
     if (DATA.ctcChart) {
       const vals = DATA.ctcChart.values.map(v => v === null ? 0 : v);
-      barChart('ctcChart', DATA.ctcChart.labels, [{ label: 'Compute-to-comm', data: vals, backgroundColor: vals.map(v => v >= 5 ? '#4e79a7' : v >= 2 ? '#76b7b2' : '#e15759') }], { legend: false });
+      barChart('ctcChart', DATA.ctcChart.labels, [{ label: 'Compute-to-comm', data: vals, backgroundColor: vals.map(v => v >= 5 ? '#4e79a7' : v >= 2 ? '#76b7b2' : '#e15759') }], { legend: false, unitY: 'x' });
     }
     if (DATA.compare) {
       if (DATA.compare.keyMetrics) {
-        barChart('cmpKeyMetrics', DATA.compare.keyMetrics.labels, DATA.compare.keyMetrics.datasets, { legend: true });
+        barChart('cmpKeyMetrics', DATA.compare.keyMetrics.labels, DATA.compare.keyMetrics.datasets, { legend: true, unitY: DATA.compare.keyMetrics.unitY });
       }
       if (DATA.compare.phaseTimes) {
-        barChart('cmpPhaseTimes', DATA.compare.phaseTimes.labels, DATA.compare.phaseTimes.datasets, { legend: true });
+        barChart('cmpPhaseTimes', DATA.compare.phaseTimes.labels, DATA.compare.phaseTimes.datasets, { legend: true, unitY: DATA.compare.phaseTimes.unitY });
       }
       if (DATA.compare.mfu) {
-        barChart('cmpMfu', DATA.compare.mfu.labels, DATA.compare.mfu.datasets, { legend: true });
+        barChart('cmpMfu', DATA.compare.mfu.labels, DATA.compare.mfu.datasets, { legend: true, unitY: DATA.compare.mfu.unitY });
       }
       if (DATA.compare.commRatios) {
-        barChart('cmpCommRatios', DATA.compare.commRatios.labels, DATA.compare.commRatios.datasets, { legend: true });
+        barChart('cmpCommRatios', DATA.compare.commRatios.labels, DATA.compare.commRatios.datasets, { legend: true, unitY: DATA.compare.commRatios.unitY });
       }
     }
   </script>
