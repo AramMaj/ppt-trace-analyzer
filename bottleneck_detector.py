@@ -434,9 +434,14 @@ class Metrics:
         self.fwd_cmp_cpu = _phase_cpu_time(unit.fwd_compute)
         self.fwd_cmp_wall = _phase_wall_time(unit.fwd_compute, unit.fwd_compute_span)
 
-        self.ag_bwd_gpu = _phase_gpu_time(unit.all_gather_bwd) + unit.ag_bwd_supplement_us
-        self.ag_bwd_cpu = _phase_cpu_time(unit.all_gather_bwd)
-        self.ag_bwd_wall = _phase_wall_time(unit.all_gather_bwd)
+        self.ag_bwd_gpu = (_phase_gpu_time(unit.all_gather_bwd)
+                           + _phase_gpu_time(unit.all_gather_bwd_nccl)
+                           + unit.ag_bwd_supplement_us)
+        self.ag_bwd_cpu = (_phase_cpu_time(unit.all_gather_bwd)
+                           + _phase_cpu_time(unit.all_gather_bwd_nccl))
+        self.ag_bwd_wall = _phase_wall_time(
+            unit.all_gather_bwd + unit.all_gather_bwd_nccl
+        )
 
         self.bwd_cmp_gpu = _phase_gpu_time(unit.bwd_compute)
         self.bwd_cmp_cpu = _phase_cpu_time(unit.bwd_compute)

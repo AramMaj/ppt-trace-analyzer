@@ -30,20 +30,6 @@ PPT_PID_BASE = 9999
 PPT_CAT = "ppt_analyzer"
 TID_BLOCK = 200  # Fallback block size when tid_offset is not provided
 
-PHASE_COLORS = {
-    "AG fwd": "#4CAF50",
-    "Fwd cmp": "#2196F3",
-    "AG bwd": "#FF9800",
-    "Bwd AG": "#E91E63",
-    "Bwd cmp": "#F44336",
-    "RS": "#9C27B0",
-    "Pre-fwd AG": "#795548",
-    "Prefetch AG": "#00BCD4",
-    "Trailing RS": "#607D8B",
-    "Optimizer": "#607D8B",
-    "TP": "#FFEB3B",
-}
-
 PHASE_LABELS = ["AG fwd", "Fwd cmp", "AG bwd", "Bwd AG", "Bwd cmp", "RS",
                 "Pre-fwd AG", "Prefetch AG", "Trailing RS"]
 
@@ -325,6 +311,21 @@ def _get_gpu_kernel_spans(unit, ac2g_layer_spans=None):
                 span = (ac2g_start, ac2g_end)
         if span is not None:
             phases.append((label, span[0], span[1], node_list))
+
+    # Merge NCCL AG bwd GPU spans from backward_prefetch nodes into the AG bwd
+    # GPU phase bar so the annotated trace shows the full all-gather time
+    # (NCCL kernel + copy-out), not just the copy-out.
+    if unit.all_gather_bwd_nccl:
+        nccl_spans = []
+        for n in unit.all_gather_bwd_nccl:
+            nccl_spans.extend(_collect_nccl_gpu_spans(n))
+        if nccl_spans:
+            nccl_start = min(s for s, _ in nccl_spans)
+            nccl_end = max(e for _, e in nccl_spans)
+            for i, (label, start, end, nodes) in enumerate(phases):
+                if label == "AG bwd":
+                    phases[i] = (label, min(start, nccl_start), max(end, nccl_end), nodes)
+                    break
     return phases
 
 
@@ -355,8 +356,8 @@ def _get_unattributed_gpu_spans(fsdp, roots):
             for ch in node.children:
                 _walk(ch)
         for u in fsdp.units:
-            for lst in (u.all_gather_fwd, u.all_gather_bwd, u.reduce_scatter,
-                        u.fwd_compute, u.bwd_compute):
+            for lst in (u.all_gather_fwd, u.all_gather_bwd, u.all_gather_bwd_nccl,
+                        u.reduce_scatter, u.fwd_compute, u.bwd_compute):
                 for n in lst:
                     _walk(n)
         return exts
@@ -704,7 +705,6 @@ def annotate_trace(trace_file: str, output_file: str,
                         "num_nodes": len(nodes),
                         "step": step_name,
                     },
-                    "cname": PHASE_COLORS.get(label, "#888"),
                 })
 
                 # Flow arrow: phase transition within the same step
@@ -749,7 +749,6 @@ def annotate_trace(trace_file: str, output_file: str,
                         "cpu_us": round(opt_node.cpu_duration, 1),
                         "step": step_name,
                     },
-                    "cname": PHASE_COLORS["Optimizer"],
                 })
 
     # -- TP collectives thread (all steps merged) -------------------------
@@ -783,7 +782,6 @@ def annotate_trace(trace_file: str, output_file: str,
                     "gpu_us": round(k.get("dur", 0), 1),
                     "step": k.get("_step", ""),
                 },
-                "cname": PHASE_COLORS["TP"],
             })
 
     # -- GPU activity counter (all layers, all steps) ---------------------
@@ -813,12 +811,21 @@ def annotate_trace(trace_file: str, output_file: str,
             })
             active += delta
 
-    # -- GPU phase thread (GPU domain — overlaps GPU kernel events) --------
+    # -- GPU phase threads (GPU domain — overlaps GPU kernel events) --------
+    # One TID per layer + one for unattributed spans, so phases from
+    # different layers don't overlap on the same timeline.
     gpu_comp_tid = max_layers + 5
+    for layer_idx in range(max_layers):
+        annotations.append({
+            "ph": "M", "pid": pid, "tid": gpu_comp_tid + layer_idx,
+            "name": "thread_name",
+            "args": {"name": f"GPU phases (Layer {layer_idx})"},
+        })
+    gpu_extra_tid = gpu_comp_tid + max_layers
     annotations.append({
-        "ph": "M", "pid": pid, "tid": gpu_comp_tid,
+        "ph": "M", "pid": pid, "tid": gpu_extra_tid,
         "name": "thread_name",
-        "args": {"name": "GPU phases (all steps)"},
+        "args": {"name": "GPU phases (unattributed)"},
     })
     for step_idx, (step_name, fsdp, _, roots) in enumerate(step_analyses):
         step_ac2g = _filter_ac2g_spans_by_step(ac2g_layer_spans, step_idx, len(step_analyses))
@@ -828,7 +835,7 @@ def annotate_trace(trace_file: str, output_file: str,
                 gpu_dur = _phase_gpu_time(nodes)
                 ac2g_us = _total_ac2g_kernel_us(unit.layer_name, step_ac2g) if label == "AG bwd" else 0
                 annotations.append({
-                    "ph": "X", "pid": pid, "tid": gpu_comp_tid,
+                    "ph": "X", "pid": pid, "tid": gpu_comp_tid + layer_idx,
                     "ts": start, "dur": end - start,
                     "cat": PPT_CAT,
                     "name": f"{label} ({step_name}, Layer {layer_idx})",
@@ -841,13 +848,12 @@ def annotate_trace(trace_file: str, output_file: str,
                         "step": step_name,
                         "domain": "gpu",
                     },
-                    "cname": PHASE_COLORS.get(label, "#888"),
                 })
 
         # Cross-unit / unattributed phase bars
         for label, start, end in _get_unattributed_gpu_spans(fsdp, roots):
             annotations.append({
-                "ph": "X", "pid": pid, "tid": gpu_comp_tid,
+                "ph": "X", "pid": pid, "tid": gpu_extra_tid,
                 "ts": start, "dur": end - start,
                 "cat": PPT_CAT,
                 "name": f"{label} ({step_name})",
@@ -860,7 +866,6 @@ def annotate_trace(trace_file: str, output_file: str,
                     "step": step_name,
                     "domain": "gpu",
                 },
-                "cname": PHASE_COLORS.get(label, "#888"),
             })
 
     # -- Bottleneck markers (all steps merged) ----------------------------
@@ -907,7 +912,7 @@ def annotate_trace(trace_file: str, output_file: str,
                     "rs_overlap_eff": round(metric.rs_exposed_ratio, 3),
                     "step": step_name,
                 },
-                "s": "t", "cname": "#FF5722",
+                "s": "t",
             })
 
     # 4. Merge and write

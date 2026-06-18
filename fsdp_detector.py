@@ -183,6 +183,7 @@ class FSDPUnit:
         self.bwd_compute_span: Optional[Tuple[float, float]] = None
         self.all_gather_bwd_end: Optional[float] = None
         self.ag_bwd_supplement_us: float = 0.0
+        self.all_gather_bwd_nccl: List[LogicalOperation] = []
 
     @property
     def all_gather_fwd_gpu_kernels(self) -> List[dict]:
@@ -197,13 +198,19 @@ class FSDPUnit:
 
     @property
     def all_gather_bwd_gpu_kernels(self) -> List[dict]:
-        """GPU kernel events under all ``all_gather_bwd`` CPU nodes."""
+        """GPU kernel events under all ``all_gather_bwd`` and ``all_gather_bwd_nccl`` CPU nodes."""
+        def _collect(node):
+            acc = []
+            acc.extend(node.direct_gpu_kernels if isinstance(node.direct_gpu_kernels, list) else [])
+            for ch in _iter_logical(node):
+                if ch.direct_gpu_kernels:
+                    acc.extend(ch.direct_gpu_kernels if isinstance(ch.direct_gpu_kernels, list) else [])
+            return acc
         kernels = []
         for n in self.all_gather_bwd:
-            kernels.extend(n.direct_gpu_kernels if isinstance(n.direct_gpu_kernels, list) else [])
-            for ch in _iter_logical(n):
-                if ch.direct_gpu_kernels:
-                    kernels.extend(ch.direct_gpu_kernels if isinstance(ch.direct_gpu_kernels, list) else [])
+            kernels.extend(_collect(n))
+        for n in self.all_gather_bwd_nccl:
+            kernels.extend(_collect(n))
         return kernels
 
     @property
@@ -284,7 +291,14 @@ class StandardFSDPDetector:
 
     def _detect_all_gather_bwd(self, roots: List[LogicalOperation], fsdp_units: FSDP):
         """Function searches ``FSDP::pre_backward (layer.X)`` event which consists of 
-        ``FSDP::all_gather`` and  `all_gather_copy_out`` (mirrors forward) """
+        ``FSDP::all_gather`` and  `all_gather_copy_out`` (mirrors forward)
+
+        **Critical**: The NCCL ``FSDP::all_gather (layer.X)`` for backward is NOT
+        a direct child of ``pre_backward`` — it lives inside
+        ``FSDP::backward_prefetch for layer.X``, which is itself nested under the
+        **next** layer's ``pre_backward``.  We search the entire tree for the
+        ``backward_prefetch`` node by name and collect its ``all_gather`` children.
+        """
         for unit in fsdp_units.units:
             pre_bwd_list = []
             for name in _fsdp_phase_name('pre_backward', unit.layer_name):
@@ -297,6 +311,19 @@ class StandardFSDPDetector:
                 if _has_fsdp_prefix(ch.name) and 'all_gather' in ch.name:
                     if ch not in unit.all_gather_bwd:
                         unit.all_gather_bwd.append(ch)
+
+            # Search all nodes for backward_prefetch matching this layer.
+            # The NCCL all_gather kernel lives here, not under pre_backward directly.
+            # Store in all_gather_bwd_nccl (separate from all_gather_bwd which
+            # holds copy-out nodes) so the annotated trace's CPU phase spans
+            # don't get polluted with the early-starting backward_prefetch range.
+            for prefix in FSDP_PREFIXES:
+                prefetch_name = f'{prefix}backward_prefetch for {unit.layer_name}'
+                for n in self.all_nodes:
+                    if n.name == prefetch_name:
+                        for ch in n.children:
+                            if _has_fsdp_prefix(ch.name) and 'all_gather' in ch.name and ch not in unit.all_gather_bwd_nccl:
+                                unit.all_gather_bwd_nccl.append(ch)
 
     @staticmethod
     def _has_other_tids(all_nodes, profiler_tid):

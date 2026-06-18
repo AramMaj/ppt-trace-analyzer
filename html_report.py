@@ -592,15 +592,18 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
                 vals.append(tp.get("hfu", 0) * 100)
             mfu_datasets.append({"label": label, "data": [round(v, 1) for v in vals], "backgroundColor": colors[i]})
 
-    # Comm breakdown chart
+    # Comm breakdown chart — use total (sum) ratios, not per-layer averages,
+    # because outlier layers (e.g. tok_embeddings, lm_head) inflate averages.
     comm_labels = ["Comm ratio", "FSDP comm", "TP comm"]
     comm_datasets = []
     for i, (label, agg, metrics, steps, tp) in enumerate(all_results):
-        vals = [
-            agg.get("comm_ratio", 0) * 100,
-            _avg([m.fsdp_comm_ratio for m in metrics]) * 100,
-            _avg([m.tp_comm_ratio for m in metrics]) * 100,
-        ]
+        total_fsdp_comm = sum(m.ag_fwd_gpu + m.ag_bwd_gpu + m.rs_gpu for m in metrics)
+        total_tp_comm = sum(m.tp_total_gpu for m in metrics)
+        total_gpu = sum(m.total_gpu + m.tp_total_gpu for m in metrics)
+        cr = (total_fsdp_comm + total_tp_comm) / total_gpu if total_gpu > 0 else 0.0
+        fr = total_fsdp_comm / total_gpu if total_gpu > 0 else 0.0
+        tr = total_tp_comm / total_gpu if total_gpu > 0 else 0.0
+        vals = [cr * 100, fr * 100, tr * 100]
         comm_datasets.append({"label": label, "data": [round(v, 1) for v in vals], "backgroundColor": colors[i]})
 
     compare_data = {
@@ -676,10 +679,10 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
     COMPARE_METRICS.append(("HFU", lambda r, m, tp=None: tp.get("hfu", 0) if tp else 0, "higher", True))
     COMPARE_METRICS.append(("Tokens/sec/GPU", lambda r, m, tp=None: tp.get("tokens_per_second_per_gpu", 0) if tp else 0, "higher", True))
 
-    # Comm breakdown
-    COMPARE_METRICS.append(("Comm ratio", lambda r, m: r.get("comm_ratio", 0), "lower", True))
-    COMPARE_METRICS.append(("FSDP comm ratio", lambda r, m: sum(x.fsdp_comm_ratio for x in m) / max(len(m), 1), "lower", True))
-    COMPARE_METRICS.append(("TP comm ratio", lambda r, m: sum(x.tp_comm_ratio for x in m) / max(len(m), 1), "lower", True))
+    # Comm breakdown (total ratios — not per-layer averages)
+    COMPARE_METRICS.append(("Comm ratio", lambda r, m: (sum(x.ag_fwd_gpu + x.ag_bwd_gpu + x.rs_gpu + x.tp_total_gpu for x in m)) / max(sum(x.total_gpu + x.tp_total_gpu for x in m), 1), "lower", True))
+    COMPARE_METRICS.append(("FSDP comm ratio", lambda r, m: (sum(x.ag_fwd_gpu + x.ag_bwd_gpu + x.rs_gpu for x in m)) / max(sum(x.total_gpu + x.tp_total_gpu for x in m), 1), "lower", True))
+    COMPARE_METRICS.append(("TP comm ratio", lambda r, m: (sum(x.tp_total_gpu for x in m)) / max(sum(x.total_gpu + x.tp_total_gpu for x in m), 1), "lower", True))
 
     # Overlap & pipeline
     COMPARE_METRICS.append(("Pipeline overlap", lambda r, m: r.get("overlap_ratio", 0), "higher", True))
