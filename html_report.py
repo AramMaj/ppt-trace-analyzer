@@ -523,17 +523,22 @@ def _render_diagnostics_section(diag: dict, kstats: dict) -> str:
         opt_s = _format_us(kstats["opt_total_us"])
         avg_s = f"{kstats['avg_kernel_dur_us']:.1f}µs"
         bucket_rows = ""
+        step_total_k = 0
         if diag.get("kernel_dur_buckets"):
             buckets = diag["kernel_dur_buckets"]
-            total_k = sum(buckets.values())
+            step_total_k = sum(buckets.values())
+            total_k = step_total_k
             items = ", ".join(
                 f"{label}: <b>{buckets[label]:,}</b> ({buckets[label] / total_k:.1%})"
                 for label in ["<10us", "10-100us", "100us-1ms", "1-10ms", ">10ms"]
                 if buckets.get(label, 0) > 0
             )
             bucket_rows = f'<tr><td colspan="2" style="font-size:11px;padding-left:20px;color:#666">Kernel duration: {items}</td></tr>'
+        layer_label = f"GPU kernels (attributed to FSDP layers)</td><td>{kc:,}</td></tr>"
+        step_label = f"<tr><td>GPU kernels in profiler step</td><td>{step_total_k:,}</td></tr>" if step_total_k else ""
         parts.append(
-            f"<tr><td>Total GPU kernels</td><td>{kc:,}</td></tr>"
+            f"<tr><td>{layer_label}"
+            f"{step_label}"
             f"<tr><td>NCCL / compute / optimizer</td><td>{nccl_s} / {cmp_s} / {opt_s}</td></tr>"
             f"<tr><td>Avg kernel duration</td><td>{avg_s}</td></tr>"
             f"{bucket_rows}"
