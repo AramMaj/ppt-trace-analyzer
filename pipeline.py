@@ -32,10 +32,15 @@ def process_trace(trace_file: str, model_config=None):
         return None
 
     roots = parser.build_tree()
-    step_bounds = select_profiler_step(roots, parser)
-    step_start, step_end = step_bounds
+    # Attribute GPU kernels BEFORE filtering to the active step — GPU kernels for
+    # early layers' backward can finish hundreds of ms after the CPU ProfilerStep
+    # ends (pipelined execution).  Attributing against the full GPU event set
+    # ensures their ext-ID correlation succeeds even after the step-level filter
+    # discards the events themselves.
     parser.attribute_gpu_kernel_with_logical_operation(roots)
     parser.attribute_memory(roots)
+    step_bounds = select_profiler_step(roots, parser)
+    step_start, step_end = step_bounds
 
     detector = StandardFSDPDetector(gpu_events=parser.gpu_events)
     fsdp = detector.extract_fsdp_phases(roots)
