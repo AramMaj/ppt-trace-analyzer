@@ -117,21 +117,22 @@ def _comp_comm_chart_data(metrics_list: list, aggregated: dict) -> str:
 
 def _overlap_chart_data(metrics_list: list) -> str:
     labels = ["All-gather forward", "All-gather backward", "Reduce scatter"]
+    step_wall = max((m.step_wall for m in metrics_list if m.step_wall > 0), default=1)
     vals = []
-    for attr in ["ag_fwd_exposed_ratio", "ag_bwd_exposed_ratio", "rs_exposed_ratio"]:
-        vs = [getattr(m, attr) for m in metrics_list]
-        avg = sum(vs) / len(vs) if vs else 0
-        vals.append(round(avg * 100, 1))
+    for attr in ["ag_fwd_gpu", "ag_bwd_gpu", "rs_gpu"]:
+        times = [getattr(m, attr, 0) for m in metrics_list]
+        avg_time = sum(times) / len(times) if times else 0
+        vals.append(round(avg_time / step_wall * 100, 1))
     return json.dumps({"labels": labels, "values": vals})
 
 
 def _ctc_chart_data(metrics_list: list) -> str:
-    labels = [m.layer_name for m in metrics_list]
-    values = []
-    for m in metrics_list:
-        v = m.compute_to_comm_ratio
-        values.append(round(v, 2) if v != float('inf') else None)
-    return json.dumps({"labels": labels, "values": values})
+    pairs = [(m.layer_name, m.compute_to_comm_ratio) for m in metrics_list]
+    pairs = [(name, v) for name, v in pairs if v != float('inf')]
+    if not pairs:
+        return json.dumps({"labels": [], "values": []})
+    labels, values = zip(*pairs)
+    return json.dumps({"labels": list(labels), "values": [round(v, 2) for v in values]})
 
 
 def _phase_metrics_table(aggregated: dict, num_layers: int) -> str:

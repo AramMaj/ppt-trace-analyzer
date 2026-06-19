@@ -328,11 +328,10 @@
       barChart('compCommChart', DATA.compCommChart.labels, DATA.compCommChart.datasets, { legend: true, unitY: '\u00B5s' });
     }
     if (DATA.overlapChart) {
-      barChart('overlapChart', DATA.overlapChart.labels, [{ label: 'Share of wall span', data: DATA.overlapChart.values, backgroundColor: DATA.overlapChart.values.map(v => v >= 70 ? '#e15759' : v >= 30 ? '#f28e2b' : '#76b7b2') }], { legend: false, unitY: '%' });
+      barChart('overlapChart', DATA.overlapChart.labels, [{ label: 'Share of step wall', data: DATA.overlapChart.values, backgroundColor: DATA.overlapChart.values.map(v => v >= 20 ? '#e15759' : v >= 8 ? '#f28e2b' : '#76b7b2') }], { legend: false, unitY: '%' });
     }
     if (DATA.ctcChart) {
-      const vals = DATA.ctcChart.values.map(v => v === null ? 0 : v);
-      barChart('ctcChart', DATA.ctcChart.labels, [{ label: 'Compute-to-comm', data: vals, backgroundColor: vals.map(v => v >= 5 ? '#4e79a7' : v >= 2 ? '#76b7b2' : '#e15759') }], { legend: false, unitY: 'x' });
+      barChart('ctcChart', DATA.ctcChart.labels, [{ label: 'Compute-to-comm', data: DATA.ctcChart.values, backgroundColor: DATA.ctcChart.values.map(v => v >= 5 ? '#4e79a7' : v >= 2 ? '#76b7b2' : '#e15759') }], { legend: false, unitY: 'x' });
     }
     if (DATA.compare) {
       if (DATA.compare.keyMetrics) {

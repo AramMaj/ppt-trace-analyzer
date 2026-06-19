@@ -32,7 +32,7 @@
 
 <div class="section">
 <h2>Efficiency and Overlap</h2>
-<p style="font-size:11px;color:#888;margin-bottom:12px">Left: how much of the step wall each communication phase occupies (low = well hidden behind compute). Right: compute time per unit of communication time — higher means more compute relative to communication.</p>
+<p style="font-size:11px;color:#888;margin-bottom:12px">Left: average GPU time per layer for each FSDP communication phase, as a fraction of the total step wall. A smaller share means the phase's GPU work takes less of the step wall — well hidden behind compute. Right: compute time per unit of communication time per layer — higher means more compute relative to communication (layers with no communication are excluded).</p>
 <div class="chart-row">
   <div>
     <div class="chart-box"><canvas id="overlapChart"></canvas></div>
