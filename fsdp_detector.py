@@ -344,13 +344,19 @@ class StandardFSDPDetector:
             # Store in all_gather_bwd_nccl (separate from all_gather_bwd which
             # holds copy-out nodes) so the annotated trace's CPU phase spans
             # don't get polluted with the early-starting backward_prefetch range.
+            # Pick the latest backward_prefetch node to avoid accumulating GPU
+            # time from stale events across profiler steps.
+            prefetch_nodes = []
             for prefix in FSDP_PREFIXES:
                 prefetch_name = f'{prefix}backward_prefetch for {unit.layer_name}'
                 for n in self.all_nodes:
                     if n.name == prefetch_name:
-                        for ch in n.children:
-                            if _has_fsdp_prefix(ch.name) and 'all_gather' in ch.name and ch not in unit.all_gather_bwd_nccl:
-                                unit.all_gather_bwd_nccl.append(ch)
+                        prefetch_nodes.append(n)
+            if prefetch_nodes:
+                latest = max(prefetch_nodes, key=lambda n: n.start_time)
+                for ch in latest.children:
+                    if _has_fsdp_prefix(ch.name) and 'all_gather' in ch.name and ch not in unit.all_gather_bwd_nccl:
+                        unit.all_gather_bwd_nccl.append(ch)
 
     @staticmethod
     def _has_other_tids(all_nodes, profiler_tid):
