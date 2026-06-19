@@ -10,7 +10,7 @@ Six sections:
    compute-to-comm ratio, overlap efficiency, MFU/HFU, tokens/sec/GPU, etc.)
 6. Bottlenecks class — threshold-based detection of 16+ bottleneck types (compute-bound,
    comm-bound, copy-heavy all-gather, async TP overlap asymmetry, host-bound,
-   inter-node BW, HBM bandwidth, sync TP on critical path, NVLink saturation, etc.)
+    exposed all-gather, HBM bandwidth, sync TP on critical path, NVLink saturation, etc.)
 7. Report class — aggregation, formatting, JSON markers
 """
 
@@ -838,7 +838,7 @@ class Bottlenecks:
     OVERLAP_ASYMMETRY_DIFF = 0.40
     HOST_BOUND_RATIO = 3.0
     COPY_HEAVY_RATIO = 0.50
-    FWD_BWD_IMBALANCE = 0.30
+    FWD_BWD_IMBALANCE = 0.75
     SERIAL_RATIO_HIGH = 0.85
 
     # --- New FSDP2 communication bottleneck thresholds ---
@@ -852,7 +852,7 @@ class Bottlenecks:
     # RS GPU time ≥ 30% of backward compute GPU time → injection pressure.
     # Uses GPU-time ratio instead of overlap efficiency because async NCCL's
     # CPU_wall is just dispatch time, making overlap efficiency meaningless.
-    RS_INJECTION_RATIO = 0.30
+    RS_INJECTION_RATIO = 1.0
     # Synchronous TP: TP GPU time ≥ 10% of compute, but TP overlap < 0.20
     # (TP collectives block on critical path, defeating async TP)
     TP_ON_CRITICAL_PATH_RATIO = 0.10
@@ -1014,7 +1014,7 @@ class Bottlenecks:
         if metrics.fwd_cmp_gpu > 0:
             ag_exposed = metrics.ag_fwd_gpu / metrics.fwd_cmp_gpu
             if ag_exposed >= cls.AG_LATENCY_EXPOSED_RATIO:
-                issues.append(f"inter-node BW (AG={ag_exposed:.1%} of fwd compute)")
+                issues.append(f"exposed all-gather (AG={ag_exposed:.1%} of fwd compute)")
 
         # 8. HBM bandwidth bound
         # Low GPU utilisation despite a compute-heavy profile suggests the
@@ -1035,7 +1035,7 @@ class Bottlenecks:
         if metrics.bwd_cmp_gpu > 0:
             rs_injection = metrics.rs_gpu / metrics.bwd_cmp_gpu
             if rs_injection >= cls.RS_INJECTION_RATIO:
-                issues.append(f"RS injection pressure "
+                issues.append(f"RS exceeds bwd compute "
                               f"(RS={rs_injection:.1%} of bwd compute)")
 
         # 10. Synchronous TP on critical path
