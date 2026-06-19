@@ -1263,7 +1263,8 @@ class Report:
             lines.append(f"  {label:25s} {_format_us(avg):>10s} {pct:>13.1f}%")
         lines.append(f"  {'-----':25s} {'---':>10s} {'------------':>14s}")
         lines.append(f"  {'FSDP total':25s} {_format_us(total_gpu):>10s}")
-        lines.append(f"  {'TP total':25s} {_format_us(tp_total):>10s} {100.0:>13.1f}%")
+        total_with_tp = total_gpu + tp_total
+        lines.append(f"  {'TP total':25s} {_format_us(tp_total):>10s} {tp_total / total_with_tp * 100:>13.1f}%" if total_with_tp > 0 else f"  {'TP total':25s} {_format_us(tp_total):>10s} {'N/A':>13s}")
         lines.append(f"  {'Total CPU (dispatch)':25s} {_format_us(self.aggregated.get('total_cpu_us', 0)):>10s}")
         lines.append("")
 
@@ -1285,10 +1286,9 @@ class Report:
         tp_total = self.aggregated.get("tp_total_gpu_us", 0)
         fsdp_comm = self.aggregated.get("ag_fwd_gpu_us", 0) + self.aggregated.get("ag_bwd_gpu_us", 0) + self.aggregated.get("rs_gpu_us", 0)
         opt_ratio = self.aggregated.get('optimizer_ratio', 0)
-        true_comp = comp_gpu - tp_total
         total = total_gpu + tp_total
         if total > 0:
-            lines.append(f"  True compute:         {true_comp / total:.1%} (ex-TP)")
+            lines.append(f"  Compute time:         {comp_gpu / total:.1%}")
             lines.append(f"  TP communication:     {tp_total / total:.1%}")
             lines.append(f"  FSDP communication:   {fsdp_comm / total:.1%}")
         else:

@@ -106,12 +106,11 @@ def _busy_chart_data(metrics_list: list) -> str:
 
 def _comp_comm_chart_data(metrics_list: list, aggregated: dict) -> str:
     labels = [m.layer_name for m in metrics_list]
-    tp_total = aggregated.get("tp_total_gpu_us", 0) / max(len(metrics_list), 1)
     datasets = [
         {"label": "Forward compute", "data": [round(m.fwd_cmp_gpu, 1) for m in metrics_list], "backgroundColor": COLORS['fwd_cmp']},
         {"label": "Backward compute", "data": [round(m.bwd_cmp_gpu, 1) for m in metrics_list], "backgroundColor": COLORS['bwd_cmp']},
         {"label": "FSDP comm", "data": [round(m.ag_fwd_gpu + m.ag_bwd_gpu + m.rs_gpu, 1) for m in metrics_list], "backgroundColor": COLORS['ag']},
-        {"label": "TP comm", "data": [round(tp_total, 1) for _ in metrics_list], "backgroundColor": COLORS['tp_ag']},
+        {"label": "TP comm", "data": [round(m.tp_total_gpu, 1) for m in metrics_list], "backgroundColor": COLORS['tp_ag']},
     ]
     return json.dumps({"labels": labels, "datasets": datasets})
 
@@ -159,7 +158,7 @@ def _phase_metrics_table(aggregated: dict, num_layers: int) -> str:
         rows += f"<tr><td><span class='legend-dot' style='background:{color}'></span> {label}</td><td>{_format_us(avg)}</td><td>{pct:.1f}%</td></tr>\n"
 
     rows += f"<tr style='border-top:1px solid #ccc'><td><strong>Fully sharded data parallelism (FSDP) total</strong></td><td>{_format_us(total_gpu)}</td><td></td></tr>\n"
-    rows += f"<tr><td><strong>Tensor parallelism (TP) total</strong></td><td>{_format_us(tp_total)}</td><td>100.0%</td></tr>\n"
+    rows += f"<tr><td><strong>Tensor parallelism (TP) total</strong></td><td>{_format_us(tp_total)}</td><td>{tp_total / total * 100:.1f}%</td></tr>\n"
     rows += f"<tr><td>Total CPU dispatch time</td><td>{_format_us(aggregated.get('total_cpu_us', 0))}</td><td></td></tr>\n"
 
     return f"""<p style="font-size:11px;color:#888;margin-bottom:8px">Average GPU time per layer per phase, and its share of all GPU cycles. Lower is better for communication phases; compute phases should dominate.</p>
@@ -174,7 +173,7 @@ def _efficiency_table(aggregated: dict, metrics_list: list) -> str:
     tp_total = aggregated.get("tp_total_gpu_us", 0)
     fsdp_comm = aggregated.get("ag_fwd_gpu_us", 0) + aggregated.get("ag_bwd_gpu_us", 0) + aggregated.get("rs_gpu_us", 0)
     comp = aggregated.get("fwd_cmp_gpu_us", 0) + aggregated.get("bwd_cmp_gpu_us", 0)
-    true_comp = comp - tp_total
+    true_comp = comp
     avg_util = sum(m.gpu_busy for m in metrics_list) / len(metrics_list) if metrics_list else 0
     avg_ctc = sum(m.compute_to_comm_ratio for m in metrics_list) / len(metrics_list) if metrics_list else 0
     max_span = max(m.layer_span for m in metrics_list) if metrics_list else 0
@@ -191,7 +190,7 @@ def _efficiency_table(aggregated: dict, metrics_list: list) -> str:
     return f"""<p style="font-size:11px;color:#888;margin-bottom:8px">Breakdown of GPU cycles and pipeline efficiency. Compute should dominate; a high communication share (&gt;40%) suggests communication-bound performance.</p>
 <table>
 <tr><th>Metric</th><th>Value</th><th>Interpretation</th></tr>
-<tr><td>True compute (excluding tensor parallelism)</td><td>{true_comp / total:.1%}</td><td>Share of GPU cycles on actual arithmetic (attention, MLP). Higher is better</td></tr>
+<tr><td>Compute time (attention, MLP)</td><td>{true_comp / total:.1%}</td><td>Share of GPU cycles on actual arithmetic (attention, MLP). Higher is better</td></tr>
 <tr><td>Fully sharded data parallelism (FSDP) communication</td><td>{fsdp_comm / total:.1%}</td><td>Share on NCCL all-gather / reduce-scatter collectives. Lower is better</td></tr>
 <tr><td>Tensor parallelism (TP) communication</td><td>{tp_total / total:.1%}</td><td>Share on TP all-gather / all-reduce / reduce-scatter. Lower is better</td></tr>
 <tr><td>Optimizer step</td><td>{aggregated.get('optimizer_ratio', 0):.1%}</td><td>Share on ADAMW parameter update. Should be &lt;10% with fused optimizer</td></tr>
@@ -388,7 +387,7 @@ def _trace_step_diagnostics(trace_file: str) -> dict:
         dur = ev.get("dur", 0)
 
         # Kernel duration bucketing (skip ProfilerStep markers)
-        if dur > 0 and cat and cat.startswith("gpu") and ph == "X" and not name.startswith("ProfilerStep#"):
+        if dur > 0 and cat and (cat.startswith("gpu") or cat == "kernel") and ph == "X" and not name.startswith("ProfilerStep#"):
             if dur < 10:
                 kernel_dur_buckets["<10us"] += 1
             elif dur < 100:
