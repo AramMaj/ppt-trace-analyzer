@@ -30,7 +30,7 @@ PPT_PID_BASE = 9999
 PPT_CAT = "ppt_analyzer"
 TID_BLOCK = 200  # Fallback block size when tid_offset is not provided
 
-PHASE_LABELS = ["AG fwd", "Fwd cmp", "AG bwd", "Bwd AG", "Bwd cmp", "RS",
+PHASE_LABELS = ["AG fwd", "Fwd cmp", "AG bwd", "Bwd cmp", "RS",
                 "Pre-fwd AG", "Prefetch AG", "Trailing RS"]
 
 
@@ -297,7 +297,6 @@ def _get_gpu_kernel_spans(unit, ac2g_layer_spans=None):
         ("AG fwd", unit.all_gather_fwd, 'nccl'),
         ("Fwd cmp", unit.fwd_compute, 'compute'),
         ("AG bwd", unit.all_gather_bwd, 'child'),
-        ("Bwd AG", unit.bwd_compute, 'nccl_from_nodes'),
         ("Bwd cmp", unit.bwd_compute, 'compute'),
         ("RS", unit.reduce_scatter, 'nccl'),
     ]:
@@ -326,6 +325,23 @@ def _get_gpu_kernel_spans(unit, ac2g_layer_spans=None):
                 if label == "AG bwd":
                     phases[i] = (label, min(start, nccl_start), max(end, nccl_end), nodes)
                     break
+
+    # Also merge NCCL all-gather kernels found inside bwd_compute into AG bwd.
+    # For the last FSDP layer the backward-prefetch all-gather NCCL kernel lives
+    # inside bwd_compute's kernel tree rather than under a dedicated
+    # backward_prefetch node, so this step picks it up.
+    bwd_nccl_spans = _gpu_kernel_span(unit.bwd_compute, 'nccl_from_nodes')
+    if bwd_nccl_spans is not None:
+        bwd_nccl_start, bwd_nccl_end = bwd_nccl_spans
+        found = False
+        for i, (label, start, end, nodes) in enumerate(phases):
+            if label == "AG bwd":
+                phases[i] = (label, min(start, bwd_nccl_start), max(end, bwd_nccl_end), nodes)
+                found = True
+                break
+        if not found:
+            # Last layer: no AG bwd yet — create one from bwd_compute NCCL kernels
+            phases.append(("AG bwd", bwd_nccl_start, bwd_nccl_end, unit.bwd_compute))
     return phases
 
 

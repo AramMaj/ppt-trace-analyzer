@@ -44,6 +44,25 @@ def _collect_gpu_kernels(nodes):
     return kernels
 
 
+def _collect_nccl_kernel_time(nodes):
+    """DFS-sum of NCCL GPU kernel durations from *nodes* and their subtrees.
+
+    Only kernels with ``'nccl'`` in their name are counted.
+    ``gpu_duration`` is not reused because it includes child compute kernels;
+    we need raw NCCL direct-GPU-kernel durations for re-attribution between
+    backward compute and all-gather phases.
+    """
+    total = 0.0
+    stack = list(nodes)
+    while stack:
+        n = stack.pop()
+        for gpu in (n.direct_gpu_kernels or []):
+            if 'nccl' in gpu.get('name', '').lower():
+                total += gpu.get('dur', 0)
+        stack.extend(n.children)
+    return total
+
+
 def _classify_kernel(name: str) -> str:
     """Substring-based classification: ``nccl`` / ``copy`` / ``compute``.
     NCCL patterns checked first to avoid false-positive "copy" classification on NCCL names.
@@ -448,7 +467,8 @@ class Metrics:
 
         self.ag_bwd_gpu = (_phase_gpu_time(unit.all_gather_bwd)
                            + _phase_gpu_time(unit.all_gather_bwd_nccl)
-                           + unit.ag_bwd_supplement_us)
+                           + unit.ag_bwd_supplement_us
+                           + _collect_nccl_kernel_time(unit.bwd_compute))
         self.ag_bwd_cpu = (_phase_cpu_time(unit.all_gather_bwd)
                            + _phase_cpu_time(unit.all_gather_bwd_nccl))
         self.ag_bwd_wall = _phase_wall_time(
