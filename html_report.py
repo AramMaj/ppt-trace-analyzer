@@ -264,10 +264,11 @@ def _per_unit_table(metrics_list: list) -> str:
             mem_str = "N/A"
         tags = ""
         if issues:
-            for i, iss in enumerate(issues):
-                if i > 0:
-                    tags += ", "
-                tags += f'<span class="tag">{iss.split("(")[0].strip()}</span>'
+            short_names = [iss.split("(")[0].strip() for iss in issues]
+            detail = ", ".join(short_names)
+            count = len(short_names)
+            severity = "tag-high" if count >= 5 else ("tag-med" if count >= 3 else "tag-low")
+            tags = f'<span class="tag {severity}" title="{detail}">({count})</span>'
         else:
             tags = '<span class="tag tag-ok">OK</span>'
 
