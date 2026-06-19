@@ -311,6 +311,12 @@
       new Chart(ctx, { type: 'doughnut', data: { labels, datasets: [{ data: values, backgroundColor: colors, borderWidth: 1, borderColor: '#fff' }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'right', labels: { boxWidth: 10, padding: 6, font: { size: 11 } } } } } });
     }
 
+    function lineChart(id, labels, datasets, opts) {
+      const ctx = document.getElementById(id);
+      if (!ctx) return;
+      new Chart(ctx, { type: 'line', data: { labels, datasets }, options: { responsive: true, maintainAspectRatio: false, scales: { x: { grid: { display: false }, ticks: { font: { size: 9 } } }, y: { beginAtZero: true, grid: { color: '#eee', drawBorder: false }, ticks: { font: { size: 10 }, callback: function(value) { return value + (opts?.unitY || ''); } } } }, plugins: { legend: { display: !!opts?.legend, position: 'bottom', labels: { boxWidth: 10, padding: 6, font: { size: 10 } } } } } });
+    }
+
     function barChart(id, labels, datasets, opts) {
       const ctx = document.getElementById(id);
       if (!ctx) return;
@@ -328,7 +334,7 @@
       barChart('compCommChart', DATA.compCommChart.labels, DATA.compCommChart.datasets, { legend: true, unitY: '\u00B5s' });
     }
     if (DATA.overlapChart) {
-      barChart('overlapChart', DATA.overlapChart.labels, [{ label: 'Share of step wall', data: DATA.overlapChart.values, backgroundColor: DATA.overlapChart.values.map(v => v >= 20 ? '#e15759' : v >= 8 ? '#f28e2b' : '#76b7b2') }], { legend: false, unitY: '%' });
+      lineChart('overlapChart', DATA.overlapChart.labels, DATA.overlapChart.datasets.map(ds => ({ label: ds.label, data: ds.data, borderColor: ds.borderColor, backgroundColor: ds.borderColor, pointRadius: 2, pointHoverRadius: 4, tension: 0.2, fill: false })), { legend: true, unitY: '\u00B5s' });
     }
     if (DATA.ctcChart) {
       barChart('ctcChart', DATA.ctcChart.labels, [{ label: 'Compute-to-comm', data: DATA.ctcChart.values, backgroundColor: DATA.ctcChart.values.map(v => v >= 5 ? '#4e79a7' : v >= 2 ? '#76b7b2' : '#e15759') }], { legend: false, unitY: 'x' });

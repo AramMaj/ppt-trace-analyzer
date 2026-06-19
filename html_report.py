@@ -116,14 +116,18 @@ def _comp_comm_chart_data(metrics_list: list, aggregated: dict) -> str:
 
 
 def _overlap_chart_data(metrics_list: list) -> str:
-    labels = ["All-gather forward", "All-gather backward", "Reduce scatter"]
-    step_wall = max((m.step_wall for m in metrics_list if m.step_wall > 0), default=1)
-    vals = []
-    for attr in ["ag_fwd_gpu", "ag_bwd_gpu", "rs_gpu"]:
-        times = [getattr(m, attr, 0) for m in metrics_list]
-        avg_time = sum(times) / len(times) if times else 0
-        vals.append(round(avg_time / step_wall * 100, 1))
-    return json.dumps({"labels": labels, "values": vals})
+    labels = [m.layer_name for m in metrics_list]
+    fwd_vals = [round(m.ag_fwd_gpu, 1) for m in metrics_list]
+    bwd_vals = [round(m.ag_bwd_gpu, 1) for m in metrics_list]
+    rs_vals = [round(m.rs_gpu, 1) for m in metrics_list]
+    return json.dumps({
+        "labels": labels,
+        "datasets": [
+            {"label": "AG forward", "data": fwd_vals, "backgroundColor": "#76b7b2", "borderColor": "#76b7b2"},
+            {"label": "AG backward", "data": bwd_vals, "backgroundColor": "#e15759", "borderColor": "#e15759"},
+            {"label": "Reduce scatter", "data": rs_vals, "backgroundColor": "#f28e2b", "borderColor": "#f28e2b"},
+        ]
+    })
 
 
 def _ctc_chart_data(metrics_list: list) -> str:
