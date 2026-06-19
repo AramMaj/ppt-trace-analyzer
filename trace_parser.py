@@ -72,39 +72,7 @@ class LogicalOperation:
     direct_gpu_kernels: List[dict] = field(default_factory=list)
     raw_event: Optional[Dict[str, Any]] = None
 
-    @property
-    def total_time(self) -> float:
-        """Rough upper bound: whichever is larger between CPU dispatch and GPU execution.
-        For a CPU-bound ``aten::empty`` this is the CPU duration; for a fused NVIDIA
-        kernel launched by the backward stream thread it's the GPU duration.
-        """
-        return max(self.cpu_duration, self.gpu_duration)
 
-    @property
-    def exclusive_cpu(self) -> float:
-        """CPU dispatch time attributed to this op alone (children subtracted).
-        For ``aten::linear`` under an FSDP ``fwd_compute``, this excludes the
-        sub-operation dispatch overhead — what the GEMM itself costs on the CPU side.
-        """
-        return self.cpu_duration - sum(c.cpu_duration for c in self.children)
-
-    @property
-    def exclusive_gpu(self) -> float:
-        """GPU kernel time attributed solely to this node — no children included.
-        After external-ID attribution, a node like ``all_gather_copy_out`` carries
-        its split/memcpy GPU kernels here; the NCCL all-gather sibling is separate.
-        """
-        return self.gpu_duration - sum(c.gpu_duration for c in self.children)
-
-    @property
-    def gpu_utilization(self) -> float:
-        """GPU busy-fraction vs CPU wall (capped at 1.0).
-        Sub-0.2 is diagnostic of a host-bound layer where NCCL synchronisation or
-        CUDA malloc dominates wall time — a common FSDP2 bottleneck on the 8B trace.
-        """
-        if self.cpu_duration > 0:
-            return min(1.0, self.gpu_duration / self.cpu_duration)
-        return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -469,12 +437,5 @@ class AsyncDependencyResolver:
         for ev in all_events:
             self.process_event(ev)
 
-    def get_parent_from_async_only(self, gpu_event: Dict) -> Optional[Dict]:
-        """Find the async-start event whose interval contains this GPU event's timestamp."""
-        ts = gpu_event.get('ts', 0)
-        for start_ev, _ in self.dependencies:
-            interval = start_ev.get('_async_interval')
-            if interval and interval[0] <= ts <= interval[1]:
-                return start_ev
-        return None
+
 

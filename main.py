@@ -24,7 +24,7 @@ from trace_parser import TraceParser
 from fsdp_detector import StandardFSDPDetector
 from bottleneck_detector import Report
 
-from pipeline import process_trace, select_profiler_step, sanitize_optimizer
+from pipeline import select_profiler_step, sanitize_optimizer
 from timeline import print_timeline
 from comparison import compare_traces
 
@@ -157,9 +157,9 @@ def main():
         if not parser.load():
             sys.exit(1)
         roots = parser.build_tree()
-        step_start, step_end = select_profiler_step(roots, parser)
         parser.attribute_gpu_kernel_with_logical_operation(roots)
         parser.attribute_memory(roots)
+        step_start, step_end = select_profiler_step(roots, parser)
         detector = StandardFSDPDetector(gpu_events=parser.gpu_events)
         fsdp = detector.extract_fsdp_phases(roots)
         sanitize_optimizer(fsdp, step_start, step_end)
@@ -239,9 +239,13 @@ def main():
     print(f"Loaded {len(parser.cpu_events)} CPU, {len(parser.gpu_events)} GPU, {len(parser.memory_events)} memory events.")
 
     roots = parser.build_tree()
-    step_start, step_end = select_profiler_step(roots, parser)
+    # Attribute GPU kernels BEFORE step filtering — GPU kernels for early layers'
+    # backward can finish hundreds of ms after the CPU ProfilerStep ends (pipelined
+    # execution). Attributing against the full GPU event set ensures their ext-ID
+    # correlation succeeds even after step-level filtering discards the events.
     parser.attribute_gpu_kernel_with_logical_operation(roots)
     parser.attribute_memory(roots)
+    step_start, step_end = select_profiler_step(roots, parser)
 
     detector = StandardFSDPDetector(gpu_events=parser.gpu_events)
     fsdp = detector.extract_fsdp_phases(roots)

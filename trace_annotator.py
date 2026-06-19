@@ -30,21 +30,7 @@ PPT_PID_BASE = 9999
 PPT_CAT = "ppt_analyzer"
 TID_BLOCK = 200  # Fallback block size when tid_offset is not provided
 
-PHASE_COLORS = {
-    "AG fwd": "#4CAF50",
-    "Fwd cmp": "#2196F3",
-    "AG bwd": "#FF9800",
-    "Bwd AG": "#E91E63",
-    "Bwd cmp": "#F44336",
-    "RS": "#9C27B0",
-    "Pre-fwd AG": "#795548",
-    "Prefetch AG": "#00BCD4",
-    "Trailing RS": "#607D8B",
-    "Optimizer": "#607D8B",
-    "TP": "#FFEB3B",
-}
-
-PHASE_LABELS = ["AG fwd", "Fwd cmp", "AG bwd", "Bwd AG", "Bwd cmp", "RS",
+PHASE_LABELS = ["AG fwd", "Fwd cmp", "AG bwd", "Bwd cmp", "RS",
                 "Pre-fwd AG", "Prefetch AG", "Trailing RS"]
 
 
@@ -311,7 +297,6 @@ def _get_gpu_kernel_spans(unit, ac2g_layer_spans=None):
         ("AG fwd", unit.all_gather_fwd, 'nccl'),
         ("Fwd cmp", unit.fwd_compute, 'compute'),
         ("AG bwd", unit.all_gather_bwd, 'child'),
-        ("Bwd AG", unit.bwd_compute, 'nccl_from_nodes'),
         ("Bwd cmp", unit.bwd_compute, 'compute'),
         ("RS", unit.reduce_scatter, 'nccl'),
     ]:
@@ -325,6 +310,38 @@ def _get_gpu_kernel_spans(unit, ac2g_layer_spans=None):
                 span = (ac2g_start, ac2g_end)
         if span is not None:
             phases.append((label, span[0], span[1], node_list))
+
+    # Merge NCCL AG bwd GPU spans from backward_prefetch nodes into the AG bwd
+    # GPU phase bar so the annotated trace shows the full all-gather time
+    # (NCCL kernel + copy-out), not just the copy-out.
+    if unit.all_gather_bwd_nccl:
+        nccl_spans = []
+        for n in unit.all_gather_bwd_nccl:
+            nccl_spans.extend(_collect_nccl_gpu_spans(n))
+        if nccl_spans:
+            nccl_start = min(s for s, _ in nccl_spans)
+            nccl_end = max(e for _, e in nccl_spans)
+            for i, (label, start, end, nodes) in enumerate(phases):
+                if label == "AG bwd":
+                    phases[i] = (label, min(start, nccl_start), max(end, nccl_end), nodes)
+                    break
+
+    # Also merge NCCL all-gather kernels found inside bwd_compute into AG bwd.
+    # For the last FSDP layer the backward-prefetch all-gather NCCL kernel lives
+    # inside bwd_compute's kernel tree rather than under a dedicated
+    # backward_prefetch node, so this step picks it up.
+    bwd_nccl_spans = _gpu_kernel_span(unit.bwd_compute, 'nccl_from_nodes')
+    if bwd_nccl_spans is not None:
+        bwd_nccl_start, bwd_nccl_end = bwd_nccl_spans
+        found = False
+        for i, (label, start, end, nodes) in enumerate(phases):
+            if label == "AG bwd":
+                phases[i] = (label, min(start, bwd_nccl_start), max(end, bwd_nccl_end), nodes)
+                found = True
+                break
+        if not found:
+            # Last layer: no AG bwd yet — create one from bwd_compute NCCL kernels
+            phases.append(("AG bwd", bwd_nccl_start, bwd_nccl_end, unit.bwd_compute))
     return phases
 
 
@@ -355,8 +372,8 @@ def _get_unattributed_gpu_spans(fsdp, roots):
             for ch in node.children:
                 _walk(ch)
         for u in fsdp.units:
-            for lst in (u.all_gather_fwd, u.all_gather_bwd, u.reduce_scatter,
-                        u.fwd_compute, u.bwd_compute):
+            for lst in (u.all_gather_fwd, u.all_gather_bwd, u.all_gather_bwd_nccl,
+                        u.reduce_scatter, u.fwd_compute, u.bwd_compute):
                 for n in lst:
                     _walk(n)
         return exts
@@ -539,6 +556,26 @@ def _prune_roots_for_step(roots, step_name, step_start, step_end):
 # Step-level analysis
 # ---------------------------------------------------------------------------
 
+
+def _resolve_gpu_filter_end(parser, step_name, default_end):
+    """Return the end time of the GPU-profile ProfilerStep (``gpu_user_annotation``
+    category) for *step_name*, falling back to *default_end* when absent.
+
+    The GPU-profile step typically extends 600-800 ms beyond the CPU-profile
+    step (``user_annotation`` / ``cpu_op`` category).  Using the CPU step
+    boundary for GPU event filtering clips valid GPU events for layers that
+    finish backward last (layers 0‑N in forward order), producing the
+    illusion that early layers have no backward GPU phases.
+    """
+    for ev in parser.all_events:
+        cat = ev.get('cat', '')
+        name = ev.get('name', '')
+        ph = ev.get('ph', '')
+        if cat == 'gpu_user_annotation' and name == step_name and ph == 'X':
+            return ev['ts'] + ev['dur']
+    return default_end
+
+
 def _analyze_step(
     trace_file: str,
     step_name: str,
@@ -558,7 +595,10 @@ def _analyze_step(
     if not parser.load():
         return None, None, None
 
-    _filter_gpu_events(parser, step_start, step_end)
+    # Extend GPU filtering window to cover gpu_user_annotation ProfilerStep
+    # (the GPU profile typically extends ~600-800 ms beyond the CPU profile).
+    gpu_filter_end = _resolve_gpu_filter_end(parser, step_name, step_end)
+    _filter_gpu_events(parser, step_start, gpu_filter_end)
     roots = parser.build_tree()
     roots = _prune_roots_for_step(roots, step_name, step_start, step_end)
     parser.attribute_gpu_kernel_with_logical_operation(roots)
@@ -590,7 +630,7 @@ def _analyze_step(
 # Cross-step annotation generation (one TID per layer, steps go right)
 # ---------------------------------------------------------------------------
 
-def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0,
+def annotate_trace(trace_file: str, output_file: str,
                    model_config: Optional[ModelConfig] = None):
     """Analyse each ProfilerStep and append phase/flow/counter/bottleneck events
     to the Chrome Trace JSON.  All steps share PID=9999; each layer gets its
@@ -633,9 +673,6 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0,
         print("  No ProfilerStep markers found, annotating full trace as one step.")
     else:
         print(f"  Found {len(steps)} ProfilerStep(s)")
-
-    if max_steps and max_steps < len(steps):
-        steps = steps[-max_steps:]
 
     # 3a. Build ac2g-based all-gather copy-out GPU spans (across all steps)
     raw_events = trace_json.get("traceEvents", [])
@@ -707,7 +744,6 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0,
                         "num_nodes": len(nodes),
                         "step": step_name,
                     },
-                    "cname": PHASE_COLORS.get(label, "#888"),
                 })
 
                 # Flow arrow: phase transition within the same step
@@ -752,7 +788,6 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0,
                         "cpu_us": round(opt_node.cpu_duration, 1),
                         "step": step_name,
                     },
-                    "cname": PHASE_COLORS["Optimizer"],
                 })
 
     # -- TP collectives thread (all steps merged) -------------------------
@@ -786,7 +821,6 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0,
                     "gpu_us": round(k.get("dur", 0), 1),
                     "step": k.get("_step", ""),
                 },
-                "cname": PHASE_COLORS["TP"],
             })
 
     # -- GPU activity counter (all layers, all steps) ---------------------
@@ -816,12 +850,21 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0,
             })
             active += delta
 
-    # -- GPU phase thread (GPU domain — overlaps GPU kernel events) --------
+    # -- GPU phase threads (GPU domain — overlaps GPU kernel events) --------
+    # One TID per layer + one for unattributed spans, so phases from
+    # different layers don't overlap on the same timeline.
     gpu_comp_tid = max_layers + 5
+    for layer_idx in range(max_layers):
+        annotations.append({
+            "ph": "M", "pid": pid, "tid": gpu_comp_tid + layer_idx,
+            "name": "thread_name",
+            "args": {"name": f"GPU phases (Layer {layer_idx})"},
+        })
+    gpu_extra_tid = gpu_comp_tid + max_layers
     annotations.append({
-        "ph": "M", "pid": pid, "tid": gpu_comp_tid,
+        "ph": "M", "pid": pid, "tid": gpu_extra_tid,
         "name": "thread_name",
-        "args": {"name": "GPU phases (all steps)"},
+        "args": {"name": "GPU phases (unattributed)"},
     })
     for step_idx, (step_name, fsdp, _, roots) in enumerate(step_analyses):
         step_ac2g = _filter_ac2g_spans_by_step(ac2g_layer_spans, step_idx, len(step_analyses))
@@ -831,7 +874,7 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0,
                 gpu_dur = _phase_gpu_time(nodes)
                 ac2g_us = _total_ac2g_kernel_us(unit.layer_name, step_ac2g) if label == "AG bwd" else 0
                 annotations.append({
-                    "ph": "X", "pid": pid, "tid": gpu_comp_tid,
+                    "ph": "X", "pid": pid, "tid": gpu_comp_tid + layer_idx,
                     "ts": start, "dur": end - start,
                     "cat": PPT_CAT,
                     "name": f"{label} ({step_name}, Layer {layer_idx})",
@@ -844,13 +887,12 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0,
                         "step": step_name,
                         "domain": "gpu",
                     },
-                    "cname": PHASE_COLORS.get(label, "#888"),
                 })
 
         # Cross-unit / unattributed phase bars
         for label, start, end in _get_unattributed_gpu_spans(fsdp, roots):
             annotations.append({
-                "ph": "X", "pid": pid, "tid": gpu_comp_tid,
+                "ph": "X", "pid": pid, "tid": gpu_extra_tid,
                 "ts": start, "dur": end - start,
                 "cat": PPT_CAT,
                 "name": f"{label} ({step_name})",
@@ -863,7 +905,6 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0,
                     "step": step_name,
                     "domain": "gpu",
                 },
-                "cname": PHASE_COLORS.get(label, "#888"),
             })
 
     # -- Bottleneck markers (all steps merged) ----------------------------
@@ -901,16 +942,16 @@ def annotate_trace(trace_file: str, output_file: str, max_steps: int = 0,
                     "issues_full": "; ".join(issues),
                     "comm_ratio": round(metric.comm_ratio, 3),
                     "comp_ratio": round(metric.comp_ratio, 3),
-                    "gpu_util": round(metric.gpu_util, 3),
+                    "gpu_busy": round(metric.gpu_busy, 3),
                     "comm_ratio_pct": f"{metric.comm_ratio:.1%}",
                     "comp_ratio_pct": f"{metric.comp_ratio:.1%}",
                     "compute_to_comm": ctc_str,
-                    "exposed_comm": round(metric.exposed_comm_fraction, 3),
-                    "ag_overlap_eff": round(metric.ag_fwd_overlap_efficiency, 3),
-                    "rs_overlap_eff": round(metric.rs_overlap_efficiency, 3),
+                    "exposed_comm": round(metric.avg_exposed_ratio, 3),
+                    "ag_overlap_eff": round(metric.ag_fwd_exposed_ratio, 3),
+                    "rs_overlap_eff": round(metric.rs_exposed_ratio, 3),
                     "step": step_name,
                 },
-                "s": "t", "cname": "#FF5722",
+                "s": "t",
             })
 
     # 4. Merge and write

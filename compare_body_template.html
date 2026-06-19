@@ -1,24 +1,39 @@
 <h1>{{TITLE}}</h1>
-<p class="subtitle">{{FILES}} &mdash; Color coding compares against <strong>{{BASELINE}}</strong></p>
+<p class="subtitle">{{FILES}} &mdash; Color coding compares against <strong>{{BASELINE}}</strong>. Green = better, red = worse.</p>
 <div class="trace-tabs">
     {{TRACE_TABS}}
 </div>
+{{VERDICT_CARD}}
+
+{{CONSISTENCY_WARNINGS}}
 
 <div class="cmp-grid">{{SUMMARY_CARDS}}</div>
 
 <div class="section">
     <h2>Key Metrics Comparison</h2>
+    <p style="font-size:11px;color:#888;margin-bottom:12px">High-level utilization, overlap, communication share, and exposed communication ratio across traces. All values in percent.</p>
     <div class="chart-box tall"><canvas id="cmpKeyMetrics"></canvas></div>
 </div>
 
 <div class="section">
-    <h2>Phase Times (ms)</h2>
-    <div class="chart-box tall"><canvas id="cmpPhaseTimes"></canvas></div>
+    <h2>Phase Times</h2>
+    <p style="font-size:11px;color:#888;margin-bottom:12px">Average GPU time per layer per phase, in milliseconds. Compute and communication shown separately so scales don't obscure each other.</p>
+    <div class="comp-row">
+        <div class="comp-col">
+            <h3>Compute</h3>
+            <div class="chart-box"><canvas id="cmpPhaseTimes"></canvas></div>
+        </div>
+        <div class="comp-col">
+            <h3>Communication</h3>
+            <div class="chart-box"><canvas id="cmpPhaseTimesComm"></canvas></div>
+        </div>
+    </div>
 </div>
 
 <div class="comp-row">
     <div class="comp-col">
         <h3>Communication Ratios</h3>
+        <p style="font-size:11px;color:#888;margin-bottom:8px">Share of GPU cycles consumed by communication (all-gather, reduce-scatter, all-reduce). Lower is better.</p>
         <div class="chart-box"><canvas id="cmpCommRatios"></canvas></div>
     </div>
     {{MFU_CHART}}
@@ -30,14 +45,17 @@
         <span class="cmp-better" style="padding:2px 8px;margin-right:12px">Better than
             {{BASELINE}}</span>
         <span class="cmp-worse" style="padding:2px 8px">Worse than {{BASELINE}}</span>
+        &mdash; blank cells = N/A
     </p>
     <div class="table-wrap">
         <table class="cmp-table">{{TABLE_HEAD}}{{TABLE_ROWS}}</table>
     </div>
+    {{KEY_DIFFERENCES}}
 </div>
 
 <div class="section">
     <h2>Bottleneck Profile by Trace</h2>
+    <p style="font-size:11px;color:#888;margin-bottom:8px">Prevalent bottleneck types per trace and the fraction of layers affected. Bottlenecks affecting &ge;50% of layers (in red) should be investigated first.</p>
     {{BOTTLENECK_LEGEND}}
     <div class="comp-row">{{BOTTLENECK_SECTIONS}}</div>
 </div>

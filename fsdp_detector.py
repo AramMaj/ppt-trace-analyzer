@@ -27,7 +27,8 @@ CUDA stream thread (tid=24759) than forward (tid=24529), forward compute
 scans only the profiler thread and backward compute filters it out.
 """
 
-from typing import Dict, List, Optional, Tuple, Set, Iterator, Any
+from copy import deepcopy
+from typing import Iterator, List, Optional, Tuple
 
 from trace_parser import LogicalOperation, TraceParserHelper
 
@@ -79,6 +80,33 @@ def _has_fsdp_prefix(name: str) -> bool:
     return name.startswith(FSDP_PREFIXES)
 
 
+_COMM_NAMES = {
+    '_c10d_functional::all_gather_into_tensor',
+    '_c10d_functional::reduce_scatter_tensor',
+    '_c10d_functional::all_reduce',
+    '_c10d_functional::wait_tensor',
+    'c10d::allgather_into_tensor_coalesced_',
+    'c10d::reduce_scatter_tensor_coalesced_',
+    'c10d::allreduce_',
+    'c10d::_allgather_base_',
+    'c10d::_reduce_scatter_base_',
+    'record_param_comms',
+    'fsdp::all_gather_copy_in',
+    'Redistribute',
+    'RedistributeBackward',
+    'autograd::engine::evaluate_function: RedistributeBackward',
+    'NestedRedistribute',
+}
+
+
+def _is_comm_node(name: str) -> bool:
+    """Match communication operations (c10d, FSDP2 record_param, etc.) that
+    should be excluded from fwd_compute / bwd_compute phase attribution so
+    their GPU kernel time is not double-counted as compute.
+    """
+    return name in _COMM_NAMES
+
+
 def _fsdp_phase_name(phase: str, layer: str = '') -> List[str]:
     """Return both ``FSDP::`` and ``FullyShardedDataParallel::`` variants of a phase name
     (e.g. ``['FSDP::pre_forward (layers.0)', 'FullyShardedDataParallel::pre_forward (layers.0)']``).
@@ -105,6 +133,7 @@ class FSDP:
         self.tp_all_gather: List[dict] = []
         self.tp_reduce_scatter: List[dict] = []
         self.tp_all_reduce: List[dict] = []
+        self.tp_other: List[dict] = []
 
     @property
     def tp_all_gather_gpu(self) -> float:
@@ -136,25 +165,7 @@ class FSDP:
         """Total CPU duration of Optimizer.step nodes (µs)."""
         return sum(n.cpu_duration for n in self.optimizer_step)
 
-    @property
-    def optimizer_wall(self) -> float:
-        """Wall-clock span covering all optimizer-step nodes (µs)."""
-        if not self.optimizer_step:
-            return 0.0
-        start = min(n.start_time for n in self.optimizer_step)
-        end = max(n.end_time for n in self.optimizer_step)
-        return end - start
 
-    @property
-    def optimizer_step_gpu_kernels(self) -> List[dict]:
-        """Collect all GPU kernel events under all Optimizer.step nodes (recursive)."""
-        kernels = []
-        for n in self.optimizer_step:
-            kernels.extend(n.direct_gpu_kernels if isinstance(n.direct_gpu_kernels, list) else [])
-            for ch in _iter_logical(n):
-                if ch.direct_gpu_kernels:
-                    kernels.extend(ch.direct_gpu_kernels if isinstance(ch.direct_gpu_kernels, list) else [])
-        return kernels
 
     @property
     def step_wall(self) -> float:
@@ -199,6 +210,7 @@ class FSDPUnit:
         self.bwd_compute_span: Optional[Tuple[float, float]] = None
         self.all_gather_bwd_end: Optional[float] = None
         self.ag_bwd_supplement_us: float = 0.0
+        self.all_gather_bwd_nccl: List[LogicalOperation] = []
 
     @property
     def all_gather_fwd_gpu_kernels(self) -> List[dict]:
@@ -213,13 +225,19 @@ class FSDPUnit:
 
     @property
     def all_gather_bwd_gpu_kernels(self) -> List[dict]:
-        """GPU kernel events under all ``all_gather_bwd`` CPU nodes."""
+        """GPU kernel events under all ``all_gather_bwd`` and ``all_gather_bwd_nccl`` CPU nodes."""
+        def _collect(node):
+            acc = []
+            acc.extend(node.direct_gpu_kernels if isinstance(node.direct_gpu_kernels, list) else [])
+            for ch in _iter_logical(node):
+                if ch.direct_gpu_kernels:
+                    acc.extend(ch.direct_gpu_kernels if isinstance(ch.direct_gpu_kernels, list) else [])
+            return acc
         kernels = []
         for n in self.all_gather_bwd:
-            kernels.extend(n.direct_gpu_kernels if isinstance(n.direct_gpu_kernels, list) else [])
-            for ch in _iter_logical(n):
-                if ch.direct_gpu_kernels:
-                    kernels.extend(ch.direct_gpu_kernels if isinstance(ch.direct_gpu_kernels, list) else [])
+            kernels.extend(_collect(n))
+        for n in self.all_gather_bwd_nccl:
+            kernels.extend(_collect(n))
         return kernels
 
     @property
@@ -270,17 +288,6 @@ def _pick_latest_with_allgather(nodes: List[LogicalOperation]) -> LogicalOperati
     return max(picks, key=lambda n: n.start_time) if picks else max(nodes, key=lambda n: n.start_time)
 
 
-def _match_gpu_by_interval(gpu_events: List[dict], start: float, end: float) -> List[dict]:
-    """GPU events fully contained in [start, end].  Debugging helper, not used in the main pipeline."""
-    out = []
-    ts = start
-    for ev in gpu_events:
-        ev_start = ev.get('ts', 0)
-        ev_dur = ev.get('dur', 0)
-        if ev_start >= ts and (ev_start + ev_dur) <= end:
-            out.append(ev)
-    return out
-
 
 class StandardFSDPDetector:
     """Orchestrates seven sub-detectors into ``extract_fsdp_phases(roots)``.
@@ -311,7 +318,14 @@ class StandardFSDPDetector:
 
     def _detect_all_gather_bwd(self, roots: List[LogicalOperation], fsdp_units: FSDP):
         """Function searches ``FSDP::pre_backward (layer.X)`` event which consists of 
-        ``FSDP::all_gather`` and  `all_gather_copy_out`` (mirrors forward) """
+        ``FSDP::all_gather`` and  `all_gather_copy_out`` (mirrors forward)
+
+        **Critical**: The NCCL ``FSDP::all_gather (layer.X)`` for backward is NOT
+        a direct child of ``pre_backward`` — it lives inside
+        ``FSDP::backward_prefetch for layer.X``, which is itself nested under the
+        **next** layer's ``pre_backward``.  We search the entire tree for the
+        ``backward_prefetch`` node by name and collect its ``all_gather`` children.
+        """
         for unit in fsdp_units.units:
             pre_bwd_list = []
             for name in _fsdp_phase_name('pre_backward', unit.layer_name):
@@ -324,6 +338,25 @@ class StandardFSDPDetector:
                 if _has_fsdp_prefix(ch.name) and 'all_gather' in ch.name:
                     if ch not in unit.all_gather_bwd:
                         unit.all_gather_bwd.append(ch)
+
+            # Search all nodes for backward_prefetch matching this layer.
+            # The NCCL all_gather kernel lives here, not under pre_backward directly.
+            # Store in all_gather_bwd_nccl (separate from all_gather_bwd which
+            # holds copy-out nodes) so the annotated trace's CPU phase spans
+            # don't get polluted with the early-starting backward_prefetch range.
+            # Pick the latest backward_prefetch node to avoid accumulating GPU
+            # time from stale events across profiler steps.
+            prefetch_nodes = []
+            for prefix in FSDP_PREFIXES:
+                prefetch_name = f'{prefix}backward_prefetch for {unit.layer_name}'
+                for n in self.all_nodes:
+                    if n.name == prefetch_name:
+                        prefetch_nodes.append(n)
+            if prefetch_nodes:
+                latest = max(prefetch_nodes, key=lambda n: n.start_time)
+                for ch in latest.children:
+                    if _has_fsdp_prefix(ch.name) and 'all_gather' in ch.name and ch not in unit.all_gather_bwd_nccl:
+                        unit.all_gather_bwd_nccl.append(ch)
 
     @staticmethod
     def _has_other_tids(all_nodes, profiler_tid):
@@ -369,7 +402,8 @@ class StandardFSDPDetector:
             copy_out_end = None
             for n in unit.all_gather_fwd:
                 if 'all_gather_copy_out' in n.name:
-                    copy_out_end = n.end_time
+                    if copy_out_end is None or n.end_time > copy_out_end:
+                        copy_out_end = n.end_time
 
             if copy_out_end is None:
                 continue
@@ -407,12 +441,14 @@ class StandardFSDPDetector:
                     n_tid = n.raw_event.get('tid') if n.raw_event else None
                     if n_tid != profiler_tid:
                         continue
-                if n.start_time < end_time and copy_out_end < n.end_time <= end_time:
+                if n.start_time < end_time and n.start_time >= copy_out_end and copy_out_end < n.end_time <= end_time:
                     if _has_fsdp_prefix(n.name) or n.name.startswith('ProfilerStep') or n.name.startswith('Optimizer'):
                         continue
                     if n.name in ('backward_pass', 'forward_pass', 'root_pre_forward',
                                   'root_post_backward_callback', 'inputs_to_device',
                                   'cast_forward_inputs'):
+                        continue
+                    if _is_comm_node(n.name):
                         continue
                     unit.fwd_compute.append(n)
 
@@ -502,6 +538,15 @@ class StandardFSDPDetector:
                     if copy_out_end_bwd is None or ag_node.end_time > copy_out_end_bwd:
                         copy_out_end_bwd = ag_node.end_time
             all_gather_end = copy_out_end_bwd if copy_out_end_bwd is not None else (pre_bwd.end_time if pre_bwd else None)
+
+            # Fallback: search all_pre_bwd_global for this layer when the local
+            # copy_out_bwd + pre_bwd chain came up empty but rs_start is known.
+            if all_gather_end is None and rs_start is not None and all_pre_bwd_global:
+                for pb in all_pre_bwd_global:
+                    if _extract_layer(pb.name) == unit.layer_name:
+                        all_gather_end = pb.end_time
+                        break
+
             unit.all_gather_bwd_end = all_gather_end
 
             if all_gather_end is None or rs_start is None:
@@ -516,6 +561,8 @@ class StandardFSDPDetector:
                     if n.name in ('backward_pass', 'forward_pass', 'root_pre_forward',
                                   'root_post_backward_callback', 'inputs_to_device',
                                   'cast_forward_inputs'):
+                        continue
+                    if _is_comm_node(n.name):
                         continue
                     unit.bwd_compute.append(n)
 
@@ -539,6 +586,8 @@ class StandardFSDPDetector:
                 fsdp.tp_reduce_scatter.append(ev)
             elif cat == 'tp_all_reduce':
                 fsdp.tp_all_reduce.append(ev)
+            elif cat == 'tp_other':
+                fsdp.tp_other.append(ev)
 
     def _detect_optimizer_step(self, roots: List[LogicalOperation], fsdp_units: FSDP):
         """Collect ``Optimizer.step#N`` / ``Optimizer.zero_grad#N`` CPU nodes.
@@ -585,9 +634,8 @@ class StandardFSDPDetector:
                 if pg == FSDP_PG_DESC and 'reduce_scatter' in coll.lower():
                     ev_start = ev.get('ts', 0)
                     ev_end = ev_start + ev.get('dur', 0)
-                    if ev_start >= bwd_span[0] and ev_end <= bwd_span[1] + 5000:
-                        import copy
-                        fake = copy.deepcopy(unit.bwd_compute[0]) if unit.bwd_compute else None
+                    if ev_start >= bwd_span[0] and ev_end <= bwd_span[1] + 1000:
+                        fake = deepcopy(unit.bwd_compute[0]) if unit.bwd_compute else None
                         if fake is not None:
                             fake.name = f'FSDP::post_backward_reduce ({unit.layer_name})'
                             fake.start_time = ev_start
@@ -600,7 +648,6 @@ class StandardFSDPDetector:
                             fake.external_ids = set()
                             if fake not in unit.reduce_scatter:
                                 unit.reduce_scatter.append(fake)
-                                break
 
     def _profiler_tid(self, roots: List[LogicalOperation]):
         """Thread ID of the first ProfilerStep# event — used for conditional
