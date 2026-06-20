@@ -759,6 +759,72 @@ BOTTLENECK_DESCRIPTIONS = {
         "Consider gradient accumulation or increasing sharding degree.",
 }
 
+# Key supplementary metrics per bottleneck type for layer-level evidence.
+BOTTLENECK_EVIDENCE_METRICS = {
+    "I/O or pipeline bubble": ["idle_ratio", "gpu_busy"],
+    "comm-bound": ["comm_ratio", "gpu_busy"],
+    "all-gather-heavy": ["ag_fwd_gpu_us", "ag_bwd_gpu_us", "gpu_busy"],
+    "reduce-scatter-heavy": ["rs_gpu_us", "gpu_busy"],
+    "TP-heavy": ["tp_total_gpu_us", "total_gpu_us"],
+    "optimizer-heavy": ["optimizer_ratio", "optimizer_gpu_us"],
+    "low GPU utilization": ["gpu_busy", "fwd_busy", "bwd_busy"],
+    "small-kernel-bound": ["kernel_count", "avg_kernel_dur_us"],
+    "serial pipeline": ["serial_ratio", "overlap_ratio", "gpu_busy"],
+    "low async TP overlap": ["fwd_comp_comm_overlap", "bwd_comp_comm_overlap"],
+    "async TP asymmetry": ["fwd_comp_comm_overlap", "bwd_comp_comm_overlap"],
+    "host-bound": ["cpu_wall_to_gpu_ratio", "cpu_wall_us", "total_gpu_us"],
+    "copy-heavy all-gather": ["copy_data_movement_gpu_us", "nccl_comm_gpu_us"],
+    "fwd-bwd imbalance": ["fwd_cmp_gpu_us", "bwd_cmp_gpu_us", "ag_fwd_gpu_us", "ag_bwd_gpu_us", "rs_gpu_us"],
+    "exposed all-gather": ["ag_fwd_gpu_us", "fwd_cmp_gpu_us", "gpu_busy"],
+    "HBM bandwidth-bound": ["comp_kernel_avg_dur_us", "comp_ratio", "gpu_busy"],
+    "RS exceeds bwd compute": ["rs_gpu_us", "bwd_cmp_gpu_us"],
+    "synchronous TP on critical path": ["tp_total_gpu_us", "fwd_cmp_gpu_us", "fwd_comp_comm_overlap"],
+    "NVLink saturation": ["comp_kernel_avg_dur_us", "nccl_in_comp_count"],
+    "no comm/compute overlap": ["gpu_busy", "ag_fwd_gpu_us", "fwd_cmp_gpu_us"],
+    "exposed communication": ["gpu_busy", "fwd_cmp_gpu_us", "bwd_cmp_gpu_us"],
+    "low cross-layer GPU overlap": ["pipeline_overlap_ratio", "serial_ratio"],
+    "AG fwd dominates": ["ag_fwd_gpu_us", "total_gpu_us"],
+    "AG bwd dominates": ["ag_bwd_gpu_us", "total_gpu_us"],
+    "RS dominates": ["rs_gpu_us", "total_gpu_us"],
+    "Optimizer dominates": ["optimizer_gpu_us", "total_gpu_us"],
+    "TP dominates": ["tp_total_gpu_us", "total_gpu_us"],
+}
+
+
+def _evidence_for_layer(metrics, short_name):
+    """Extract key metric evidence for a given bottleneck type from a Metrics object."""
+    evidence_metrics = BOTTLENECK_EVIDENCE_METRICS.get(short_name, [])
+    d = metrics.to_dict()
+    parts = []
+    # These are unit-ratio metrics (0..1) formatted as percentages
+    unit_ratio_keys = {"gpu_busy", "fwd_busy", "bwd_busy",
+                       "fwd_comp_comm_overlap", "bwd_comp_comm_overlap",
+                       "pipeline_overlap_ratio", "serial_ratio",
+                       "idle_ratio", "comp_ratio", "comm_ratio",
+                       "optimizer_ratio", "fsdp_comm_ratio",
+                       "tp_comm_ratio", "avg_exposed_ratio",
+                       "ag_fwd_exposed_ratio", "rs_exposed_ratio",
+                       "ag_bwd_exposed_ratio", "overlap_ratio",
+                       "compute_to_comm_ratio"}
+    for key in evidence_metrics:
+        v = d.get(key)
+        if v is None:
+            continue
+        if key in unit_ratio_keys:
+            parts.append(f"{key}={v:.2%}")
+        elif key == "cpu_wall_to_gpu_ratio":
+            parts.append(f"{key}={v:.1f}x")
+        elif key.endswith("_us") or key in ("cpu_wall_us", "total_gpu_us"):
+            parts.append(f"{key}={v:.0f}us")
+        elif key in ("kernel_count", "nccl_in_comp_count"):
+            parts.append(f"{key}={v:.0f}")
+        elif key in ("avg_kernel_dur_us", "comp_kernel_avg_dur_us"):
+            parts.append(f"{key}={v:.1f}us")
+        else:
+            parts.append(f"{key}={v}")
+    return ", ".join(parts)
+
+
 def _bottleneck_tags(metrics_list: list) -> str:
     # Group by short name (before parenthesis) to collapse variants like
     # "compute-bound (comp=88.9%)" and "compute-bound (comp=85.0%)".
