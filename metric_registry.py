@@ -1,4 +1,5 @@
 """METRIC_REGISTRY: documentation for every metric in Metrics.to_dict().
+THRESHOLD_REGISTRY: documentation for every threshold in Bottlenecks.
 
 Each entry documents one metric key with:
 - description: plain-English explanation
@@ -6,10 +7,16 @@ Each entry documents one metric key with:
 - unit: µs, ratio, count, bytes, FLOPs, tokens/s/GPU
 - calculation: how the metric is derived from raw data
 
+Each threshold entry documents one threshold constant with:
+- value: the numeric threshold
+- rationale: plain-English explanation of what it detects
+- physical_justification: the physical / architectural model it derives from
+- used_by: list of bottleneck short names that use this threshold
+
 This file is imported by html_report.py to render the collapsible metric
-registry table. It lives in its own module so that CLI tools, comparison
-reports, and other consumers can reference it without importing the full
-detection pipeline.
+registry table and threshold documentation. It lives in its own module so
+that CLI tools, comparison reports, and other consumers can reference it
+without importing the full detection pipeline.
 """
 
 METRIC_REGISTRY = {
@@ -315,5 +322,194 @@ METRIC_REGISTRY = {
         "used_by": [],
         "unit": "FLOPs",
         "calculation": "Kaplan et al. FLOPs formula from ModelConfig hyperparameters — estimated FLOPs per step",
+    },
+}
+
+
+# =========================================================================
+# THRESHOLD_REGISTRY — physical justification for every Bottlenecks threshold
+# =========================================================================
+# Each entry documents one threshold constant with:
+#   value                  — numeric threshold value
+#   rationale              — what this threshold detects / signals
+#   physical_justification — the physical or architectural model that
+#                            motivates the number (roofline, NCCL BW model,
+#                            Amdahl's law, GPU spec, empirical measurement)
+#   used_by                — list of bottleneck short names that check this
+# =========================================================================
+
+THRESHOLD_REGISTRY = {
+    # --- Section A — Classical bottleneck thresholds ---
+    "COMP_HEAVY_THRESHOLD": {
+        "value": 0.70,
+        "rationale": "Fraction of total GPU time spent on compute (fwd + bwd) above which the bottleneck is compute-bound rather than communication-bound",
+        "physical_justification": "Amdahl's law: if ≥70% of GPU time is compute, further communication optimisation yields at most 1/(1−0.70)≈1.43× speedup. The bottleneck has shifted to compute.",
+        "used_by": ["HBM bandwidth-bound"],
+    },
+    "COMM_HEAVY_THRESHOLD": {
+        "value": 0.40,
+        "rationale": "Fraction of total GPU time spent on communication above which the step is communication-bound",
+        "physical_justification": "NCCL bandwidth model on H100 NVLink (≈900 GB/s aggregate): large-message all-reduce BW plateaus at ≈60–70 GB/s. When comm ≥40% of GPU time, the all-reduce is in the bandwidth-limited regime; doubling network BW gives <2× speedup (Amdahl).",
+        "used_by": ["comm-bound"],
+    },
+    "IO_HEAVY_THRESHOLD": {
+        "value": 0.15,
+        "rationale": "Fraction of wall time with no active GPU work (idle / pipeline bubble) above which I/O or bubbles limit scaling",
+        "physical_justification": "Amdahl's law: with 15% serial/idle fraction, maximum achievable speedup is 1/0.15≈6.7× regardless of GPU count. Beyond this, I/O or pipeline bubbles materially limit strong scaling.",
+        "used_by": ["I/O or pipeline bubble"],
+    },
+    "AG_HEAVY_THRESHOLD": {
+        "value": 0.40,
+        "rationale": "Fraction of FSDP communication time spent on all-gather (fwd + bwd) above which AG dominates the comm profile",
+        "physical_justification": "NCCL all-gather BW model: same bandwidth ceiling as all-reduce on NVLink (≈60–70 GB/s large-message). When AG ≥40% of FSDP comm, unshard dominates the communication profile.",
+        "used_by": ["all-gather-heavy"],
+    },
+    "RS_HEAVY_THRESHOLD": {
+        "value": 0.40,
+        "rationale": "Fraction of FSDP communication time spent on reduce-scatter above which RS dominates the comm profile",
+        "physical_justification": "NCCL reduce-scatter BW model: RS has identical BW characteristics to all-gather (algorithmic equivalents in NCCL ring/tree). ≥40% indicates gradient synchronisation dominates FSDP comm.",
+        "used_by": ["reduce-scatter-heavy"],
+    },
+    "TP_HEAVY_THRESHOLD": {
+        "value": 0.15,
+        "rationale": "Fraction of total GPU time spent on tensor-parallel collectives above which TP is a bottleneck",
+        "physical_justification": "NVLink BW model: TP collectives run intra-node over NVLink at ≈900 GB/s (H100). Lower threshold because TP (unlike FSDP) is synchronous on the critical path and cannot be overlapped across layers. Even 15% GPU time in TP materially limits scaling efficiency.",
+        "used_by": ["TP-heavy"],
+    },
+    "OPTIMIZER_HEAVY_THRESHOLD": {
+        "value": 0.15,
+        "rationale": "Fraction of total GPU time spent on the ADAMW optimizer step above which the optimizer dominates",
+        "physical_justification": "HBM memory-bandwidth model: ADAMW is memory-bandwidth-bound (reads g + m, writes m + params). On H100 HBM3 (3.35 TB/s), 15% corresponds to the point where optimizer memory traffic becomes a dominant fraction of the HBM budget.",
+        "used_by": ["optimizer-heavy"],
+    },
+    "UTIL_LOW_THRESHOLD": {
+        "value": 0.50,
+        "rationale": "Minimum GPU utilisation below which the layer is flagged as low-utilisation",
+        "physical_justification": "Standard industry heuristic (cf. NVIDIA GPU utilisation guidance): below 50% the GPU is idle more than it is computing — the pipeline delivers less than half its achievable throughput.",
+        "used_by": ["low GPU utilization"],
+    },
+
+    # --- Section B — FSDP2 / TP / async TP specific thresholds ---
+    "SMALL_KERNEL_AVG_DUR_US": {
+        "value": 5.0,
+        "rationale": "Average GPU kernel duration (µs) below which kernels are small enough to be launch-latency-bound",
+        "physical_justification": "CUDA launch-latency model: kernel launch latency is ≈3–8 µs (driver + scheduler overhead). When avg kernel duration ≤5 µs, execution is comparable to launch latency → launch-latency-bound. NVIDIA guidance recommends kernels >10 µs for efficient utilisation.",
+        "used_by": ["small-kernel-bound"],
+    },
+    "SMALL_KERNEL_COUNT": {
+        "value": 100,
+        "rationale": "Minimum number of small kernels to trigger small-kernel-bound classification",
+        "physical_justification": "Empirical — transformer layer composition: a typical layer has ≈50–80 CUDA kernels (attention + MLP + norms). When count ≥100 with avg <5 µs, the decomposition is fine-grained enough for launch overhead to dominate.",
+        "used_by": ["small-kernel-bound"],
+    },
+    "ASYNC_TP_OVERLAP_LOW": {
+        "value": 0.30,
+        "rationale": "Fraction of forward (or backward) wall time with concurrent TP kernel execution below which async TP overlap is considered poor",
+        "physical_justification": "Async TP pipeline model: in an ideal async TP implementation, collectives overlap with compute for >70% of forward wall time. Below 30% the overlap mechanism is present but hides less than a third of TP latency.",
+        "used_by": ["low async TP overlap"],
+    },
+    "OVERLAP_ASYMMETRY_DIFF": {
+        "value": 0.40,
+        "rationale": "Absolute difference (in percentage points) between fwd and bwd TP overlap above which the asymmetry is flagged",
+        "physical_justification": "Pipeline symmetry: |fwd−bwd| ≥40 pp indicates the pipeline stagger is tuned for one direction at the expense of the other. Forward has one AG; backward has AG+RS — inherently asymmetric; large asymmetry means poor stagger balance.",
+        "used_by": ["async TP asymmetry"],
+    },
+    "HOST_BOUND_RATIO": {
+        "value": 3.0,
+        "rationale": "Ratio of CPU wall span to total GPU time above which CPU dispatch overhead is considered a bottleneck",
+        "physical_justification": "CPU dispatch overhead model: for efficient GPU utilisation, CPU dispatch overhead should be a small fraction of GPU time. A ratio of 3.0 means 1 µs of GPU work costs 3 µs of CPU serialisation — Python runtime / GIL / PyTorch dispatch overhead. Well-optimised FSDP2 achieves CPU:GPU ≤1.5×.",
+        "used_by": ["host-bound"],
+    },
+    "COPY_HEAVY_RATIO": {
+        "value": 0.50,
+        "rationale": "Fraction of all-gather phase GPU time spent on memcpy (vs NCCL) above which CPU-side memory copy dominates the AG",
+        "physical_justification": "CPU memory bandwidth model (DDR5): in FSDP2 AG, non-NCCL time is dominated by split_with_sizes_copy (CPU-side memory copies for tensor slicing). When ≥50% of AG time is copy, CPU data-preparation (DDR5 ≈50–80 GB/s) bottlenecks the AG faster than NCCL (NVLink ≈450 GB/s unidirectional).",
+        "used_by": ["copy-heavy all-gather"],
+    },
+    "FWD_BWD_IMBALANCE": {
+        "value": 0.75,
+        "rationale": "Normalised |fwd−bwd| / max(fwd,bwd) above which the forward/backward GPU time split is considered imbalanced",
+        "physical_justification": "Theoretical fwd:bwd FLOPs ratio: standard transformer layer with activation checkpointing has fwd:bwd ≈ 1:2. Deviation >25% (i.e. imbalance ≥0.75) signals intervention from act-ckpt or custom gradient computation.",
+        "used_by": ["fwd-bwd imbalance"],
+    },
+    "SERIAL_RATIO_HIGH": {
+        "value": 0.85,
+        "rationale": "Fraction of total wall time with only one FSDP shard group active above which the pipeline is considered serial",
+        "physical_justification": "FSDP2 pipeline model: with N pipeline stages, theoretical max overlap = (N−1)/N. Even a 2-deep pipeline should achieve 50% overlap. Serial >85% means <15% overlap — the stagger is defeated by synchronisation or insufficient in-flight layers.",
+        "used_by": ["serial pipeline"],
+    },
+
+    # --- Section C — Communication-hiding / BW bottleneck thresholds ---
+    "AG_LATENCY_EXPOSED_RATIO": {
+        "value": 0.80,
+        "rationale": "Ratio of all-gather fwd GPU time to fwd compute GPU time above which AG is considered exposed (inter-node BW-limited)",
+        "physical_justification": "NCCL AG BW model (inter-node): on NVLink (≈450 GB/s unidirectional), AG fwd GPU ≥80% of fwd compute GPU means the GPU stalls waiting for AG. At this ratio, doubling AG BW would reduce step time by ≤20% (Amdahl: serial fraction = 0.80/1.80≈0.44; max speedup = 1/(1−0.44+0.44/2)≈1.22×).",
+        "used_by": ["exposed all-gather"],
+    },
+    "HBM_BOUND_AVG_KERNEL_US": {
+        "value": 8.0,
+        "rationale": "Average compute-phase kernel duration below which kernels are short enough to suggest HBM bandwidth binding",
+        "physical_justification": "Roofline model (H100 HBM3): ridge point at 295 FLOPs/byte (bf16). A kernel of 8 µs at typical grid size (≈256 blocks = 2 waves on 128 SMs) has arithmetic intensity well below the ridge point, placing it in the memory-bandwidth-bound regime.",
+        "used_by": ["HBM bandwidth-bound"],
+    },
+    "HBM_BOUND_GPU_UTIL": {
+        "value": 0.50,
+        "rationale": "GPU utilisation below which (combined with short compute kernels) HBM bandwidth binding is flagged",
+        "physical_justification": "Utilisation cross-validation: GPU utilisation <50% AND avg kernel <8 µs → kernel execution is memory-bandwidth-starved rather than compute-bound. Short kernels issue rapidly but spend most time waiting on HBM.",
+        "used_by": ["HBM bandwidth-bound"],
+    },
+    "RS_INJECTION_RATIO": {
+        "value": 1.0,
+        "rationale": "Ratio of RS GPU time to bwd compute GPU time above which RS injection pressure is flagged",
+        "physical_justification": "Injection BW model: RS GPU ≥100% of bwd compute GPU means gradient synchronisation takes as long as backward computation. On H100 NVLink (≈60–70 GB/s large-message all-reduce BW), this is the point where all-reduce BW limits backward throughput as much as compute. Uses GPU-time ratio (not overlap) because async NCCL CPU_wall is just dispatch time.",
+        "used_by": ["RS exceeds bwd compute"],
+    },
+    "TP_ON_CRITICAL_PATH_RATIO": {
+        "value": 0.10,
+        "rationale": "Ratio of TP GPU time to fwd compute GPU time above which synchronous TP on the critical path is flagged",
+        "physical_justification": "Critical-path analysis: even 10% TP GPU time relative to compute is significant because TP collectives are synchronous per transformer layer (unlike FSDP which pipelines across layers). Synchronous collectives >10% of compute directly limit scaling efficiency via Amdahl's law.",
+        "used_by": ["synchronous TP on critical path"],
+    },
+    "TP_ON_CRITICAL_PATH_OVERLAP": {
+        "value": 0.20,
+        "rationale": "Forward TP overlap below which (combined with significant TP time) the async TP mechanism is defeated",
+        "physical_justification": "Async TP profitability model: when TP overlap <20% AND TP ≥10% of compute, the async TP mechanism hides <20% of collective latency — effectively synchronous. Only 1/5 of collective latency is hidden.",
+        "used_by": ["synchronous TP on critical path"],
+    },
+    "NVLINK_SAT_COUNT": {
+        "value": 50,
+        "rationale": "Minimum number of small TP kernels per layer above which NVLink fragmentation is flagged",
+        "physical_justification": "NVLink message-efficiency model: NVLink BW efficiency drops significantly for small messages (<1 KB). On H100 (18 NVLink 4.0 links × 450 GB/s uni), small-message throughput can be 5–10% of peak. ≥50 small TP kernels indicates message fragmentation that prevents NVLink BW saturation.",
+        "used_by": ["NVLink saturation"],
+    },
+    "NVLINK_SAT_AVG_US": {
+        "value": 10.0,
+        "rationale": "Average TP kernel duration (µs) below which TP kernels are too short to saturate NVLink bandwidth",
+        "physical_justification": "NVLink BW model: for a 128 KB TP message on H100 NVLink (≈70 GB/s achievable large-message BW per link pair), expected transfer ≲2 µs. Avg TP kernel <10 µs means launch overhead dominates and NVLink BW is never saturated.",
+        "used_by": ["NVLink saturation"],
+    },
+    "COMM_COMPUTE_UTIL_THRESHOLD": {
+        "value": 0.50,
+        "rationale": "GPU utilisation below which (combined with meaningful AG time) no comm/compute overlap is flagged",
+        "physical_justification": "Pipeline utilisation model: same physical basis as UTIL_LOW_THRESHOLD (50% is the standard low-utilisation boundary). When combined with AG ≥10% of fwd compute, the AG is a material contributor to the idle — not hidden by pipeline stagger.",
+        "used_by": ["no comm/compute overlap"],
+    },
+    "AG_VS_FWD_RATIO": {
+        "value": 0.10,
+        "rationale": "Ratio of AG fwd GPU time to fwd compute GPU time below which AG is negligible for low-utilisation diagnosis",
+        "physical_justification": "Signal-to-noise filter: AG <10% of fwd compute is negligible — low utilisation in that case is driven by other factors (data loading, synchronisation). The 10% floor ensures we only flag communication-mediated low utilisation.",
+        "used_by": ["no comm/compute overlap"],
+    },
+    "EXPOSED_COMM_IDLE_THRESHOLD": {
+        "value": 0.50,
+        "rationale": "GPU idle fraction (1 − gpu_busy) above which communication exposure is flagged (requires fwd + bwd activity)",
+        "physical_justification": "Utilisation-derived idle model: GPU idle ≥50% of wall time with both fwd and bwd active → communication exposure is the dominant limiter. Uses 1−gpu_busy which replaces the old overlap-efficiency formula that broke for async NCCL (CPU_wall = dispatch, not execution).",
+        "used_by": ["exposed communication"],
+    },
+    "PIPELINE_OVERLAP_LOW": {
+        "value": 0.20,
+        "rationale": "Cross-layer GPU span overlap ratio below which the FSDP2 pipeline stagger is considered ineffective",
+        "physical_justification": "Cross-layer GPU pipeline model: ideal overlap = (N−1)/N. Even a 2-layer pipeline should achieve 50%. Below 20% indicates insufficient micro-batches or synchronisation that serialises the GPU stream. Cross-check against CPU overlap_ratio (sweep-line) — GPU overlap is the real signal.",
+        "used_by": ["low cross-layer GPU overlap"],
     },
 }
