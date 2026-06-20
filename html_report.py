@@ -10,7 +10,7 @@ import json
 import sys
 from pipeline import process_trace, process_all_steps
 from bottleneck_detector import ModelConfig, _format_us, Bottlenecks
-from metric_registry import METRIC_REGISTRY
+from metric_registry import METRIC_REGISTRY, THRESHOLD_REGISTRY
 from collections import defaultdict
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -961,6 +961,76 @@ The "used_by" column shows which bottlenecks consume each metric — metrics wit
 </div>"""
 
 
+def _render_threshold_registry() -> str:
+    """Render the THRESHOLD_REGISTRY as a table showing value, rationale, physical justification, and which bottlenecks use each threshold."""
+    import re as _re
+    rows = ""
+    sections = {
+        "A": ("Classical bottleneck thresholds", []),
+        "B": ("FSDP2 / TP / async TP specific thresholds", []),
+        "C": ("Communication-hiding / BW bottleneck thresholds", []),
+    }
+    for key, info in THRESHOLD_REGISTRY.items():
+        val = info.get("value", "")
+        val_s = f"{val:.0%}" if isinstance(val, float) and 0 < val < 1 else str(val)
+        rat = info.get("rationale", "")
+        phys = info.get("physical_justification", "")
+        used_by = info.get("used_by", [])
+        used_str = ", ".join(used_by) if used_by else '<span style="color:#999">—</span>'
+        key_lower = key.lower()
+        if any(w in key_lower for w in ["comp_heavy", "comm_heavy", "io_heavy", "ag_heavy", "rs_heavy", "tp_heavy", "optimizer_heavy", "util_low"]):
+            sections["A"][1].append((key, val_s, rat, phys, used_str))
+        elif any(w in key_lower for w in ["small_kernel", "async_tp", "overlap_asymmetry", "host_bound", "copy_heavy", "fwd_bwd", "serial_ratio"]):
+            sections["B"][1].append((key, val_s, rat, phys, used_str))
+        else:
+            sections["C"][1].append((key, val_s, rat, phys, used_str))
+
+    for sec_id, (sec_title, items) in sections.items():
+        if not items:
+            continue
+        sec_id_attr = _re.sub(r"[^a-zA-Z0-9_-]", "", sec_title.replace(" ", "-").lower())
+        rows += (
+            f'<tr style="background:#f5f5f5">'
+            f'<td colspan="5" style="font-weight:600;font-size:11px;padding:8px 7px;text-align:left">'
+            f'Sec {sec_id} — {sec_title} ({len(items)} thresholds)</td></tr>\n'
+        )
+        for key, val_s, rat, phys, used_str in items:
+            rows += (
+                f"<tr>"
+                f"<td style='font-family:monospace;font-size:10px;white-space:nowrap'>{key}</td>"
+                f"<td style='font-size:10px;color:#555'>{rat}</td>"
+                f"<td style='font-size:10px;font-weight:500'>{val_s}</td>"
+                f"<td style='font-size:10px;color:#444;font-style:italic;max-width:360px'>{phys}</td>"
+                f"<td style='font-size:10px'>{used_str}</td>"
+                f"</tr>\n"
+            )
+
+    return f"""<div class="section">
+<h2>Threshold Registry</h2>
+<details>
+<summary style="cursor:pointer;font-size:12px;color:#555;padding:4px 0;margin-bottom:4px">
+All {len(THRESHOLD_REGISTRY)} thresholds with physical justifications — click to expand
+</summary>
+<p style="font-size:11px;color:#888;margin-bottom:8px">
+Each threshold is documented with its numeric value, detection rationale, and the physical or architectural model it derives from (roofline model, NCCL bandwidth model, Amdahl's law, GPU architecture specs for H100-SXM). Thresholds are grouped by their section in the detection logic.
+</p>
+<div class="table-wrap">
+<table>
+<thead><tr>
+<th style="text-align:left">Threshold</th>
+<th style="text-align:left">Rationale</th>
+<th>Value</th>
+<th style="text-align:left">Physical Justification</th>
+<th style="text-align:left">Used by</th>
+</tr></thead>
+<tbody>
+{rows}
+</tbody>
+</table>
+</div>
+</details>
+</div>"""
+
 
 def generate_html_report(trace_file: str, output_path: str = None, model_config: ModelConfig = None):
     """Run the full pipeline and write an enhanced HTML report with charts."""
@@ -1004,6 +1074,7 @@ def generate_html_report(trace_file: str, output_path: str = None, model_config:
         BOTTLENECK_TAGS=_bottleneck_tags(metrics_list),
         PER_UNIT_TABLE=_per_unit_table(metrics_list),
         METRIC_REGISTRY_SECTION=_render_metric_registry(),
+        THRESHOLD_REGISTRY_SECTION=_render_threshold_registry(),
     )
     html = _render_page(title, body, json.dumps(chart_data))
     with open(output_path, 'w') as f:
@@ -1517,6 +1588,7 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
         BOTTLENECK_LEGEND=bneck_legend,
         BOTTLENECK_SECTIONS=bneck_sections,
         METRIC_REGISTRY_SECTION=_render_metric_registry(),
+        THRESHOLD_REGISTRY_SECTION=_render_threshold_registry(),
     )
     chart_data = json.dumps({"compare": compare_data})
     html = _render_page(title, body, chart_data)
