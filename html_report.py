@@ -827,13 +827,14 @@ def _evidence_for_layer(metrics, short_name):
 
 def _bottleneck_tags(metrics_list: list) -> str:
     # Group by short name (before parenthesis) to collapse variants like
-    # "compute-bound (comp=88.9%)" and "compute-bound (comp=85.0%)".
-    all_issues = defaultdict(list)
+    # "comm-bound (comm=58.3%)" and "comm-bound (comm=85.0%)".
+    # Also capture per-layer evidence.
+    all_issues = defaultdict(list)  # short_name -> [(layer_name, issue_text, Metrics)]
     for m in metrics_list:
         issues = Bottlenecks.detect(m)
         for iss in issues:
             short = iss.split("(")[0].strip()
-            all_issues[short].append(m.layer_name)
+            all_issues[short].append((m.layer_name, iss, m))
 
     if not all_issues:
         return '<p class="tag-ok" style="font-size:12px">No bottlenecks detected.</p>'
@@ -846,20 +847,48 @@ def _bottleneck_tags(metrics_list: list) -> str:
               '<span style="color:#1a7a2e">&#9679;</span> few layers'
               '</div>')
     parts = legend
-    for short, layers in sorted(all_issues.items(), key=lambda x: -len(x[1])):
-        count = len(layers)
+    for short, entries in sorted(all_issues.items(), key=lambda x: -len(x[1])):
+        count = len(entries)
         if count >= len(metrics_list) * 0.5:
             severity = "tag-high"
         elif count >= 3:
             severity = "tag-med"
         else:
             severity = "tag-low"
-        layers_str = ", ".join(layers[:4])
-        if len(layers) > 4:
-            layers_str += f" (+{len(layers) - 4})"
+        # Count layers for display
+        layer_names = [l for l, _, _ in entries]
+        layers_str = ", ".join(layer_names[:4])
+        if len(layer_names) > 4:
+            layers_str += f" (+{len(layer_names) - 4})"
         desc = BOTTLENECK_DESCRIPTIONS.get(short, "")
         desc_suffix = f"<br><span style='font-size:11px;color:#666;font-style:italic;margin-left:8px'>{desc}</span>" if desc else ""
-        parts += f'<div style="margin:4px 0"><span class="tag {severity}">{short}</span> <span style="font-size:11px;color:#888">{count} units &mdash; {layers_str}</span>{desc_suffix}</div>\n'
+
+        # Build collapsible content: per-layer evidence lines
+        evidence_lines = ""
+        for layer_name, issue_text, m in entries:
+            extra = _evidence_for_layer(m, short)
+            evidence_str = issue_text
+            if extra:
+                evidence_str += f"  [{extra}]"
+            evidence_lines += (
+                f'<div style="font-size:11px;color:#444;padding:2px 0 2px 16px">'
+                f'<span style="font-weight:500">{layer_name}:</span> {evidence_str}'
+                f'</div>\n'
+            )
+
+        details_id = f"bneck-{short.replace(' ', '-').replace('/', '-')}"
+        collapsible = (
+            f'<details id="{details_id}" style="margin:2px 0">'
+            f'<summary style="cursor:pointer;font-size:11px;color:#888;padding:2px 0">'
+            f'<span class="tag {severity}">{short}</span> '
+            f'<span style="font-size:12px;font-weight:500">{count}/{len(metrics_list)} layers</span>'
+            f' — {layers_str}'
+            f'{desc_suffix}'
+            f'</summary>'
+            f'{evidence_lines}'
+            f'</details>'
+        )
+        parts += collapsible + '\n'
     return parts
 
 
