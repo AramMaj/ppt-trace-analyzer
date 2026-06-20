@@ -10,6 +10,7 @@ import json
 import sys
 from pipeline import process_trace, process_all_steps
 from bottleneck_detector import ModelConfig, _format_us, Bottlenecks
+from metric_registry import METRIC_REGISTRY, THRESHOLD_REGISTRY
 from collections import defaultdict
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -705,17 +706,13 @@ BOTTLENECK_DESCRIPTIONS = {
         "Forward and backward phases use noticeably different GPU time. This may be natural with "
         "activation checkpointing; if extreme, check for gradient accumulation asymmetry.",
 
-    "inter-node BW":
-        "All-gather GPU time approaches or exceeds forward compute — the gather is fully exposed. "
-        "Upgrade inter-node bandwidth (IB/RoCE), overlap AG with compute, or use async AG.",
-
     "HBM bandwidth-bound":
         "Compute kernels average <8 µs with low GPU utilisation — memory-bandwidth-limited. "
         "Check for suboptimal tensor shapes or use memory-bound-optimized kernel implementations.",
 
-    "RS injection pressure":
-        "Reduce-scatter contends with backward compute for GPU resources (both active on separate "
-        "streams). Try gradient accumulation or increasing the sharding degree to reduce RS size.",
+    "exposed all-gather":
+        "All-gather GPU time approaches or exceeds forward compute — the gather is fully exposed. "
+        "Upgrade inter-node bandwidth (IB/RoCE), overlap AG with compute, or use async AG.",
 
     "synchronous TP on critical path":
         "TP collectives overlap poorly with compute and sit on the critical path. This defeats "
@@ -736,17 +733,108 @@ BOTTLENECK_DESCRIPTIONS = {
     "low cross-layer GPU overlap":
         "Adjacent layers' GPU spans overlap by <20%. The pipeline stagger is not keeping the GPU "
         "busy — try increasing the number of in-flight layers or narrowing the pipeline window.",
+
+    "AG fwd dominates":
+        "All-gather forward consumes a disproportionate share of GPU time. Likely a pipeline "
+        "bottleneck or insufficient overlap with compute.",
+
+    "AG bwd dominates":
+        "All-gather backward consumes a disproportionate share of GPU time. Likely a pipeline "
+        "bottleneck or insufficient overlap with backward compute.",
+
+    "RS dominates":
+        "Reduce-scatter consumes a disproportionate share of GPU time. Check gradient accumulation "
+        "or injection pressure.",
+
+    "Optimizer dominates":
+        "The optimizer step consumes a disproportionate share of GPU time. Consider a fused optimizer "
+        "or reduce precision for optimizer states.",
+
+    "TP dominates":
+        "Tensor-parallel collectives dominate GPU time. Consider reducing TP degree or fusing "
+        "TP communication kernels.",
+
+    "RS exceeds bwd compute":
+        "Reduce-scatter GPU time exceeds backward compute GPU time — strong injection pressure. "
+        "Consider gradient accumulation or increasing sharding degree.",
 }
+
+# Key supplementary metrics per bottleneck type for layer-level evidence.
+BOTTLENECK_EVIDENCE_METRICS = {
+    "I/O or pipeline bubble": ["idle_ratio", "gpu_busy"],
+    "comm-bound": ["comm_ratio", "gpu_busy"],
+    "all-gather-heavy": ["ag_fwd_gpu_us", "ag_bwd_gpu_us", "gpu_busy"],
+    "reduce-scatter-heavy": ["rs_gpu_us", "gpu_busy"],
+    "TP-heavy": ["tp_total_gpu_us", "total_gpu_us"],
+    "optimizer-heavy": ["optimizer_ratio", "optimizer_gpu_us"],
+    "low GPU utilization": ["gpu_busy", "fwd_busy", "bwd_busy"],
+    "small-kernel-bound": ["kernel_count", "avg_kernel_dur_us"],
+    "serial pipeline": ["serial_ratio", "overlap_ratio", "gpu_busy"],
+    "low async TP overlap": ["fwd_comp_comm_overlap", "bwd_comp_comm_overlap"],
+    "async TP asymmetry": ["fwd_comp_comm_overlap", "bwd_comp_comm_overlap"],
+    "host-bound": ["cpu_wall_to_gpu_ratio", "cpu_wall_us", "total_gpu_us"],
+    "copy-heavy all-gather": ["copy_data_movement_gpu_us", "nccl_comm_gpu_us"],
+    "fwd-bwd imbalance": ["fwd_cmp_gpu_us", "bwd_cmp_gpu_us", "ag_fwd_gpu_us", "ag_bwd_gpu_us", "rs_gpu_us"],
+    "exposed all-gather": ["ag_fwd_gpu_us", "fwd_cmp_gpu_us", "gpu_busy"],
+    "HBM bandwidth-bound": ["comp_kernel_avg_dur_us", "comp_ratio", "gpu_busy"],
+    "RS exceeds bwd compute": ["rs_gpu_us", "bwd_cmp_gpu_us"],
+    "synchronous TP on critical path": ["tp_total_gpu_us", "fwd_cmp_gpu_us", "fwd_comp_comm_overlap"],
+    "NVLink saturation": ["comp_kernel_avg_dur_us", "nccl_in_comp_count"],
+    "no comm/compute overlap": ["gpu_busy", "ag_fwd_gpu_us", "fwd_cmp_gpu_us"],
+    "exposed communication": ["gpu_busy", "fwd_cmp_gpu_us", "bwd_cmp_gpu_us"],
+    "low cross-layer GPU overlap": ["pipeline_overlap_ratio", "serial_ratio"],
+    "AG fwd dominates": ["ag_fwd_gpu_us", "total_gpu_us"],
+    "AG bwd dominates": ["ag_bwd_gpu_us", "total_gpu_us"],
+    "RS dominates": ["rs_gpu_us", "total_gpu_us"],
+    "Optimizer dominates": ["optimizer_gpu_us", "total_gpu_us"],
+    "TP dominates": ["tp_total_gpu_us", "total_gpu_us"],
+}
+
+
+def _evidence_for_layer(metrics, short_name):
+    """Extract key metric evidence for a given bottleneck type from a Metrics object."""
+    evidence_metrics = BOTTLENECK_EVIDENCE_METRICS.get(short_name, [])
+    d = metrics.to_dict()
+    parts = []
+    # These are unit-ratio metrics (0..1) formatted as percentages
+    unit_ratio_keys = {"gpu_busy", "fwd_busy", "bwd_busy",
+                       "fwd_comp_comm_overlap", "bwd_comp_comm_overlap",
+                       "pipeline_overlap_ratio", "serial_ratio",
+                       "idle_ratio", "comp_ratio", "comm_ratio",
+                       "optimizer_ratio", "fsdp_comm_ratio",
+                       "tp_comm_ratio", "avg_exposed_ratio",
+                       "ag_fwd_exposed_ratio", "rs_exposed_ratio",
+                       "ag_bwd_exposed_ratio", "overlap_ratio",
+                       "compute_to_comm_ratio"}
+    for key in evidence_metrics:
+        v = d.get(key)
+        if v is None:
+            continue
+        if key in unit_ratio_keys:
+            parts.append(f"{key}={v:.2%}")
+        elif key == "cpu_wall_to_gpu_ratio":
+            parts.append(f"{key}={v:.1f}x")
+        elif key.endswith("_us") or key in ("cpu_wall_us", "total_gpu_us"):
+            parts.append(f"{key}={v:.0f}us")
+        elif key in ("kernel_count", "nccl_in_comp_count"):
+            parts.append(f"{key}={v:.0f}")
+        elif key in ("avg_kernel_dur_us", "comp_kernel_avg_dur_us"):
+            parts.append(f"{key}={v:.1f}us")
+        else:
+            parts.append(f"{key}={v}")
+    return ", ".join(parts)
+
 
 def _bottleneck_tags(metrics_list: list) -> str:
     # Group by short name (before parenthesis) to collapse variants like
-    # "compute-bound (comp=88.9%)" and "compute-bound (comp=85.0%)".
-    all_issues = defaultdict(list)
+    # "comm-bound (comm=58.3%)" and "comm-bound (comm=85.0%)".
+    # Also capture per-layer evidence.
+    all_issues = defaultdict(list)  # short_name -> [(layer_name, issue_text, Metrics)]
     for m in metrics_list:
         issues = Bottlenecks.detect(m)
         for iss in issues:
             short = iss.split("(")[0].strip()
-            all_issues[short].append(m.layer_name)
+            all_issues[short].append((m.layer_name, iss, m))
 
     if not all_issues:
         return '<p class="tag-ok" style="font-size:12px">No bottlenecks detected.</p>'
@@ -759,20 +847,48 @@ def _bottleneck_tags(metrics_list: list) -> str:
               '<span style="color:#1a7a2e">&#9679;</span> few layers'
               '</div>')
     parts = legend
-    for short, layers in sorted(all_issues.items(), key=lambda x: -len(x[1])):
-        count = len(layers)
+    for short, entries in sorted(all_issues.items(), key=lambda x: -len(x[1])):
+        count = len(entries)
         if count >= len(metrics_list) * 0.5:
             severity = "tag-high"
         elif count >= 3:
             severity = "tag-med"
         else:
             severity = "tag-low"
-        layers_str = ", ".join(layers[:4])
-        if len(layers) > 4:
-            layers_str += f" (+{len(layers) - 4})"
+        # Count layers for display
+        layer_names = [l for l, _, _ in entries]
+        layers_str = ", ".join(layer_names[:4])
+        if len(layer_names) > 4:
+            layers_str += f" (+{len(layer_names) - 4})"
         desc = BOTTLENECK_DESCRIPTIONS.get(short, "")
         desc_suffix = f"<br><span style='font-size:11px;color:#666;font-style:italic;margin-left:8px'>{desc}</span>" if desc else ""
-        parts += f'<div style="margin:4px 0"><span class="tag {severity}">{short}</span> <span style="font-size:11px;color:#888">{count} units &mdash; {layers_str}</span>{desc_suffix}</div>\n'
+
+        # Build collapsible content: per-layer evidence lines
+        evidence_lines = ""
+        for layer_name, issue_text, m in entries:
+            extra = _evidence_for_layer(m, short)
+            evidence_str = issue_text
+            if extra:
+                evidence_str += f"  [{extra}]"
+            evidence_lines += (
+                f'<div style="font-size:11px;color:#444;padding:2px 0 2px 16px">'
+                f'<span style="font-weight:500">{layer_name}:</span> {evidence_str}'
+                f'</div>\n'
+            )
+
+        details_id = f"bneck-{short.replace(' ', '-').replace('/', '-')}"
+        collapsible = (
+            f'<details id="{details_id}" style="margin:2px 0">'
+            f'<summary style="cursor:pointer;font-size:11px;color:#888;padding:2px 0">'
+            f'<span class="tag {severity}">{short}</span> '
+            f'<span style="font-size:12px;font-weight:500">{count}/{len(metrics_list)} layers</span>'
+            f' — {layers_str}'
+            f'{desc_suffix}'
+            f'</summary>'
+            f'{evidence_lines}'
+            f'</details>'
+        )
+        parts += collapsible + '\n'
     return parts
 
 
@@ -789,6 +905,131 @@ def _model_config_card(cfg: ModelConfig) -> str:
     if cfg.activation_checkpointing is not None:
         parts.append(f"act ckpt <b>{cfg.activation_checkpointing:.0%}</b>")
     return f'<div style="margin:6px 0 14px;padding:8px 14px;border:1px solid #ddd;font-size:13px;color:#555;line-height:1.7"><b>Model config:</b> {", ".join(parts)}</div>\n'
+
+
+def _render_metric_registry() -> str:
+    """Render the METRIC_REGISTRY as a table showing description, calculation, unit, and which bottlenecks use each metric."""
+    rows = ""
+    used = {k: v for k, v in METRIC_REGISTRY.items() if v.get("used_by")}
+    unused = {k: v for k, v in METRIC_REGISTRY.items() if not v.get("used_by")}
+
+    for label, group in [("Used by bottleneck detection", used), ("Informational only (not used by detection)", unused)]:
+        if not group:
+            continue
+        rows += f'<tr style="background:#f5f5f5"><td colspan="5" style="font-weight:600;font-size:11px;padding:6px 7px;text-align:left">{label}</td></tr>\n'
+        for key, info in sorted(group.items()):
+            desc = info.get("description", "")
+            calc = info.get("calculation", "")
+            unit = info.get("unit", "")
+            used_by = info.get("used_by", [])
+            used_str = ", ".join(used_by) if used_by else '<span style="color:#999">—</span>'
+            calc_cell = f'<span style="font-size:10px;color:#666;font-style:italic">{calc}</span>' if calc else '<span style="color:#999;font-size:10px">—</span>'
+            rows += (
+                f"<tr>"
+                f"<td style='font-family:monospace;font-size:10px;white-space:nowrap'>{key}</td>"
+                f"<td style='font-size:10px;color:#555'>{desc}</td>"
+                f"<td>{calc_cell}</td>"
+                f"<td style='font-size:10px'>{unit}</td>"
+                f"<td style='font-size:10px'>{used_str}</td>"
+                f"</tr>\n"
+            )
+
+    return f"""<div class="section">
+<h2>Metric Registry</h2>
+<details>
+<summary style="cursor:pointer;font-size:12px;color:#555;padding:4px 0;margin-bottom:4px">
+All {len(METRIC_REGISTRY)} metrics — click to expand
+</summary>
+<p style="font-size:11px;color:#888;margin-bottom:8px">
+The "used_by" column shows which bottlenecks consume each metric — metrics with no consumers are informational only.
+</p>
+<div class="table-wrap">
+<table>
+<thead><tr>
+<th style="text-align:left">Metric</th>
+<th style="text-align:left">Description</th>
+<th style="text-align:left">Calculation</th>
+<th>Unit</th>
+<th style="text-align:left">Used by</th>
+</tr></thead>
+<tbody>
+{rows}
+</tbody>
+</table>
+</div>
+</details>
+</div>"""
+
+
+def _render_threshold_registry() -> str:
+    """Render the THRESHOLD_REGISTRY as a table showing value, rationale, physical justification, and which bottlenecks use each threshold."""
+    import re as _re
+    rows = ""
+    sections = {
+        "A": ("Classical bottleneck thresholds", []),
+        "B": ("FSDP2 / TP / async TP specific thresholds", []),
+        "C": ("Communication-hiding / BW bottleneck thresholds", []),
+    }
+    for key, info in THRESHOLD_REGISTRY.items():
+        val = info.get("value", "")
+        val_s = f"{val:.0%}" if isinstance(val, float) and 0 < val < 1 else str(val)
+        rat = info.get("rationale", "")
+        phys = info.get("physical_justification", "")
+        used_by = info.get("used_by", [])
+        used_str = ", ".join(used_by) if used_by else '<span style="color:#999">—</span>'
+        key_lower = key.lower()
+        if any(w in key_lower for w in ["comp_heavy", "comm_heavy", "io_heavy", "ag_heavy", "rs_heavy", "tp_heavy", "optimizer_heavy", "util_low"]):
+            sections["A"][1].append((key, val_s, rat, phys, used_str))
+        elif any(w in key_lower for w in ["small_kernel", "async_tp", "overlap_asymmetry", "host_bound", "copy_heavy", "fwd_bwd", "serial_ratio"]):
+            sections["B"][1].append((key, val_s, rat, phys, used_str))
+        else:
+            sections["C"][1].append((key, val_s, rat, phys, used_str))
+
+    for sec_id, (sec_title, items) in sections.items():
+        if not items:
+            continue
+        sec_id_attr = _re.sub(r"[^a-zA-Z0-9_-]", "", sec_title.replace(" ", "-").lower())
+        rows += (
+            f'<tr style="background:#f5f5f5">'
+            f'<td colspan="5" style="font-weight:600;font-size:11px;padding:8px 7px;text-align:left">'
+            f'Sec {sec_id} — {sec_title} ({len(items)} thresholds)</td></tr>\n'
+        )
+        for key, val_s, rat, phys, used_str in items:
+            rows += (
+                f"<tr>"
+                f"<td style='font-family:monospace;font-size:10px;white-space:nowrap'>{key}</td>"
+                f"<td style='font-size:10px;color:#555'>{rat}</td>"
+                f"<td style='font-size:10px;font-weight:500'>{val_s}</td>"
+                f"<td style='font-size:10px;color:#444;font-style:italic;max-width:360px'>{phys}</td>"
+                f"<td style='font-size:10px'>{used_str}</td>"
+                f"</tr>\n"
+            )
+
+    return f"""<div class="section">
+<h2>Threshold Registry</h2>
+<details>
+<summary style="cursor:pointer;font-size:12px;color:#555;padding:4px 0;margin-bottom:4px">
+All {len(THRESHOLD_REGISTRY)} thresholds with physical justifications — click to expand
+</summary>
+<p style="font-size:11px;color:#888;margin-bottom:8px">
+Each threshold is documented with its numeric value, detection rationale, and the physical or architectural model it derives from (roofline model, NCCL bandwidth model, Amdahl's law, GPU architecture specs for H100-SXM). Thresholds are grouped by their section in the detection logic.
+</p>
+<div class="table-wrap">
+<table>
+<thead><tr>
+<th style="text-align:left">Threshold</th>
+<th style="text-align:left">Rationale</th>
+<th>Value</th>
+<th style="text-align:left">Physical Justification</th>
+<th style="text-align:left">Used by</th>
+</tr></thead>
+<tbody>
+{rows}
+</tbody>
+</table>
+</div>
+</details>
+</div>"""
 
 
 def generate_html_report(trace_file: str, output_path: str = None, model_config: ModelConfig = None):
@@ -832,6 +1073,8 @@ def generate_html_report(trace_file: str, output_path: str = None, model_config:
         EFFICIENCY_TABLE=_efficiency_table(aggregated, metrics_list),
         BOTTLENECK_TAGS=_bottleneck_tags(metrics_list),
         PER_UNIT_TABLE=_per_unit_table(metrics_list),
+        METRIC_REGISTRY_SECTION=_render_metric_registry(),
+        THRESHOLD_REGISTRY_SECTION=_render_threshold_registry(),
     )
     html = _render_page(title, body, json.dumps(chart_data))
     with open(output_path, 'w') as f:
@@ -1344,6 +1587,8 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
         TABLE_ROWS=table_rows,
         BOTTLENECK_LEGEND=bneck_legend,
         BOTTLENECK_SECTIONS=bneck_sections,
+        METRIC_REGISTRY_SECTION=_render_metric_registry(),
+        THRESHOLD_REGISTRY_SECTION=_render_threshold_registry(),
     )
     chart_data = json.dumps({"compare": compare_data})
     html = _render_page(title, body, chart_data)
