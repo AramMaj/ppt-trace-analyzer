@@ -36,7 +36,7 @@ from trace_parser import LogicalOperation, TraceParserHelper
 FSDP_PREFIXES = ('FSDP::', 'FullyShardedDataParallel::')
 
 TP_PG_DESC = 'mesh_tp'
-FSDP_PG_DESC = 'mesh_fsdp'
+FSDP_PG_DESCS = {'mesh_fsdp', 'mesh_dp_shard'}
 
 NCCL_COLLECTIVE_NAMES = {
     'allgather': 'tp_all_gather',
@@ -631,7 +631,7 @@ class StandardFSDPDetector:
             for ev in self.gpu_events:
                 pg = ev.get('_pg_desc', '')
                 coll = ev.get('_coll_name', '')
-                if pg == FSDP_PG_DESC and 'reduce_scatter' in coll.lower():
+                if pg in FSDP_PG_DESCS and 'reduce_scatter' in coll.lower():
                     ev_start = ev.get('ts', 0)
                     ev_end = ev_start + ev.get('dur', 0)
                     if ev_start >= bwd_span[0] and ev_end <= bwd_span[1] + 1000:
@@ -661,8 +661,110 @@ class StandardFSDPDetector:
                 return raw.get("tid")
         return None
 
+    def _detect_fsdp_gpu_fallback(self, fsdp: FSDP):
+        """Attribute FSDP NCCL kernels (mesh_dp_shard, mesh_fsdp) that were
+        missed by CPU-tree-based GPU kernel attribution.
+
+        The CPU-tree pipeline attributes GPU kernels to CPU phase nodes via
+        External ID correlation + time-overlap heuristics.  In async TP traces,
+        NCCL kernels on ``mesh_dp_shard`` execute on dedicated CUDA streams
+        whose External IDs don't match the CPU tree, so they fall through.
+
+        This fallback scans GPU events for FSDP-PG NCCL kernels that haven't
+        been attributed to any unit's phase, and patches them onto the
+        best-matching layer's existing phase node using nearest-span matching
+        (handles pre-fetch AG before layer 0, and kernels in pipeline gaps).
+        """
+        attr_ag_fwd = set()
+        attr_ag_bwd = set()
+        attr_rs = set()
+        for unit in fsdp.units:
+            for n in unit.all_gather_fwd:
+                for k in n.direct_gpu_kernels:
+                    attr_ag_fwd.add((k.get('ts', 0), k.get('dur', 0)))
+            for n in unit.all_gather_bwd + unit.all_gather_bwd_nccl:
+                for k in n.direct_gpu_kernels:
+                    attr_ag_bwd.add((k.get('ts', 0), k.get('dur', 0)))
+            for n in unit.reduce_scatter:
+                for k in n.direct_gpu_kernels:
+                    attr_rs.add((k.get('ts', 0), k.get('dur', 0)))
+
+        # Pre-compute fwd/bwd span lists with layer index for efficient matching
+        fwd_spans = [(i, u.fwd_compute_span) for i, u in enumerate(fsdp.units)
+                     if u.fwd_compute_span]
+        bwd_spans = [(i, u.bwd_compute_span) for i, u in enumerate(fsdp.units)
+                     if u.bwd_compute_span]
+
+        def _nearest_span(ts, ev_end, span_list):
+            """Find (layer_idx, span) with smallest gap to kernel [ts, ev_end].
+            Returns (idx, span, gap) or (None, None, inf)."""
+            best_i, best_span, best_gap = None, None, float('inf')
+            for i, span in span_list:
+                if ts >= span[0] and ev_end <= span[1]:
+                    return i, span, 0.0  # perfect containment
+                if ev_end <= span[0]:
+                    gap = span[0] - ev_end
+                elif ts >= span[1]:
+                    gap = ts - span[1]
+                else:
+                    gap = 0.0  # partial overlap
+                if gap < best_gap:
+                    best_i, best_span, best_gap = i, span, gap
+            return best_i, best_span, best_gap
+
+        for ev in self.gpu_events:
+            pg = ev.get('_pg_desc', '')
+            if pg not in FSDP_PG_DESCS:
+                continue
+            ts = ev.get('ts', 0)
+            dur = ev.get('dur', 0)
+            fp = (ts, dur)
+
+            cat = _classify_nccl_kernel(ev)
+            ev_end = ts + dur
+
+            if cat == 'tp_all_gather':
+                if fp in attr_ag_fwd or fp in attr_ag_bwd:
+                    continue
+
+                # Pick whichever span (fwd or bwd) is closest — avoids the
+                # fwd-first bias that would misattribute all bwd all-gather
+                # kernels when they happen to be near a forward span.
+                fwd_i, fwd_s, fwd_gap = _nearest_span(ts, ev_end, fwd_spans)
+                bwd_i, bwd_s, bwd_gap = _nearest_span(ts, ev_end, bwd_spans)
+
+                if fwd_i is not None and (fwd_gap <= bwd_gap) and fsdp.units[fwd_i].all_gather_fwd:
+                    fsdp.units[fwd_i].all_gather_fwd[0].direct_gpu_kernels.append(ev)
+                    fsdp.units[fwd_i].all_gather_fwd[0].direct_gpu_duration += dur
+                    fsdp.units[fwd_i].all_gather_fwd[0].gpu_duration += dur
+                    attr_ag_fwd.add(fp)
+                elif bwd_i is not None:
+                    nodes = fsdp.units[bwd_i].all_gather_bwd + fsdp.units[bwd_i].all_gather_bwd_nccl
+                    if not nodes:
+                        # Layer has no AG bwd nodes — find nearest layer that does
+                        for other in fsdp.units:
+                            onodes = other.all_gather_bwd + other.all_gather_bwd_nccl
+                            if onodes:
+                                nodes = onodes
+                                break
+                    if nodes:
+                        nodes[0].direct_gpu_kernels.append(ev)
+                        nodes[0].direct_gpu_duration += dur
+                        nodes[0].gpu_duration += dur
+                        attr_ag_bwd.add(fp)
+
+            elif cat == 'tp_reduce_scatter':
+                if fp in attr_rs:
+                    continue
+                idx, span, gap = _nearest_span(ts, ev_end, bwd_spans)
+                if idx is not None and fsdp.units[idx].reduce_scatter:
+                    fsdp.units[idx].reduce_scatter[0].direct_gpu_kernels.append(ev)
+                    fsdp.units[idx].reduce_scatter[0].direct_gpu_duration += dur
+                    fsdp.units[idx].reduce_scatter[0].gpu_duration += dur
+                    attr_rs.add(fp)
+
     def extract_fsdp_phases(self, roots: List[LogicalOperation]) -> FSDP:
-        """Run all seven sub-detectors in dependency order and return the populated ``FSDP`` container.
+        """Run all eight sub-detectors in dependency order and return the populated ``FSDP`` container.
 
         Order matters:
         1. ``_detect_all_gather_fwd`` — identifies layers (pre_forward → layer name)
@@ -672,6 +774,7 @@ class StandardFSDPDetector:
         5. ``_detect_bwd_cmp`` — needs pre_backward + reduce_scatter boundaries
         6. ``_detect_optimizer_step`` — independent, collects Optimizer.step/zero_grad
         7. ``_detect_tp_gpu`` — independent, classifies mesh_tp GPU kernels from gpu_events
+        8. ``_detect_fsdp_gpu_fallback`` — catches FSDP NCCL kernels missed by CPU-tree attribution
 
         This single call transforms the raw CPU tree into structured phases consumed
         by the bottleneck detector, report, timeline, and annotator.
@@ -699,5 +802,6 @@ class StandardFSDPDetector:
         self._detect_bwd_cmp(roots, fsdp, profiler_tid)
         self._detect_optimizer_step(roots, fsdp)
         self._detect_tp_gpu(fsdp)
+        self._detect_fsdp_gpu_fallback(fsdp)
 
         return fsdp
