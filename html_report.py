@@ -907,6 +907,61 @@ def _model_config_card(cfg: ModelConfig) -> str:
     return f'<div style="margin:6px 0 14px;padding:8px 14px;border:1px solid #ddd;font-size:13px;color:#555;line-height:1.7"><b>Model config:</b> {", ".join(parts)}</div>\n'
 
 
+def _render_metric_registry() -> str:
+    """Render the METRIC_REGISTRY as a table showing description, calculation, unit, and which bottlenecks use each metric."""
+    rows = ""
+    used = {k: v for k, v in METRIC_REGISTRY.items() if v.get("used_by")}
+    unused = {k: v for k, v in METRIC_REGISTRY.items() if not v.get("used_by")}
+
+    for label, group in [("Used by bottleneck detection", used), ("Informational only (not used by detection)", unused)]:
+        if not group:
+            continue
+        rows += f'<tr style="background:#f5f5f5"><td colspan="5" style="font-weight:600;font-size:11px;padding:6px 7px;text-align:left">{label}</td></tr>\n'
+        for key, info in sorted(group.items()):
+            desc = info.get("description", "")
+            calc = info.get("calculation", "")
+            unit = info.get("unit", "")
+            used_by = info.get("used_by", [])
+            used_str = ", ".join(used_by) if used_by else '<span style="color:#999">—</span>'
+            calc_cell = f'<span style="font-size:10px;color:#666;font-style:italic">{calc}</span>' if calc else '<span style="color:#999;font-size:10px">—</span>'
+            rows += (
+                f"<tr>"
+                f"<td style='font-family:monospace;font-size:10px;white-space:nowrap'>{key}</td>"
+                f"<td style='font-size:10px;color:#555'>{desc}</td>"
+                f"<td>{calc_cell}</td>"
+                f"<td style='font-size:10px'>{unit}</td>"
+                f"<td style='font-size:10px'>{used_str}</td>"
+                f"</tr>\n"
+            )
+
+    return f"""<div class="section">
+<h2>Metric Registry</h2>
+<details>
+<summary style="cursor:pointer;font-size:12px;color:#555;padding:4px 0;margin-bottom:4px">
+All {len(METRIC_REGISTRY)} metrics — click to expand
+</summary>
+<p style="font-size:11px;color:#888;margin-bottom:8px">
+The "used_by" column shows which bottlenecks consume each metric — metrics with no consumers are informational only.
+</p>
+<div class="table-wrap">
+<table>
+<thead><tr>
+<th style="text-align:left">Metric</th>
+<th style="text-align:left">Description</th>
+<th style="text-align:left">Calculation</th>
+<th>Unit</th>
+<th style="text-align:left">Used by</th>
+</tr></thead>
+<tbody>
+{rows}
+</tbody>
+</table>
+</div>
+</details>
+</div>"""
+
+
+
 def generate_html_report(trace_file: str, output_path: str = None, model_config: ModelConfig = None):
     """Run the full pipeline and write an enhanced HTML report with charts."""
     result = process_trace(trace_file, model_config=model_config)
@@ -948,6 +1003,7 @@ def generate_html_report(trace_file: str, output_path: str = None, model_config:
         EFFICIENCY_TABLE=_efficiency_table(aggregated, metrics_list),
         BOTTLENECK_TAGS=_bottleneck_tags(metrics_list),
         PER_UNIT_TABLE=_per_unit_table(metrics_list),
+        METRIC_REGISTRY_SECTION=_render_metric_registry(),
     )
     html = _render_page(title, body, json.dumps(chart_data))
     with open(output_path, 'w') as f:
@@ -1460,6 +1516,7 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
         TABLE_ROWS=table_rows,
         BOTTLENECK_LEGEND=bneck_legend,
         BOTTLENECK_SECTIONS=bneck_sections,
+        METRIC_REGISTRY_SECTION=_render_metric_registry(),
     )
     chart_data = json.dumps({"compare": compare_data})
     html = _render_page(title, body, chart_data)
