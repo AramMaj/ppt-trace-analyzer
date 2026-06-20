@@ -706,17 +706,13 @@ BOTTLENECK_DESCRIPTIONS = {
         "Forward and backward phases use noticeably different GPU time. This may be natural with "
         "activation checkpointing; if extreme, check for gradient accumulation asymmetry.",
 
-    "inter-node BW":
-        "All-gather GPU time approaches or exceeds forward compute — the gather is fully exposed. "
-        "Upgrade inter-node bandwidth (IB/RoCE), overlap AG with compute, or use async AG.",
-
     "HBM bandwidth-bound":
         "Compute kernels average <8 µs with low GPU utilisation — memory-bandwidth-limited. "
         "Check for suboptimal tensor shapes or use memory-bound-optimized kernel implementations.",
 
-    "RS injection pressure":
-        "Reduce-scatter contends with backward compute for GPU resources (both active on separate "
-        "streams). Try gradient accumulation or increasing the sharding degree to reduce RS size.",
+    "exposed all-gather":
+        "All-gather GPU time approaches or exceeds forward compute — the gather is fully exposed. "
+        "Upgrade inter-node bandwidth (IB/RoCE), overlap AG with compute, or use async AG.",
 
     "synchronous TP on critical path":
         "TP collectives overlap poorly with compute and sit on the critical path. This defeats "
@@ -737,6 +733,30 @@ BOTTLENECK_DESCRIPTIONS = {
     "low cross-layer GPU overlap":
         "Adjacent layers' GPU spans overlap by <20%. The pipeline stagger is not keeping the GPU "
         "busy — try increasing the number of in-flight layers or narrowing the pipeline window.",
+
+    "AG fwd dominates":
+        "All-gather forward consumes a disproportionate share of GPU time. Likely a pipeline "
+        "bottleneck or insufficient overlap with compute.",
+
+    "AG bwd dominates":
+        "All-gather backward consumes a disproportionate share of GPU time. Likely a pipeline "
+        "bottleneck or insufficient overlap with backward compute.",
+
+    "RS dominates":
+        "Reduce-scatter consumes a disproportionate share of GPU time. Check gradient accumulation "
+        "or injection pressure.",
+
+    "Optimizer dominates":
+        "The optimizer step consumes a disproportionate share of GPU time. Consider a fused optimizer "
+        "or reduce precision for optimizer states.",
+
+    "TP dominates":
+        "Tensor-parallel collectives dominate GPU time. Consider reducing TP degree or fusing "
+        "TP communication kernels.",
+
+    "RS exceeds bwd compute":
+        "Reduce-scatter GPU time exceeds backward compute GPU time — strong injection pressure. "
+        "Consider gradient accumulation or increasing sharding degree.",
 }
 
 def _bottleneck_tags(metrics_list: list) -> str:
