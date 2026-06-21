@@ -604,6 +604,9 @@ def _analyze_step(
     parser.attribute_gpu_kernel_with_logical_operation(roots)
     parser.attribute_memory(roots)
 
+    from bottleneck_detector import _compute_ag_per_layer
+    ag_per_layer = _compute_ag_per_layer(roots)
+
     detector = StandardFSDPDetector(gpu_events=parser.gpu_events)
     fsdp = detector.extract_fsdp_phases(roots)
 
@@ -620,7 +623,8 @@ def _analyze_step(
     for unit in fsdp.units:
         unit.ag_bwd_supplement_us = ac2g_supplement.get(unit.layer_name, 0.0)
 
-    report = Report(fsdp, roots, output_path=None, model_config=model_config)
+    report = Report(fsdp, roots, output_path=None, model_config=model_config,
+                    ag_per_layer=ag_per_layer)
     report.generate_report()
 
     return fsdp, report, roots

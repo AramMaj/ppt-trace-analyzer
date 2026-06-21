@@ -15,11 +15,11 @@ Six sections:
 """
 
 import json
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 
-from trace_parser import LogicalOperation
-from fsdp_detector import FSDP, FSDPUnit, FSDP_PREFIXES
+from trace_parser import LogicalOperation, TraceParserHelper
+from fsdp_detector import FSDP, FSDPUnit, FSDP_PREFIXES, FSDP_PG_DESCS, _extract_layer
 
 # NB: Own DFS in _collect_gpu_kernels rather than reusing _iter_logical from fsdp_detector.
 
@@ -88,11 +88,28 @@ def _is_fsdp_name(name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _phase_gpu_time(nodes: List[LogicalOperation]) -> float:
-    """Sum of inclusive GPU duration across nodes (aggregate CUDA kernel time,
-    NCCL collective time, memcpy).  ``gpu_duration`` is already the inclusive
-    sum per node, so this is not a unioned time range.
+    """Unique GPU duration across all nodes' subtrees.
+
+    Collects direct GPU-kernel events from the entire subtree of each node
+    (via DFS), deduplicates by ``(timestamp, duration)``, and returns the
+    sum.  This avoids over-counting when ancestor-descendant pairs appear
+    in the same node list (as happens with time-window-based phase attribution
+    under ``torch.compile``, where a single ``CompiledFunctionBackward`` node
+    wraps many child events that all fall inside the same phase window).
+
+    When subtrees are disjoint (the common case) the result is identical to
+    ``sum(n.gpu_duration for n in nodes)`` but never over-counts.
     """
-    return sum(n.gpu_duration for n in nodes)
+    seen: Set[Tuple[float, float]] = set()
+    stack = list(nodes)
+    while stack:
+        n = stack.pop()
+        for gpu in (n.direct_gpu_kernels or []):
+            dur = gpu.get('dur', 0)
+            if dur > 0:
+                seen.add((gpu.get('ts', 0), dur))
+        stack.extend(n.children)
+    return sum(dur for _, dur in seen)
 
 
 def _phase_gpu_time_direct(nodes: List[LogicalOperation]) -> float:
@@ -438,6 +455,74 @@ class ModelConfig:
         return self.gpu_hbm_bw_gbps * 1e9
 
 
+def _compute_ag_per_layer(root_nodes):
+    """Walk all CPU nodes and compute per-layer FSDP all-gather GPU time.
+
+    Uses ``_pg_desc`` to distinguish FSDP all-gather kernels (``mesh_dp_shard``
+    or ``mesh_fsdp``) from TP redistribute all-gathers, then classifies each
+    kernel as forward or backward by walking its CPU ancestor chain.
+
+    Returns ``{layer_name: (ag_fwd_us, ag_bwd_us)}`` — one entry per layer
+    that has FSDP all-gather kernels.  Layers with no FSDP all-gather (e.g.
+    the last layer when backward_prefetch is absent) get ``(0, 0)``.
+    """
+    all_nodes = list(TraceParserHelper.iter_nodes(root_nodes))
+
+    parent_map = {}
+    stack = list(root_nodes)
+    while stack:
+        n = stack.pop()
+        for ch in n.children:
+            parent_map[id(ch)] = n
+            stack.append(ch)
+
+    from collections import defaultdict
+    totals = defaultdict(lambda: [0.0, 0.0])  # layer -> [fwd, bwd]
+    seen = set()
+
+    for node in all_nodes:
+        for gpu in (node.direct_gpu_kernels or []):
+            if gpu.get('_pg_desc', '') not in FSDP_PG_DESCS:
+                continue
+            name = gpu.get('name', '').lower()
+            if 'nccl' not in name or not ('allgather' in name or 'all_gather' in name):
+                continue
+            key = (gpu.get('ts', 0), gpu.get('dur', 0))
+            if key in seen:
+                continue
+            seen.add(key)
+            dur = gpu.get('dur', 0)
+
+            layer = None
+            phase = None
+            curr = node
+            while curr is not None:
+                cn = curr.name
+                if cn.startswith(FSDP_PREFIXES):
+                    if 'pre_forward' in cn:
+                        layer = _extract_layer(cn) if '(' in cn else None
+                        phase = 'fwd'
+                        break
+                    if 'backward_prefetch' in cn:
+                        idx = cn.find(' for ')
+                        layer = cn[idx + 5:] if idx >= 0 else None
+                        phase = 'bwd'
+                        break
+                    if 'pre_backward' in cn:
+                        layer = _extract_layer(cn) if '(' in cn else None
+                        phase = 'bwd'
+                        break
+                curr = parent_map.get(id(curr))
+
+            if layer and phase:
+                if phase == 'fwd':
+                    totals[layer][0] += dur
+                else:
+                    totals[layer][1] += dur
+
+    return dict(totals)
+
+
 class Metrics:
     """Per-layer computed metrics — all derived quantities for a single FSDP unit.
 
@@ -455,22 +540,33 @@ class Metrics:
                  num_units: int = 1, global_tp_ag_gpu: float = 0.0,
                  global_tp_rs_gpu: float = 0.0,
                  global_tp_ar_gpu: float = 0.0,
-                 tp_kernels: Optional[List[dict]] = None):
+                 tp_kernels: Optional[List[dict]] = None,
+                 ag_per_layer: Optional[Dict[str, Tuple[float, float]]] = None):
         self.layer_name = unit.layer_name
+        ln = unit.layer_name
 
         # --- Phase raw times — these are the building blocks for everything ---
-        self.ag_fwd_gpu = _phase_gpu_time(unit.all_gather_fwd)
+        if ag_per_layer is not None and ln in ag_per_layer:
+            self.ag_fwd_gpu = ag_per_layer[ln][0]
+            self.ag_bwd_gpu = ag_per_layer[ln][1] + unit.ag_bwd_supplement_us
+        else:
+            self.ag_fwd_gpu = _phase_gpu_time(unit.all_gather_fwd)
+            self.ag_bwd_gpu = (_phase_gpu_time(unit.all_gather_bwd)
+                               + _phase_gpu_time(unit.all_gather_bwd_nccl)
+                               + unit.ag_bwd_supplement_us
+                               + _collect_nccl_kernel_time(unit.bwd_compute))
         self.ag_fwd_cpu = _phase_cpu_time(unit.all_gather_fwd)
         self.ag_fwd_wall = _phase_wall_time(unit.all_gather_fwd)
+        self.ag_bwd_cpu = (_phase_cpu_time(unit.all_gather_bwd)
+                           + _phase_cpu_time(unit.all_gather_bwd_nccl))
+        self.ag_bwd_wall = _phase_wall_time(
+            unit.all_gather_bwd + unit.all_gather_bwd_nccl)
 
         self.fwd_cmp_gpu = _phase_gpu_time_direct(unit.fwd_compute)
         self.fwd_cmp_cpu = _phase_cpu_time(unit.fwd_compute)
         self.fwd_cmp_wall = _phase_wall_time(unit.fwd_compute, unit.fwd_compute_span)
 
-        self.ag_bwd_gpu = (_phase_gpu_time(unit.all_gather_bwd)
-                           + _phase_gpu_time(unit.all_gather_bwd_nccl)
-                           + unit.ag_bwd_supplement_us
-                           + _collect_nccl_kernel_time(unit.bwd_compute))
+        self.bwd_cmp_gpu = _phase_gpu_time_direct(unit.bwd_compute)
         self.ag_bwd_cpu = (_phase_cpu_time(unit.all_gather_bwd)
                            + _phase_cpu_time(unit.all_gather_bwd_nccl))
         self.ag_bwd_wall = _phase_wall_time(
@@ -1286,7 +1382,8 @@ class Report:
 
     def __init__(self, fsdp: FSDP, root_nodes: List[LogicalOperation],
                  output_path: Optional[str] = None,
-                 model_config: Optional[ModelConfig] = None):
+                 model_config: Optional[ModelConfig] = None,
+                 ag_per_layer: Optional[Dict[str, Tuple[float, float]]] = None):
         self.fsdp = fsdp
         self.root_nodes = root_nodes
         self.output_path = output_path
@@ -1294,6 +1391,7 @@ class Report:
         self.metrics_list: List[Metrics] = []
         self.aggregated: Dict[str, float] = {}
         self.throughput_metrics: Dict[str, float] = {}
+        self._ag_per_layer = ag_per_layer
 
     def generate_report(self):
         """Build metrics, compute aggregates, format text + JSON, write to file if configured.
@@ -1306,9 +1404,11 @@ class Report:
         tp_rs = self.fsdp.tp_reduce_scatter_gpu
         tp_ar = self.fsdp.tp_all_reduce_gpu
         tp_kernels = list(self.fsdp.tp_all_gather + self.fsdp.tp_reduce_scatter + self.fsdp.tp_all_reduce)
+        ag_per_layer = self._ag_per_layer if self._ag_per_layer is not None else _compute_ag_per_layer(self.root_nodes)
         for unit in self.fsdp.units:
             self.metrics_list.append(Metrics(unit, opt_gpu, opt_cpu, num_units,
-                                             tp_ag, tp_rs, tp_ar, tp_kernels=tp_kernels))
+                                             tp_ag, tp_rs, tp_ar, tp_kernels=tp_kernels,
+                                             ag_per_layer=ag_per_layer))
 
         self._compute_aggregated()
         self._compute_throughput()
