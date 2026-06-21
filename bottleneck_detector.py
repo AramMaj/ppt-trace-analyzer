@@ -45,19 +45,21 @@ def _collect_gpu_kernels(nodes):
 
 
 def _collect_nccl_kernel_time(nodes):
-    """DFS-sum of NCCL GPU kernel durations from *nodes* and their subtrees.
+    """DFS-sum of AllGather NCCL GPU kernel durations from *nodes* and their subtrees.
 
-    Only kernels with ``'nccl'`` in their name are counted.
-    ``gpu_duration`` is not reused because it includes child compute kernels;
-    we need raw NCCL direct-GPU-kernel durations for re-attribution between
-    backward compute and all-gather phases.
+    Only AllGather kernels (not ReduceScatter, AllReduce, etc.) are counted
+    because this function is used to capture backward-prefetch all-gather
+    kernels that live structurally inside backward compute but are functionally
+    all-gather backward work.  Including other NCCL types would inflate the
+    all-gather backward metric with ReduceScatter time.
     """
     total = 0.0
     stack = list(nodes)
     while stack:
         n = stack.pop()
         for gpu in (n.direct_gpu_kernels or []):
-            if 'nccl' in gpu.get('name', '').lower():
+            name = gpu.get('name', '').lower()
+            if 'nccl' in name and ('allgather' in name or 'all_gather' in name):
                 total += gpu.get('dur', 0)
         stack.extend(n.children)
     return total
@@ -564,10 +566,30 @@ class Metrics:
         self.bwd_comp_comm_overlap = 0.0
         self.pipeline_overlap_ratio = 0.0
         if tp_kernels and unit.fwd_compute and unit.bwd_compute:
-            fwd_start = unit.fwd_compute[0].start_time
-            fwd_end = unit.fwd_compute[-1].end_time
-            bwd_start = unit.bwd_compute[0].start_time
-            bwd_end = unit.bwd_compute[-1].end_time
+            # Use the union of CPU event window and GPU kernel window to
+            # determine which TP kernels overlap with compute phase execution.
+            # Pure CPU timestamps are unreliable with torch.compile (very short
+            # CPU dispatch windows don't capture async GPU kernel execution).
+            fwd_kernels = _collect_gpu_kernels(unit.fwd_compute)
+            bwd_kernels = _collect_gpu_kernels(unit.bwd_compute)
+            fwd_cpu_start = unit.fwd_compute[0].start_time
+            fwd_cpu_end = unit.fwd_compute[-1].end_time
+            bwd_cpu_start = unit.bwd_compute[0].start_time
+            bwd_cpu_end = unit.bwd_compute[-1].end_time
+            if fwd_kernels:
+                fwd_start = min(fwd_cpu_start,
+                                min(k.get('ts', 0) for k in fwd_kernels))
+                fwd_end = max(fwd_cpu_end,
+                              max(k.get('ts', 0) + k.get('dur', 0) for k in fwd_kernels))
+            else:
+                fwd_start, fwd_end = fwd_cpu_start, fwd_cpu_end
+            if bwd_kernels:
+                bwd_start = min(bwd_cpu_start,
+                                min(k.get('ts', 0) for k in bwd_kernels))
+                bwd_end = max(bwd_cpu_end,
+                              max(k.get('ts', 0) + k.get('dur', 0) for k in bwd_kernels))
+            else:
+                bwd_start, bwd_end = bwd_cpu_start, bwd_cpu_end
             fwd_wall = fwd_end - fwd_start
             bwd_wall = bwd_end - bwd_start
             fwd_tp = sum(k.get('dur', 0) for k in tp_kernels

@@ -661,6 +661,24 @@ class StandardFSDPDetector:
                 return raw.get("tid")
         return None
 
+    @staticmethod
+    def _get_nodes_gpu_span(nodes):
+        """Union GPU kernel span for a list of LogicalOperation nodes.
+        Returns ``(start, end)`` or ``None`` if no GPU kernels found.
+        """
+        all_kernels = []
+        stack = list(nodes)
+        while stack:
+            n = stack.pop()
+            if n.direct_gpu_kernels:
+                all_kernels.extend(n.direct_gpu_kernels)
+            stack.extend(n.children)
+        if not all_kernels:
+            return None
+        start = min(k.get('ts', 0) for k in all_kernels)
+        end = max(k.get('ts', 0) + k.get('dur', 0) for k in all_kernels)
+        return (start, end)
+
     def _detect_fsdp_gpu_fallback(self, fsdp: FSDP):
         """Attribute FSDP NCCL kernels (mesh_dp_shard, mesh_fsdp) that were
         missed by CPU-tree-based GPU kernel attribution.
@@ -674,6 +692,10 @@ class StandardFSDPDetector:
         been attributed to any unit's phase, and patches them onto the
         best-matching layer's existing phase node using nearest-span matching
         (handles pre-fetch AG before layer 0, and kernels in pipeline gaps).
+
+        Uses the **union** of CPU compute-span and GPU kernel-span so that
+        ``torch.compile`` traces (where CPU dispatch is very short) still
+        match NCCL kernels to the correct forward or backward phase.
         """
         attr_ag_fwd = set()
         attr_ag_bwd = set()
@@ -689,11 +711,32 @@ class StandardFSDPDetector:
                 for k in n.direct_gpu_kernels:
                     attr_rs.add((k.get('ts', 0), k.get('dur', 0)))
 
-        # Pre-compute fwd/bwd span lists with layer index for efficient matching
-        fwd_spans = [(i, u.fwd_compute_span) for i, u in enumerate(fsdp.units)
-                     if u.fwd_compute_span]
-        bwd_spans = [(i, u.bwd_compute_span) for i, u in enumerate(fsdp.units)
-                     if u.bwd_compute_span]
+        # Pre-compute fwd/bwd span lists using UNION of CPU and GPU windows
+        def _combined_span(unit, cpu_span, phase_nodes):
+            cpu = cpu_span
+            gpu = self._get_nodes_gpu_span(phase_nodes)
+            if cpu is None and gpu is None:
+                return None
+            start = float('inf')
+            end = float('-inf')
+            if cpu is not None:
+                start = min(start, cpu[0])
+                end = max(end, cpu[1])
+            if gpu is not None:
+                start = min(start, gpu[0])
+                end = max(end, gpu[1])
+            return (start, end)
+
+        fwd_spans = []
+        for i, u in enumerate(fsdp.units):
+            span = _combined_span(u, u.fwd_compute_span, u.fwd_compute)
+            if span is not None:
+                fwd_spans.append((i, span))
+        bwd_spans = []
+        for i, u in enumerate(fsdp.units):
+            span = _combined_span(u, u.bwd_compute_span, u.bwd_compute)
+            if span is not None:
+                bwd_spans.append((i, span))
 
         def _nearest_span(ts, ev_end, span_list):
             """Find (layer_idx, span) with smallest gap to kernel [ts, ev_end].
