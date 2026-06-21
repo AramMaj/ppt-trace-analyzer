@@ -34,10 +34,10 @@ METRIC_REGISTRY = {
         "calculation": "_phase_gpu_time_direct(unit.fwd_compute) — sum of direct GPU kernel durations in forward compute",
     },
     "ag_bwd_gpu_us": {
-        "description": "All-gather backward GPU time — NCCL kernel duration for the backward all-gather (including NCCL kernels found inside bwd compute phases and ac2g supplement)",
+        "description": "All-gather backward GPU time — NCCL kernel duration for the backward all-gather (ancestry-based _compute_ag_per_layer + ac2g supplement)",
         "used_by": ["all-gather-heavy", "reduce-scatter-heavy", "fwd-bwd imbalance", "dominant phase"],
         "unit": "µs",
-        "calculation": "_phase_gpu_time(unit.all_gather_bwd) + _phase_gpu_time(unit.all_gather_bwd_nccl) + unit.ag_bwd_supplement_us + _collect_nccl_kernel_time(unit.bwd_compute) — NCCL AG bwd + NCCL in bwd compute",
+        "calculation": "_compute_ag_per_layer[layer] (bwd) + unit.ag_bwd_supplement_us — ancestry-based AG bwd + ac2g supplement",
     },
     "bwd_cmp_gpu_us": {
         "description": "Backward compute GPU time — gradient computation kernels (direct, non-overlapping)",
