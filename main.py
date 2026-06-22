@@ -159,6 +159,8 @@ def main():
         roots = parser.build_tree()
         parser.attribute_gpu_kernel_with_logical_operation(roots)
         parser.attribute_memory(roots)
+        from bottleneck_detector import _compute_ag_per_layer
+        ag_per_layer = _compute_ag_per_layer(roots)
         step_start, step_end = select_profiler_step(roots, parser)
         detector = StandardFSDPDetector(gpu_events=parser.gpu_events)
         fsdp = detector.extract_fsdp_phases(roots)
@@ -170,7 +172,7 @@ def main():
         ac2g_supplement = _get_ac2g_bwd_supplement(parser.all_events, step_index, num_steps)
         for unit in fsdp.units:
             unit.ag_bwd_supplement_us = ac2g_supplement.get(unit.layer_name, 0.0)
-        report = Report(fsdp, roots, output_path=None)
+        report = Report(fsdp, roots, output_path=None, ag_per_layer=ag_per_layer)
         report.generate_report()
         print_timeline(fsdp, report)
         return
@@ -245,6 +247,8 @@ def main():
     # correlation succeeds even after step-level filtering discards the events.
     parser.attribute_gpu_kernel_with_logical_operation(roots)
     parser.attribute_memory(roots)
+    from bottleneck_detector import _compute_ag_per_layer
+    ag_per_layer = _compute_ag_per_layer(roots)
     step_start, step_end = select_profiler_step(roots, parser)
 
     detector = StandardFSDPDetector(gpu_events=parser.gpu_events)
@@ -260,7 +264,8 @@ def main():
     for unit in fsdp.units:
         unit.ag_bwd_supplement_us = ac2g_supplement.get(unit.layer_name, 0.0)
 
-    report = Report(fsdp, roots, output_path=output_file, model_config=cfg)
+    report = Report(fsdp, roots, output_path=output_file, model_config=cfg,
+                    ag_per_layer=ag_per_layer)
     text, markers = report.generate_report()
     print(text)
 

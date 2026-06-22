@@ -39,6 +39,13 @@ def process_trace(trace_file: str, model_config=None):
     # discards the events themselves.
     parser.attribute_gpu_kernel_with_logical_operation(roots)
     parser.attribute_memory(roots)
+
+    # Compute AG per-layer BEFORE extract_fsdp_phases because
+    # _detect_fsdp_gpu_fallback duplicates AG kernels onto unit phase
+    # nodes, polluting the ancestry-based classification.
+    from bottleneck_detector import _compute_ag_per_layer
+    ag_per_layer = _compute_ag_per_layer(roots)
+
     step_bounds = select_profiler_step(roots, parser)
     step_start, step_end = step_bounds
 
@@ -56,7 +63,8 @@ def process_trace(trace_file: str, model_config=None):
     for unit in fsdp.units:
         unit.ag_bwd_supplement_us = ac2g_supplement.get(unit.layer_name, 0.0)
 
-    report = Report(fsdp, roots, output_path=None, model_config=model_config)
+    report = Report(fsdp, roots, output_path=None, model_config=model_config,
+                    ag_per_layer=ag_per_layer)
     text, markers = report.generate_report()
 
     return report.aggregated, report.metrics_list, fsdp, report, text
@@ -94,6 +102,9 @@ def process_all_steps(trace_file: str, model_config=None):
         parser.attribute_gpu_kernel_with_logical_operation(roots)
         parser.attribute_memory(roots)
 
+        from bottleneck_detector import _compute_ag_per_layer
+        ag_per_layer = _compute_ag_per_layer(roots)
+
         detector = StandardFSDPDetector(gpu_events=parser.gpu_events)
         fsdp = detector.extract_fsdp_phases(roots)
 
@@ -112,7 +123,8 @@ def process_all_steps(trace_file: str, model_config=None):
         for unit in fsdp.units:
             unit.ag_bwd_supplement_us = ac2g_supplement.get(unit.layer_name, 0.0)
 
-        report = Report(fsdp, roots, output_path=None, model_config=model_config)
+        report = Report(fsdp, roots, output_path=None, model_config=model_config,
+                        ag_per_layer=ag_per_layer)
         text, markers = report.generate_report()
         sname = step_name.replace("ProfilerStep#", "Step#")
         results.append((sname, report.aggregated, report.metrics_list, fsdp, report, text))

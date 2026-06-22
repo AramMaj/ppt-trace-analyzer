@@ -1334,7 +1334,7 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
 
     # Overlap & pipeline
     COMPARE_METRICS.append(("Pipeline concurrent execution", lambda r, m: r.get("overlap_ratio", 0), "higher", True))
-    COMPARE_METRICS.append(("Serial execution ratio", lambda r, m: r.get("serial_ratio", 0), "higher", True))
+    COMPARE_METRICS.append(("Serial execution ratio", lambda r, m: r.get("serial_ratio", 0), "lower", True))
     COMPARE_METRICS.append(("Pipeline idle ratio", lambda r, m: r.get("idle_ratio", 0), "lower", True))
 
     # Efficiency (all per-layer averages)
@@ -1369,7 +1369,7 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
 
     # Speedup rows: ratio vs baseline (first trace).  >1.00x = faster.
     speedup_pairs = [("Step wall speedup", "Step wall time"),
-                     ("Total GPU speedup", "Total GPU time")]
+                     ("Total GPU speedup", "Total GPU (avg per layer)")]
     for sname, src_name in speedup_pairs:
         base_val = trace_values[0].get(src_name, 1)
         for ri in range(len(trace_values)):
@@ -1436,12 +1436,13 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
             if do_color and ri > 0 and direction is not None and val is not None and baseline_vals.get(name) is not None:
                 bval = baseline_vals[name]
                 if bval is not None and val != bval:
-                    if _better(val, bval, direction):
-                        cell_class = ' class="cmp-better"'
-                    elif _worse(val, bval, direction):
-                        cell_class = ' class="cmp-worse"'
-                    # Append delta text
-                    formatted += _format_delta(val, bval, name)
+                    delta = _format_delta(val, bval, name)
+                    if delta:  # Only color when the difference passes the threshold (same threshold as delta text)
+                        if _better(val, bval, direction):
+                            cell_class = ' class="cmp-better"'
+                        elif _worse(val, bval, direction):
+                            cell_class = ' class="cmp-worse"'
+                        formatted += delta
             cells += f"<td{cell_class}>{formatted}</td>"
         table_rows += f"<tr>{cells}</tr>\n"
 
@@ -1552,21 +1553,35 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
 
     consistency_warnings = _render_consistency_warnings(all_results, trace_files=trace_files)
 
-    # Verdict card: trace with highest total GPU speedup
-    candidates = [(ri, trace_values[ri].get("Total GPU speedup", 0) or 0) for ri in range(len(trace_values))]
-    best_ri, best_val = max(candidates, key=lambda x: x[1])
-    if best_ri == 0 or best_val <= 1.01:
-        label = trace_labels[0]
-        detail = "(baseline &mdash; no trace is faster)"
-        detail_color = "#888"
-    else:
+    # Verdict card: pick the most informative speedup headline
+    wall_candidates = [(ri, trace_values[ri].get("Step wall speedup", 0) or 0) for ri in range(len(trace_values))]
+    gpu_candidates = [(ri, trace_values[ri].get("Total GPU speedup", 0) or 0) for ri in range(len(trace_values))]
+    wall_vals = [v for _, v in wall_candidates if v > 0]
+    gpu_vals = [v for _, v in gpu_candidates if v > 0]
+    wall_range = max(wall_vals) - min(wall_vals) if len(wall_vals) > 1 else 0
+    gpu_range = max(gpu_vals) - min(gpu_vals) if len(gpu_vals) > 1 else 0
+    if wall_range > 0.02:
+        best_ri, best_val = max(wall_candidates, key=lambda x: x[1])
+        worst_ri, _ = min(wall_candidates, key=lambda x: x[1])
         label = trace_labels[best_ri]
-        detail = f"({best_val:.2f}x total GPU speedup vs {trace_labels[0]})"
-        detail_color = "#666"
+        ratio = best_val / min(wall_vals)
+        detail = f"({ratio:.2f}x step wall vs {trace_labels[worst_ri]})"
+        detail_color = "#666" if best_ri != 0 else "#888"
+    elif gpu_range > 0.01:
+        best_ri, best_val = max(gpu_candidates, key=lambda x: x[1])
+        worst_ri, _ = min(gpu_candidates, key=lambda x: x[1])
+        label = trace_labels[best_ri]
+        ratio = best_val / min(gpu_vals)
+        detail = f"({ratio:.2f}x GPU time vs {trace_labels[worst_ri]})"
+        detail_color = "#666" if best_ri != 0 else "#888"
+    else:
+        label = trace_labels[0]
+        detail = "(performance is comparable across traces)"
+        detail_color = "#888"
     verdict_card = (
         f'<div style="margin:14px 0 12px;padding:12px 16px;'
         f'border:1px solid #ccc;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">'
-        f'<span style="font-size:20px;font-weight:700;color:#111">Trace with highest GPU speedup:</span>'
+        f'<span style="font-size:20px;font-weight:700;color:#111">Trace with highest speedup:</span>'
         f'<span style="font-size:18px;font-weight:600;color:#111">{label}</span>'
         f'<span style="font-size:14px;color:{detail_color}">{detail}</span>'
         f'</div>'
