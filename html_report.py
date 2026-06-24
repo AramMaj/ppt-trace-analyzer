@@ -327,17 +327,23 @@ _GPU_ARCH_KEYWORDS = [
 
 
 def _detect_gpu_architecture(trace_file: str) -> str:
-    """Scan trace events for GPU architecture clues in kernel names.
+    """Determine GPU architecture from the trace file's ``deviceProperties``.
 
-    Checks the first 2000 kernel events for known architecture keywords
-    (``ampere``, ``hopper``, ``blackwell``, etc.) and returns a human-readable
-    label like ``"NVIDIA Ampere (A100/A30/A10/RTX 3090)"`` or ``"unknown"``.
+    Falls back to scanning kernel names for architecture keywords if
+    ``deviceProperties`` is not present.
     """
     try:
         with open(trace_file) as f:
             data = json.load(f)
     except (json.JSONDecodeError, FileNotFoundError, OSError):
         return "unknown"
+
+    if isinstance(data, dict):
+        props = data.get("deviceProperties")
+        if isinstance(props, list) and len(props) > 0:
+            name = props[0].get("name", "")
+            if name:
+                return name
 
     events = data.get("traceEvents") if isinstance(data, dict) else None
     if not isinstance(events, list):
@@ -347,10 +353,9 @@ def _detect_gpu_architecture(trace_file: str) -> str:
     for ev in events:
         if ev.get("cat") not in ("kernel",):
             continue
-        name = ev.get("name", "")
-        name_lower = name.lower()
+        name = ev.get("name", "").lower()
         for kw, label in _GPU_ARCH_KEYWORDS:
-            if kw in name_lower:
+            if kw in name:
                 return label
         checked += 1
         if checked >= 2000:
