@@ -1360,7 +1360,7 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
         vals = {}
         for name, fn, direction, do_color in COMPARE_METRICS:
             try:
-                if name in ("MFU", "HFU", "Tokens/sec/GPU"):
+                if any(x in name for x in ("MFU", "HFU", "Tokens")):
                     _tp = all_results[ri][4]
                     if _tp.get("mfu", 0) > 0:
                         vals[name] = fn(agg, metrics, tp=_tp)
