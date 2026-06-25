@@ -87,7 +87,8 @@ def _is_fsdp_name(name: str) -> bool:
 # Timing helpers
 # ---------------------------------------------------------------------------
 
-def _phase_gpu_time(nodes: List[LogicalOperation]) -> float:
+def _phase_gpu_time(nodes: List[LogicalOperation],
+                    seen: Optional[Set[Tuple[float, float]]] = None) -> float:
     """Unique GPU duration across all nodes' subtrees.
 
     Collects direct GPU-kernel events from the entire subtree of each node
@@ -97,19 +98,30 @@ def _phase_gpu_time(nodes: List[LogicalOperation]) -> float:
     under ``torch.compile``, where a single ``CompiledFunctionBackward`` node
     wraps many child events that all fall inside the same phase window).
 
+    When *seen* is provided, it is used as the dedup set instead of a local
+    one.  This enables global deduplication across multiple calls so that the
+    same GPU kernel appearing in different layers' phase nodes (e.g. via the
+    ``record_param_comms`` CPU wrapper that overlaps two adjacent layers) is
+    counted exactly once.  The return value reflects only *new* kernels added
+    by this call (*seen* is updated in place).
+
     When subtrees are disjoint (the common case) the result is identical to
     ``sum(n.gpu_duration for n in nodes)`` but never over-counts.
     """
-    seen: Set[Tuple[float, float]] = set()
+    local: Set[Tuple[float, float]] = set()
     stack = list(nodes)
     while stack:
         n = stack.pop()
         for gpu in (n.direct_gpu_kernels or []):
             dur = gpu.get('dur', 0)
             if dur > 0:
-                seen.add((gpu.get('ts', 0), dur))
+                local.add((gpu.get('ts', 0), dur))
         stack.extend(n.children)
-    return sum(dur for _, dur in seen)
+    if seen is not None:
+        new = local - seen
+        seen.update(local)
+        return sum(dur for _, dur in new)
+    return sum(dur for _, dur in local)
 
 
 def _phase_gpu_time_direct(nodes: List[LogicalOperation]) -> float:
@@ -541,7 +553,8 @@ class Metrics:
                  global_tp_rs_gpu: float = 0.0,
                  global_tp_ar_gpu: float = 0.0,
                  tp_kernels: Optional[List[dict]] = None,
-                 ag_per_layer: Optional[Dict[str, Tuple[float, float]]] = None):
+                 ag_per_layer: Optional[Dict[str, Tuple[float, float]]] = None,
+                 rs_global_seen: Optional[Set[Tuple[float, float]]] = None):
         self.layer_name = unit.layer_name
         ln = unit.layer_name
 
@@ -577,7 +590,7 @@ class Metrics:
         self.bwd_cmp_cpu = _phase_cpu_time(unit.bwd_compute)
         self.bwd_cmp_wall = _phase_wall_time(unit.bwd_compute, unit.bwd_compute_span)
 
-        self.rs_gpu = _phase_gpu_time(unit.reduce_scatter)
+        self.rs_gpu = _phase_gpu_time(unit.reduce_scatter, rs_global_seen)
         self.rs_cpu = _phase_cpu_time(unit.reduce_scatter)
         self.rs_wall = _phase_wall_time(unit.reduce_scatter)
 
@@ -1405,10 +1418,12 @@ class Report:
         tp_ar = self.fsdp.tp_all_reduce_gpu
         tp_kernels = list(self.fsdp.tp_all_gather + self.fsdp.tp_reduce_scatter + self.fsdp.tp_all_reduce)
         ag_per_layer = self._ag_per_layer if self._ag_per_layer is not None else _compute_ag_per_layer(self.root_nodes)
+        rs_global_seen: Set[Tuple[float, float]] = set()
         for unit in self.fsdp.units:
             self.metrics_list.append(Metrics(unit, opt_gpu, opt_cpu, num_units,
                                              tp_ag, tp_rs, tp_ar, tp_kernels=tp_kernels,
-                                             ag_per_layer=ag_per_layer))
+                                             ag_per_layer=ag_per_layer,
+                                             rs_global_seen=rs_global_seen))
 
         self._compute_aggregated()
         self._compute_throughput()
