@@ -806,6 +806,16 @@ class StandardFSDPDetector:
                     fsdp.units[idx].reduce_scatter[0].gpu_duration += dur
                     attr_rs.add(fp)
 
+            elif cat == 'tp_all_reduce':
+                if fp in attr_rs:
+                    continue
+                idx, span, gap = _nearest_span(ts, ev_end, bwd_spans)
+                if idx is not None and fsdp.units[idx].reduce_scatter:
+                    fsdp.units[idx].reduce_scatter[0].direct_gpu_kernels.append(ev)
+                    fsdp.units[idx].reduce_scatter[0].direct_gpu_duration += dur
+                    fsdp.units[idx].reduce_scatter[0].gpu_duration += dur
+                    attr_rs.add(fp)
+
     def extract_fsdp_phases(self, roots: List[LogicalOperation]) -> FSDP:
         """Run all eight sub-detectors in dependency order and return the populated ``FSDP`` container.
 
