@@ -853,7 +853,7 @@ def _bottleneck_tags(metrics_list: list) -> str:
               '</div>')
     parts = legend
     for short, entries in sorted(all_issues.items(), key=lambda x: -len(x[1])):
-        count = len(entries)
+        count = len(set(layer_name for layer_name, _, _ in entries))
         if count >= len(metrics_list) * 0.5:
             severity = "tag-high"
         elif count >= 3:
