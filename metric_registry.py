@@ -83,9 +83,21 @@ METRIC_REGISTRY = {
     },
     "tp_total_gpu_us": {
         "description": "Total tensor-parallel GPU time (ag + rs + ar)",
-        "used_by": ["TP-heavy", "synchronous TP on critical path", "NVLink saturation", "dominant phase"],
+        "used_by": ["TP-heavy", "synchronous TP on critical path", "NVLink saturation", "TP contention inflation", "dominant phase"],
         "unit": "µs",
         "calculation": "tp_ag_gpu + tp_rs_gpu + tp_ar_gpu — sum of TP all-gather, reduce-scatter, all-reduce",
+    },
+    "tp_contention_inflation": {
+        "description": "Ratio of average TP kernel duration to the shortest TP kernel in the trace — measures CUPTI wall-clock inflation from SM contention with concurrent compute kernels",
+        "used_by": ["TP contention inflation"],
+        "unit": "ratio",
+        "calculation": "avg(TP kernel durations) / min(TP kernel durations) — actual duration ÷ uncontested baseline. Computed in Report._compute_aggregated from global TP kernel list.",
+    },
+    "tp_effective_gpu_us": {
+        "description": "Estimated uncontested TP GPU time: raw TP time divided by tp_contention_inflation. Use this instead of tp_total_gpu_us when comparing configurations with different compute/TP overlap patterns.",
+        "used_by": ["TP contention inflation"],
+        "unit": "µs",
+        "calculation": "tp_total_gpu / tp_contention_inflation — raw TP time adjusted for contention inflation. Set to tp_total_gpu when inflation ≤ 1.0.",
     },
     # Totals and ratios
     "total_gpu_us": {
@@ -517,5 +529,11 @@ THRESHOLD_REGISTRY = {
         "rationale": "Cross-layer GPU span overlap ratio below which the FSDP2 pipeline stagger is considered ineffective",
         "physical_justification": "Cross-layer GPU pipeline model: ideal overlap = (N−1)/N. Even a 2-layer pipeline should achieve 50%. Below 20% indicates insufficient micro-batches or synchronisation that serialises the GPU stream. Cross-check against CPU overlap_ratio (sweep-line) — GPU overlap is the real signal.",
         "used_by": ["low cross-layer GPU overlap"],
+    },
+    "TP_CONTENTION_INFLATION_HIGH": {
+        "value": 2.0,
+        "rationale": "TP contention inflation ratio above which raw TP GPU time is considered misleading due to CUPTI wall-clock artifacts",
+        "physical_justification": "CUPTI contention model: when TP collectives overlap with compute on the GPU, CUPTI records inflated wall durations because the TP kernel contends with compute for SM resources. The uncontested baseline is the minimum observed TP kernel duration. An inflation ratio ≥ 2.0 means TP GPU times are at least doubled by contention, making raw TP comparisons across configurations misleading.",
+        "used_by": ["TP contention inflation"],
     },
 }

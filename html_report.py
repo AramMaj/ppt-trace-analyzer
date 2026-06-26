@@ -214,6 +214,8 @@ def _efficiency_table(aggregated: dict, metrics_list: list) -> str:
 <tr><td>Idle / gap ratio</td><td>{idle:.1%}</td><td>Share with no GPU activity at all. May indicate data-loading stalls</td></tr>
 <tr><td>Forward TP overlap ratio</td><td>{avg_fwd_ov:.1%}</td><td>How well TP communication hides behind forward compute. Higher = better overlap</td></tr>
 <tr><td>Backward TP overlap ratio</td><td>{avg_bwd_ov:.1%}</td><td>How well TP communication hides behind backward compute. Higher = better overlap</td></tr>
+<tr><td>TP contention inflation</td><td>{aggregated.get('tp_contention_inflation', 1.0):.1f}×</td><td>Ratio of actual vs uncontested TP kernel duration. &gt;1.0 = CUPTI wall-clock inflation from SM contention (higher = more inflated)</td></tr>
+<tr><td>Effective TP time (≈ uncontested)</td><td>{_format_us(aggregated.get('tp_effective_gpu_us', 0))}</td><td>Estimated TP GPU time without contention inflation. Compare this across configurations instead of raw TP time</td></tr>
 </table>"""
 
 
@@ -768,6 +770,12 @@ BOTTLENECK_DESCRIPTIONS = {
     "RS exceeds bwd compute":
         "Reduce-scatter GPU time exceeds backward compute GPU time — strong injection pressure. "
         "Consider gradient accumulation or increasing sharding degree.",
+
+    "TP contention inflation":
+        "TP kernel durations are inflated by GPU resource contention with concurrent compute kernels. "
+        "CUPTI wall-clock durations double-count SM time when TP and compute kernels overlap. "
+        "The effective (uncontested) TP time is reported as tp_effective_gpu_us. "
+        "Compare tp_effective_gpu_us across configurations, not raw TP GPU time.",
 }
 
 # Key supplementary metrics per bottleneck type for layer-level evidence.
@@ -799,6 +807,7 @@ BOTTLENECK_EVIDENCE_METRICS = {
     "RS dominates": ["rs_gpu_us", "total_gpu_us"],
     "Optimizer dominates": ["optimizer_gpu_us", "total_gpu_us"],
     "TP dominates": ["tp_total_gpu_us", "total_gpu_us"],
+    "TP contention inflation": ["tp_contention_inflation", "tp_effective_gpu_us", "tp_total_gpu_us"],
 }
 
 
@@ -1289,6 +1298,8 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
             return f"{raw_val:.2f}x" if isinstance(raw_val, (int, float)) else str(raw_val)
         if name == "Peak memory":
             return f"{raw_val:.1f}G" if raw_val and raw_val > 0 else "N/A"
+        if name == "TP contention inflation":
+            return f"{raw_val:.1f}x" if isinstance(raw_val, (int, float)) else str(raw_val)
         # Microsecond metrics
         us_names = ("Step wall time",
                     "All-gather forward (avg per layer)", "Forward compute (avg per layer)",
@@ -1298,7 +1309,8 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
                     "CPU dispatch (avg per layer)",
                     "Tensor-parallel all-gather (avg per layer)",
                     "Tensor-parallel all-reduce (avg per layer)",
-                    "Tensor-parallel reduce-scatter (avg per layer)")
+                    "Tensor-parallel reduce-scatter (avg per layer)",
+                    "Effective TP time (avg per layer, ≈ uncontested)")
         if name in us_names:
             return _format_us(raw_val) if isinstance(raw_val, (int, float)) else str(raw_val)
         if name == "Steps per second":
@@ -1355,6 +1367,8 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
     COMPARE_METRICS.append(("All-gather forward exposed ratio (avg per layer)", lambda r, m: sum(x.ag_fwd_exposed_ratio for x in m) / max(len(m), 1), "lower", True))
     COMPARE_METRICS.append(("Forward TP overlap ratio (avg per layer)", lambda r, m: sum(x.fwd_comp_comm_overlap for x in m) / max(len(m), 1), "higher", True))
     COMPARE_METRICS.append(("Backward TP overlap ratio (avg per layer)", lambda r, m: sum(x.bwd_comp_comm_overlap for x in m) / max(len(m), 1), "higher", True))
+    COMPARE_METRICS.append(("TP contention inflation", lambda r, m: r.get("tp_contention_inflation", 1.0), "lower", True))
+    COMPARE_METRICS.append(("Effective TP time (avg per layer, ≈ uncontested)", lambda r, m: r.get("tp_effective_gpu_us", 0), "lower", True))
 
     # Memory
     COMPARE_METRICS.append(("Peak memory", lambda r, m: max((x.memory_peak for x in m if x.memory_has_data), default=0) / (1024**3), "lower", True))
