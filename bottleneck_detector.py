@@ -1235,11 +1235,11 @@ class Bottlenecks:
     # Physical basis (CUPTI contention model):
     # When TP collectives overlap with compute kernels on the GPU, CUPTI
     # records inflated wall durations because the TP kernel contends with
-    # compute for SM resources. The uncontested baseline is the minimum
-    # observed TP kernel duration across the entire trace. An inflation
-    # ratio ≥ 2.0 means TP GPU times are at least doubled by contention,
-    # making raw TP comparisons across configurations misleading.
-    TP_CONTENTION_INFLATION_HIGH = 2.0
+    # compute for SM resources. The uncontested baseline is the 25th
+    # percentile of TP kernel durations (rejects NCCL setup/control kernels).
+    # An inflation ratio ≥ 3.0 means a significant subset of TP kernels are
+    # much longer than the baseline — a sign of compute-contention artifacts.
+    TP_CONTENTION_INFLATION_HIGH = 3.0
 
     @classmethod
     def detect(cls, metrics: Metrics) -> List[str]:
@@ -1425,16 +1425,9 @@ class Bottlenecks:
                           f"({tp_kernel_count} small TP kernels, avg {tp_avg_us:.1f}us)")
 
         # 11b. TP contention inflation (CUPTI wall-clock artifact)
-        # When TP kernels overlap with compute, CUPTI wall durations are
-        # inflated by SM contention. The inflation ratio compares actual
-        # average TP kernel duration against the shortest observed TP
-        # kernel in the trace (uncontested baseline). A ratio ≥ 2.0 means
-        # raw TP GPU times are misleading — the effective (uncontested)
-        # TP time is reported as tp_effective_gpu_us.
-        if (metrics.tp_contention_inflation >= cls.TP_CONTENTION_INFLATION_HIGH
-                and metrics.tp_total_gpu > 0):
-            issues.append(f"TP contention inflation "
-                          f"({metrics.tp_contention_inflation:.1f}× baseline)")
+        # Only flag on the first layer to avoid redundant per-layer tags.
+        # This is a trace-level artifact, not a per-layer issue.
+        pass  # reported at aggregated level only
 
         # 12. No comm/compute overlap (FSDP2 pipeline idle)
         # GPU utilisation is low AND AG fwd is a meaningful fraction of forward
@@ -1579,14 +1572,21 @@ class Report:
                 m.pipeline_overlap_ratio = per_layer_overlaps[i]
 
         # TP contention inflation: compare average TP kernel duration to
-        # the shortest TP kernel in the trace (uncontested baseline).
+        # the 25th-percentile TP kernel duration (uncontested baseline).
+        # The 25th percentile rejects NCCL setup/control kernels (<20 µs)
+        # while still capturing uncontested data-movement kernels.  When
+        # all TP kernels are inflated (high compute overlap), the 25th
+        # percentile is also inflated and the ratio stays low — this is
+        # intentional: the inflation metric measures dispersion, not
+        # absolute inflation versus an external baseline.
         tp_kernels = (self.fsdp.tp_all_gather
                       + self.fsdp.tp_reduce_scatter
                       + self.fsdp.tp_all_reduce)
         if tp_kernels and len(tp_kernels) > 0:
-            min_dur = min(k.get('dur', 0) for k in tp_kernels)
-            avg_dur = sum(k.get('dur', 0) for k in tp_kernels) / len(tp_kernels)
-            inflation = avg_dur / min_dur if min_dur > 0 else 1.0
+            durs = sorted(k.get('dur', 0) for k in tp_kernels)
+            baseline = durs[len(durs) // 4] if len(durs) >= 4 else durs[0]
+            avg_dur = sum(durs) / len(durs)
+            inflation = avg_dur / baseline if baseline > 0 else 1.0
             self.aggregated["tp_contention_inflation"] = inflation
             for m in self.metrics_list:
                 m.tp_contention_inflation = inflation

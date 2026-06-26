@@ -531,9 +531,9 @@ THRESHOLD_REGISTRY = {
         "used_by": ["low cross-layer GPU overlap"],
     },
     "TP_CONTENTION_INFLATION_HIGH": {
-        "value": 2.0,
+        "value": 3.0,
         "rationale": "TP contention inflation ratio above which raw TP GPU time is considered misleading due to CUPTI wall-clock artifacts",
-        "physical_justification": "CUPTI contention model: when TP collectives overlap with compute on the GPU, CUPTI records inflated wall durations because the TP kernel contends with compute for SM resources. The uncontested baseline is the minimum observed TP kernel duration. An inflation ratio ≥ 2.0 means TP GPU times are at least doubled by contention, making raw TP comparisons across configurations misleading.",
+        "physical_justification": "CUPTI contention model: when TP collectives overlap with compute on the GPU, CUPTI records inflated wall durations because the TP kernel contends with compute for SM resources. The uncontested baseline is the 25th percentile of TP kernel durations (rejects NCCL setup/control kernels). An inflation ratio ≥ 3.0 means a significant subset of TP kernels are much longer than the baseline — a sign of compute-contention artifacts.",
         "used_by": ["TP contention inflation"],
     },
 }

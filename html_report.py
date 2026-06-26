@@ -512,7 +512,7 @@ def _kernel_stats_diagnostics(aggregated: dict, metrics_list: list) -> dict:
     }
 
 
-def _render_diagnostics_section(diag: dict, kstats: dict) -> str:
+def _render_diagnostics_section(diag: dict, kstats: dict, aggregated: dict = None) -> str:
     """Render a compact diagnostics card for single-trace HTML."""
     parts = []
 
@@ -569,7 +569,14 @@ def _render_diagnostics_section(diag: dict, kstats: dict) -> str:
         return ''
 
     # Warnings
-    warns = diag.get("warnings", [])
+    warns = list(diag.get("warnings", []))
+    if aggregated and aggregated.get("tp_contention_inflation", 1.0) > 3.0:
+        inf = aggregated["tp_contention_inflation"]
+        warns.append(
+            f"TP contention inflation: {inf:.1f}× — CUPTI kernel durations are inflated by "
+            f"SM contention between TP collectives and concurrent compute kernels. "
+            f"Use 'Effective TP time' (≈ uncontested) instead of raw TP GPU time for cross-configuration comparisons."
+        )
     warn_html = ""
     if warns:
         items = "".join(f'<li style="margin:4px 0;font-size:12px">{w}</li>' for w in warns)
@@ -1071,7 +1078,7 @@ def generate_html_report(trace_file: str, output_path: str = None, model_config:
     # Trace diagnostics
     step_diag = _trace_step_diagnostics(trace_file)
     kstats = _kernel_stats_diagnostics(aggregated, metrics_list)
-    diag_section = _render_diagnostics_section(step_diag, kstats)
+    diag_section = _render_diagnostics_section(step_diag, kstats, aggregated)
 
     # Serialise chart data to JSON
     chart_data = {
@@ -1159,6 +1166,9 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
         total_kernels = kstats["total_kernels"]
 
         extras = ""
+        inf = agg.get("tp_contention_inflation", 1.0)
+        if inf > 2.0:
+            extras += f'<tr><td>TP contention inflation</td><td>{inf:.1f}× <span style="color:#e15759;font-size:10px">⚠</span></td></tr>'
         if mfu > 0:
             extras += f"<tr><td>MFU</td><td>{mfu:.1%}</td></tr>"
             extras += f"<tr><td>Tok/s/GPU</td><td>{tps:.1f}</td></tr>"
