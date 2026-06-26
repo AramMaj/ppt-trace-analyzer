@@ -124,6 +124,45 @@ def _phase_gpu_time(nodes: List[LogicalOperation],
     return sum(dur for _, dur in local)
 
 
+def _phase_gpu_time_breakdown(nodes: List[LogicalOperation],
+                               seen: Optional[Set[Tuple[float, float]]] = None,
+                              ) -> Tuple[float, float, float]:
+    """Split GPU time from nodes' subtrees into ReduceScatter, AllReduce, and other.
+
+    Same tree walk and dedup logic as :func:`_phase_gpu_time`, but returns
+    ``(reduce_scatter_us, all_reduce_us, other_us)`` classified by kernel name.
+    """
+    local: Set[Tuple[float, float]] = set()
+    local_names: Dict[Tuple[float, float], str] = {}
+    stack = list(nodes)
+    while stack:
+        n = stack.pop()
+        for gpu in (n.direct_gpu_kernels or []):
+            dur = gpu.get('dur', 0)
+            if dur > 0:
+                key = (gpu.get('ts', 0), dur)
+                local.add(key)
+                if key not in local_names:
+                    local_names[key] = gpu.get('name', '')
+        stack.extend(n.children)
+    if seen is not None:
+        new = local - seen
+        seen.update(local)
+    else:
+        new = local
+
+    rs = ar = other = 0.0
+    for ts, dur in new:
+        name = local_names.get((ts, dur), '')
+        if 'ReduceScatter' in name:
+            rs += dur
+        elif 'AllReduce' in name:
+            ar += dur
+        else:
+            other += dur
+    return rs, ar, other
+
+
 def _phase_gpu_time_direct(nodes: List[LogicalOperation]) -> float:
     """Sum of **direct** (non-overlapping) GPU duration across nodes.
 
@@ -590,7 +629,11 @@ class Metrics:
         self.bwd_cmp_cpu = _phase_cpu_time(unit.bwd_compute)
         self.bwd_cmp_wall = _phase_wall_time(unit.bwd_compute, unit.bwd_compute_span)
 
-        self.rs_gpu = _phase_gpu_time(unit.reduce_scatter, rs_global_seen)
+        rs_gpu, ar_in_rs_gpu, rs_overhead_gpu = _phase_gpu_time_breakdown(
+            unit.reduce_scatter, rs_global_seen)
+        self.rs_gpu = rs_gpu
+        self.ar_in_rs_gpu = ar_in_rs_gpu
+        self.rs_overhead_gpu = rs_overhead_gpu
         self.rs_cpu = _phase_cpu_time(unit.reduce_scatter)
         self.rs_wall = _phase_wall_time(unit.reduce_scatter)
 
@@ -600,12 +643,13 @@ class Metrics:
 
         # --- Totals (all FSDP phases) ---
         self.total_gpu = (self.ag_fwd_gpu + self.fwd_cmp_gpu + self.ag_bwd_gpu
-                          + self.bwd_cmp_gpu + self.rs_gpu + self.optimizer_gpu)
+                          + self.bwd_cmp_gpu + self.rs_gpu + self.ar_in_rs_gpu
+                          + self.optimizer_gpu)
         self.total_cpu = (self.ag_fwd_cpu + self.fwd_cmp_cpu + self.ag_bwd_cpu
                           + self.bwd_cmp_cpu + self.rs_cpu + self.optimizer_cpu)
 
         # --- Communication vs compute ratio ---
-        comm_gpu = self.ag_fwd_gpu + self.ag_bwd_gpu + self.rs_gpu  # FSDP NCCL
+        comm_gpu = self.ag_fwd_gpu + self.ag_bwd_gpu + self.rs_gpu + self.ar_in_rs_gpu  # FSDP NCCL
         comp_gpu = self.fwd_cmp_gpu + self.bwd_cmp_gpu  # attn/MLP/norm
         self.comp_ratio = comp_gpu / self.total_gpu if self.total_gpu > 0 else 0.0
 
@@ -623,7 +667,7 @@ class Metrics:
             self.ag_fwd_gpu / self.ag_fwd_wall if self.ag_fwd_wall > 0 else 0.0
         ))
         self.rs_exposed_ratio = min(1.0, (
-            self.rs_gpu / self.rs_wall if self.rs_wall > 0 else 0.0
+            (self.rs_gpu + self.ar_in_rs_gpu) / self.rs_wall if self.rs_wall > 0 else 0.0
         ))
         self.ag_bwd_exposed_ratio = min(1.0, (
             self.ag_bwd_gpu / self.ag_bwd_wall if self.ag_bwd_wall > 0 else 0.0
@@ -725,7 +769,7 @@ class Metrics:
 
         # --- Communication ratio including TP ---
         total_gpu = self.total_gpu + self.tp_total_gpu
-        fsdp_comm = self.ag_fwd_gpu + self.ag_bwd_gpu + self.rs_gpu
+        fsdp_comm = self.ag_fwd_gpu + self.ag_bwd_gpu + self.rs_gpu + self.ar_in_rs_gpu
         self.fsdp_comm_ratio = fsdp_comm / total_gpu if total_gpu > 0 else 0.0
         self.tp_comm_ratio = self.tp_total_gpu / total_gpu if total_gpu > 0 else 0.0
         self.comm_ratio = (fsdp_comm + self.tp_total_gpu) / total_gpu if total_gpu > 0 else 0.0
@@ -886,6 +930,8 @@ class Metrics:
             "ag_bwd_gpu_us": self.ag_bwd_gpu,
             "bwd_cmp_gpu_us": self.bwd_cmp_gpu,
             "rs_gpu_us": self.rs_gpu,
+            "ar_in_rs_gpu_us": self.ar_in_rs_gpu,
+            "rs_overhead_gpu_us": self.rs_overhead_gpu,
             "optimizer_gpu_us": self.optimizer_gpu,
             "tp_ag_gpu_us": self.tp_ag_gpu,
             "tp_rs_gpu_us": self.tp_rs_gpu,
@@ -1284,7 +1330,7 @@ class Bottlenecks:
 
         # 6. Fwd / Bwd compute imbalance
         fwd_total = metrics.ag_fwd_gpu + metrics.fwd_cmp_gpu
-        bwd_total = metrics.ag_bwd_gpu + metrics.bwd_cmp_gpu + metrics.rs_gpu
+        bwd_total = metrics.ag_bwd_gpu + metrics.bwd_cmp_gpu + metrics.rs_gpu + metrics.ar_in_rs_gpu
         max_gpu = max(fwd_total, bwd_total)
         if max_gpu > 0:
             imbalance = abs(fwd_total - bwd_total) / max_gpu
@@ -1447,7 +1493,7 @@ class Report:
         instance so bottleneck classification can use global overlap/step_wall values.
         """
         keys = ["ag_fwd_gpu_us", "fwd_cmp_gpu_us", "ag_bwd_gpu_us", "bwd_cmp_gpu_us",
-                "rs_gpu_us", "optimizer_gpu_us", "tp_ag_gpu_us", "tp_rs_gpu_us",
+                "rs_gpu_us", "ar_in_rs_gpu_us", "optimizer_gpu_us", "tp_ag_gpu_us", "tp_rs_gpu_us",
                 "tp_ar_gpu_us", "tp_total_gpu_us",
                 "total_gpu_us", "total_cpu_us",
                 "comm_ratio", "comp_ratio", "optimizer_ratio",
@@ -1565,6 +1611,7 @@ class Report:
             ("ag_bwd_gpu_us", "All-gather bwd"),
             ("bwd_cmp_gpu_us", "Bwd compute"),
             ("rs_gpu_us", "Reduce-scatter"),
+            ("ar_in_rs_gpu_us", "  All-reduce in RS"),
             ("tp_rs_gpu_us", "  TP reduce-scatter"),
             ("optimizer_gpu_us", "Optimizer step"),
         ]
@@ -1599,7 +1646,8 @@ class Report:
         lines.append("--- Efficiency ---")
         comp_gpu = self.aggregated.get("fwd_cmp_gpu_us", 0) + self.aggregated.get("bwd_cmp_gpu_us", 0)
         tp_total = self.aggregated.get("tp_total_gpu_us", 0)
-        fsdp_comm = self.aggregated.get("ag_fwd_gpu_us", 0) + self.aggregated.get("ag_bwd_gpu_us", 0) + self.aggregated.get("rs_gpu_us", 0)
+        fsdp_comm = (self.aggregated.get("ag_fwd_gpu_us", 0) + self.aggregated.get("ag_bwd_gpu_us", 0)
+                     + self.aggregated.get("rs_gpu_us", 0) + self.aggregated.get("ar_in_rs_gpu_us", 0))
         opt_ratio = self.aggregated.get('optimizer_ratio', 0)
         total = total_gpu + tp_total
         if total > 0:

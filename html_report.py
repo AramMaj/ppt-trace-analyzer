@@ -80,6 +80,7 @@ def _phase_pie_chart_data(aggregated: dict) -> str:
         ("All-gather fwd", aggregated.get("ag_fwd_gpu_us", 0), COLORS['ag']),
         ("All-gather bwd", aggregated.get("ag_bwd_gpu_us", 0), COLORS['ag']),
         ("Reduce-scatter", aggregated.get("rs_gpu_us", 0), COLORS['rs']),
+        ("  All-reduce in RS", aggregated.get("ar_in_rs_gpu_us", 0), COLORS['ar_rs']),
         ("TP all-gather", aggregated.get("tp_ag_gpu_us", 0), COLORS['tp_ag']),
         ("TP all-reduce", aggregated.get("tp_ar_gpu_us", 0), COLORS['tp_ar']),
         ("TP reduce-scatter", aggregated.get("tp_rs_gpu_us", 0), COLORS['tp_rs']),
@@ -94,7 +95,7 @@ def _phase_pie_chart_data(aggregated: dict) -> str:
 
 COLORS = {
     'fwd_cmp': '#4e79a7', 'bwd_cmp': '#e15759', 'ag': '#76b7b2',
-    'rs': '#f28e2b', 'opt': '#59a14f', 'tp_ag': '#af7aa1',
+    'rs': '#f28e2b', 'ar_rs': '#c23531', 'opt': '#59a14f', 'tp_ag': '#af7aa1',
     'tp_rs': '#ff9da7', 'tp_ar': '#9c755f',
 }
 
@@ -110,7 +111,7 @@ def _comp_comm_chart_data(metrics_list: list, aggregated: dict) -> str:
     datasets = [
         {"label": "Forward compute", "data": [round(m.fwd_cmp_gpu, 1) for m in metrics_list], "backgroundColor": COLORS['fwd_cmp']},
         {"label": "Backward compute", "data": [round(m.bwd_cmp_gpu, 1) for m in metrics_list], "backgroundColor": COLORS['bwd_cmp']},
-        {"label": "FSDP comm", "data": [round(m.ag_fwd_gpu + m.ag_bwd_gpu + m.rs_gpu, 1) for m in metrics_list], "backgroundColor": COLORS['ag']},
+        {"label": "FSDP comm", "data": [round(m.ag_fwd_gpu + m.ag_bwd_gpu + m.rs_gpu + m.ar_in_rs_gpu, 1) for m in metrics_list], "backgroundColor": COLORS['ag']},
         {"label": "TP comm", "data": [round(m.tp_total_gpu, 1) for m in metrics_list], "backgroundColor": COLORS['tp_ag']},
     ]
     return json.dumps({"labels": labels, "datasets": datasets})
@@ -121,12 +122,14 @@ def _overlap_chart_data(metrics_list: list) -> str:
     fwd_vals = [round(m.ag_fwd_gpu, 1) for m in metrics_list]
     bwd_vals = [round(m.ag_bwd_gpu, 1) for m in metrics_list]
     rs_vals = [round(m.rs_gpu, 1) for m in metrics_list]
+    ar_vals = [round(m.ar_in_rs_gpu, 1) for m in metrics_list]
     return json.dumps({
         "labels": labels,
         "datasets": [
             {"label": "AG forward", "data": fwd_vals, "backgroundColor": "#76b7b2", "borderColor": "#76b7b2"},
             {"label": "AG backward", "data": bwd_vals, "backgroundColor": "#e15759", "borderColor": "#e15759"},
             {"label": "Reduce scatter", "data": rs_vals, "backgroundColor": "#f28e2b", "borderColor": "#f28e2b"},
+            {"label": "All-reduce in RS", "data": ar_vals, "backgroundColor": "#c23531", "borderColor": "#c23531"},
         ]
     })
 
@@ -153,6 +156,7 @@ def _phase_metrics_table(aggregated: dict, num_layers: int) -> str:
         ("All-gather backward", "ag_bwd_gpu_us", COLORS['ag']),
         ("Backward compute", "bwd_cmp_gpu_us", COLORS['bwd_cmp']),
         ("Reduce scatter", "rs_gpu_us", COLORS['rs']),
+        ("  All-reduce in RS", "ar_in_rs_gpu_us", COLORS['ar_rs']),
         ("  Tensor-parallel reduce-scatter", "tp_rs_gpu_us", COLORS['tp_rs']),
         ("Optimizer step", "optimizer_gpu_us", COLORS['opt']),
     ]
@@ -177,7 +181,8 @@ def _phase_metrics_table(aggregated: dict, num_layers: int) -> str:
 def _efficiency_table(aggregated: dict, metrics_list: list) -> str:
     total = aggregated.get("total_gpu_us", 0) + aggregated.get("tp_total_gpu_us", 0)
     tp_total = aggregated.get("tp_total_gpu_us", 0)
-    fsdp_comm = aggregated.get("ag_fwd_gpu_us", 0) + aggregated.get("ag_bwd_gpu_us", 0) + aggregated.get("rs_gpu_us", 0)
+    fsdp_comm = (aggregated.get("ag_fwd_gpu_us", 0) + aggregated.get("ag_bwd_gpu_us", 0)
+                 + aggregated.get("rs_gpu_us", 0) + aggregated.get("ar_in_rs_gpu_us", 0))
     comp = aggregated.get("fwd_cmp_gpu_us", 0) + aggregated.get("bwd_cmp_gpu_us", 0)
     true_comp = comp
     avg_util = sum(m.gpu_busy for m in metrics_list) / len(metrics_list) if metrics_list else 0
@@ -489,8 +494,9 @@ def _kernel_stats_diagnostics(aggregated: dict, metrics_list: list) -> dict:
     avg_dur = weighted_dur / max(total_kernels, 1)
 
     nccl = (aggregated.get("ag_fwd_gpu_us", 0) + aggregated.get("ag_bwd_gpu_us", 0)
-            + aggregated.get("rs_gpu_us", 0) + aggregated.get("tp_ag_gpu_us", 0)
-            + aggregated.get("tp_rs_gpu_us", 0) + aggregated.get("tp_ar_gpu_us", 0))
+            + aggregated.get("rs_gpu_us", 0) + aggregated.get("ar_in_rs_gpu_us", 0)
+            + aggregated.get("tp_ag_gpu_us", 0) + aggregated.get("tp_rs_gpu_us", 0)
+            + aggregated.get("tp_ar_gpu_us", 0))
     comp = aggregated.get("fwd_cmp_gpu_us", 0) + aggregated.get("bwd_cmp_gpu_us", 0)
     opt = aggregated.get("optimizer_gpu_us", 0)
 
@@ -1179,6 +1185,7 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
             "ag_bwd": agg.get("ag_bwd_gpu_us", 0),
             "bwd_cmp": agg.get("bwd_cmp_gpu_us", 0),
             "rs": agg.get("rs_gpu_us", 0),
+            "ar_rs": agg.get("ar_in_rs_gpu_us", 0),
             "opt": agg.get("optimizer_gpu_us", 0),
             "tp_ag": agg.get("tp_ag_gpu_us", 0),
             "tp_rs": agg.get("tp_rs_gpu_us", 0),
@@ -1201,13 +1208,13 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
     # Phase times charts (compute and comm split)
     pt_fwd_bwd_labels = ["Forward\ncompute", "Backward\ncompute"]
     pt_fwd_bwd_datasets = []
-    pt_comm_labels = ["All-gather\nforward", "All-gather\nbackward", "Reduce\nscatter"]
+    pt_comm_labels = ["All-gather\nforward", "All-gather\nbackward", "Reduce\nscatter", "All-reduce\nin RS"]
     pt_comm_datasets = []
     for i, (label, agg, metrics, steps, tp) in enumerate(all_results):
         ph = _get_phases(agg)
         fwd_bwd_vals = [ph["fwd_cmp"] / 1000, ph["bwd_cmp"] / 1000]
         pt_fwd_bwd_datasets.append({"label": label, "data": [round(v, 2) for v in fwd_bwd_vals], "backgroundColor": colors[i]})
-        comm_vals = [ph["ag_fwd"] / 1000, ph["ag_bwd"] / 1000, ph["rs"] / 1000]
+        comm_vals = [ph["ag_fwd"] / 1000, ph["ag_bwd"] / 1000, ph["rs"] / 1000, ph["ar_rs"] / 1000]
         pt_comm_datasets.append({"label": label, "data": [round(v, 2) for v in comm_vals], "backgroundColor": colors[i]})
 
     # MFU chart
@@ -1286,7 +1293,7 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
         us_names = ("Step wall time",
                     "All-gather forward (avg per layer)", "Forward compute (avg per layer)",
                     "All-gather backward (avg per layer)", "Backward compute (avg per layer)",
-                    "Reduce scatter (avg per layer)", "Optimizer (avg per layer)",
+                    "Reduce scatter (avg per layer)", "All-reduce in RS (avg per layer)", "Optimizer (avg per layer)",
                     "TP total (avg per layer)", "Total GPU (avg per layer)",
                     "CPU dispatch (avg per layer)",
                     "Tensor-parallel all-gather (avg per layer)",
@@ -1313,6 +1320,7 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
                         ("All-gather backward (avg per layer)", "ag_bwd_gpu_us"),
                         ("Backward compute (avg per layer)", "bwd_cmp_gpu_us"),
                         ("Reduce scatter (avg per layer)", "rs_gpu_us"),
+                        ("All-reduce in RS (avg per layer)", "ar_in_rs_gpu_us"),
                         ("Optimizer (avg per layer)", "optimizer_gpu_us"),
                         ("Tensor-parallel all-gather (avg per layer)", "tp_ag_gpu_us"),
                         ("Tensor-parallel all-reduce (avg per layer)", "tp_ar_gpu_us"),
@@ -1333,8 +1341,8 @@ def generate_compare_html(trace_files, output_path=None, model_config=None):
     COMPARE_METRICS.append(("Tokens per second per GPU", lambda r, m, tp=None: tp.get("tokens_per_second_per_gpu", 0) if tp else 0, "higher", True))
 
     # Comm breakdown (total ratios — not per-layer averages)
-    COMPARE_METRICS.append(("Communication ratio", lambda r, m: (sum(x.ag_fwd_gpu + x.ag_bwd_gpu + x.rs_gpu + x.tp_total_gpu for x in m)) / max(sum(x.total_gpu + x.tp_total_gpu for x in m), 1), "lower", True))
-    COMPARE_METRICS.append(("FSDP communication ratio", lambda r, m: (sum(x.ag_fwd_gpu + x.ag_bwd_gpu + x.rs_gpu for x in m)) / max(sum(x.total_gpu + x.tp_total_gpu for x in m), 1), "lower", True))
+    COMPARE_METRICS.append(("Communication ratio", lambda r, m: (sum(x.ag_fwd_gpu + x.ag_bwd_gpu + x.rs_gpu + x.ar_in_rs_gpu + x.tp_total_gpu for x in m)) / max(sum(x.total_gpu + x.tp_total_gpu for x in m), 1), "lower", True))
+    COMPARE_METRICS.append(("FSDP communication ratio", lambda r, m: (sum(x.ag_fwd_gpu + x.ag_bwd_gpu + x.rs_gpu + x.ar_in_rs_gpu for x in m)) / max(sum(x.total_gpu + x.tp_total_gpu for x in m), 1), "lower", True))
     COMPARE_METRICS.append(("Tensor-parallel communication ratio", lambda r, m: (sum(x.tp_total_gpu for x in m)) / max(sum(x.total_gpu + x.tp_total_gpu for x in m), 1), "lower", True))
 
     # Overlap & pipeline

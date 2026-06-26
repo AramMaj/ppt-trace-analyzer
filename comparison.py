@@ -71,7 +71,7 @@ def compare_traces(trace_files, output_file=None, model_config=None):
     headers = [
         "Trace", "Layers",
         "Step wall", "AG forward", "Forward compute", "AG backward", "Backward compute",
-        "Reduce scatter", "Optimizer", "TP total", "Total GPU",
+        "Reduce scatter", "All-reduce in RS", "Optimizer", "TP total", "Total GPU",
         "GPU busy", "Compute-to-comm ratio", "MFU", "HFU",
         "Comm ratio", "FSDP comm ratio", "TP comm ratio",
         "Pipeline overlap", "Serial efficiency", "Pipeline idle",
@@ -90,6 +90,7 @@ def compare_traces(trace_files, output_file=None, model_config=None):
         ag_bwd = agg.get("ag_bwd_gpu_us", 0)
         bwd_cmp = agg.get("bwd_cmp_gpu_us", 0)
         rs = agg.get("rs_gpu_us", 0)
+        ar_in_rs = agg.get("ar_in_rs_gpu_us", 0)
         opt = agg.get("optimizer_gpu_us", 0)
         tp_total = agg.get("tp_total_gpu_us", 0)
         total_gpu = agg.get("total_gpu_us", 0) + tp_total
@@ -127,6 +128,7 @@ def compare_traces(trace_files, output_file=None, model_config=None):
             "AG backward": ag_bwd,
             "Backward compute": bwd_cmp,
             "Reduce scatter": rs,
+            "All-reduce in RS": ar_in_rs,
             "Optimizer": opt,
             "TP total": tp_total,
             "Total GPU": total_gpu,
@@ -166,7 +168,7 @@ def compare_traces(trace_files, output_file=None, model_config=None):
             elif header in ("Peak memory",):
                 return f"{v:.1f}G" if v > 0 else "N/A"
             elif header in ("Step wall", "AG forward", "Forward compute", "AG backward",
-                            "Backward compute", "Reduce scatter", "Optimizer",
+                            "Backward compute", "Reduce scatter", "All-reduce in RS", "Optimizer",
                             "TP total", "Total GPU"):
                 return _format_us(v)
             else:

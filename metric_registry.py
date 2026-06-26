@@ -46,10 +46,16 @@ METRIC_REGISTRY = {
         "calculation": "_phase_gpu_time_direct(unit.bwd_compute) — sum of direct GPU kernel durations in backward compute",
     },
     "rs_gpu_us": {
-        "description": "Reduce-scatter GPU time — NCCL kernel duration for the reduce-scatter",
+        "description": "Reduce-scatter GPU time — NCCL ReduceScatter kernel duration only (excludes AllReduce kernels in the post_backward_reduce subtree)",
         "used_by": ["all-gather-heavy", "reduce-scatter-heavy", "fwd-bwd imbalance", "RS exceeds bwd compute", "dominant phase"],
         "unit": "µs",
-        "calculation": "_phase_gpu_time(unit.reduce_scatter) — sum of NCCL kernel durations for reduce-scatter",
+        "calculation": "_phase_gpu_time_breakdown(unit.reduce_scatter) — sum of NCCL ReduceScatter kernel durations in post_backward_reduce subtree, deduplicated globally",
+    },
+    "ar_in_rs_gpu_us": {
+        "description": "All-reduce GPU time in the reduce-scatter subtree — NCCL AllReduce kernels under post_backward_reduce (embedding gradient sync, tied weights)",
+        "used_by": ["AR in RS on critical path"],
+        "unit": "µs",
+        "calculation": "_phase_gpu_time_breakdown(unit.reduce_scatter) — sum of NCCL AllReduce kernel durations in post_backward_reduce subtree, deduplicated globally",
     },
     "optimizer_gpu_us": {
         "description": "Optimizer GPU time — evenly split across layers from the global optimizer step (ADAMW parameter update)",
