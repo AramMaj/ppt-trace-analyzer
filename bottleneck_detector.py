@@ -506,12 +506,17 @@ class ModelConfig:
         return self.gpu_hbm_bw_gbps * 1e9
 
 
-def _compute_ag_per_layer(root_nodes):
+def _compute_ag_per_layer(root_nodes, time_range=None):
     """Walk all CPU nodes and compute per-layer FSDP all-gather GPU time.
 
     Uses ``_pg_desc`` to distinguish FSDP all-gather kernels (``mesh_dp_shard``
     or ``mesh_fsdp``) from TP redistribute all-gathers, then classifies each
     kernel as forward or backward by walking its CPU ancestor chain.
+
+    *time_range* ``(start, end)`` filters GPU kernels to those within the
+    given window (inclusive).  This is necessary for multi-step traces where
+    ``root_nodes`` contain GPU kernel attributions from all ProfilerSteps
+    while the downstream analysis only considers the last step.
 
     Returns ``{layer_name: (ag_fwd_us, ag_bwd_us)}`` — one entry per layer
     that has FSDP all-gather kernels.  Layers with no FSDP all-gather (e.g.
@@ -535,6 +540,10 @@ def _compute_ag_per_layer(root_nodes):
         for gpu in (node.direct_gpu_kernels or []):
             if gpu.get('_pg_desc', '') not in FSDP_PG_DESCS:
                 continue
+            if time_range is not None:
+                ts = gpu.get('ts', 0)
+                if ts < time_range[0] or ts > time_range[1]:
+                    continue
             name = gpu.get('name', '').lower()
             if 'nccl' not in name or not ('allgather' in name or 'all_gather' in name):
                 continue

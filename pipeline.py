@@ -40,14 +40,17 @@ def process_trace(trace_file: str, model_config=None):
     parser.attribute_gpu_kernel_with_logical_operation(roots)
     parser.attribute_memory(roots)
 
-    # Compute AG per-layer BEFORE extract_fsdp_phases because
+    step_bounds = select_profiler_step(roots, parser)
+    step_start, step_end = step_bounds
+
+    # Compute AG per-layer AFTER step filtering so that the time range
+    # filter excludes all-gather kernels from earlier ProfilerSteps.
+    # Must still be BEFORE extract_fsdp_phases because
     # _detect_fsdp_gpu_fallback duplicates AG kernels onto unit phase
     # nodes, polluting the ancestry-based classification.
     from bottleneck_detector import _compute_ag_per_layer
-    ag_per_layer = _compute_ag_per_layer(roots)
-
-    step_bounds = select_profiler_step(roots, parser)
-    step_start, step_end = step_bounds
+    ag_range = (step_start, step_end) if step_start is not None else None
+    ag_per_layer = _compute_ag_per_layer(roots, time_range=ag_range)
 
     detector = StandardFSDPDetector(gpu_events=parser.gpu_events)
     fsdp = detector.extract_fsdp_phases(roots)
@@ -103,7 +106,7 @@ def process_all_steps(trace_file: str, model_config=None):
         parser.attribute_memory(roots)
 
         from bottleneck_detector import _compute_ag_per_layer
-        ag_per_layer = _compute_ag_per_layer(roots)
+        ag_per_layer = _compute_ag_per_layer(roots, time_range=(step_start, step_end))
 
         detector = StandardFSDPDetector(gpu_events=parser.gpu_events)
         fsdp = detector.extract_fsdp_phases(roots)

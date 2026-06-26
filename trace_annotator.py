@@ -605,7 +605,7 @@ def _analyze_step(
     parser.attribute_memory(roots)
 
     from bottleneck_detector import _compute_ag_per_layer
-    ag_per_layer = _compute_ag_per_layer(roots)
+    ag_per_layer = _compute_ag_per_layer(roots, time_range=(step_start, step_end))
 
     detector = StandardFSDPDetector(gpu_events=parser.gpu_events)
     fsdp = detector.extract_fsdp_phases(roots)
