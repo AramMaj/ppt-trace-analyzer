@@ -40,8 +40,24 @@ def process_trace(trace_file: str, model_config=None):
     parser.attribute_gpu_kernel_with_logical_operation(roots)
     parser.attribute_memory(roots)
 
-    step_bounds = select_profiler_step(roots, parser)
-    step_start, step_end = step_bounds
+    step_start, step_end, filter_start, filter_end = select_profiler_step(roots, parser)
+
+    # Prune GPU kernels from CPU tree nodes that fall outside the filtered
+    # time range.  Attribution ran on all events (ensuring ext-ID matching),
+    # but phase GPU time functions (``_phase_gpu_time*``) walk these lists
+    # without any time-range awareness — they would count kernels from
+    # earlier ProfilerSteps otherwise.
+    if filter_start is not None:
+        for node in TraceParserHelper.iter_nodes(roots):
+            if not node.direct_gpu_kernels:
+                continue
+            kept = [ev for ev in node.direct_gpu_kernels
+                    if ev.get('ts', 0) >= filter_start
+                    and ev.get('ts', 0) + ev.get('dur', 0) <= filter_end]
+            if len(kept) != len(node.direct_gpu_kernels):
+                node.direct_gpu_kernels = kept
+                node.gpu_duration = sum(k.get('dur', 0) for k in kept if k.get('dur', 0) > 0)
+                node.direct_gpu_duration = node.gpu_duration
 
     # Compute AG per-layer AFTER step filtering so that the time range
     # filter excludes all-gather kernels from earlier ProfilerSteps.
@@ -49,7 +65,7 @@ def process_trace(trace_file: str, model_config=None):
     # _detect_fsdp_gpu_fallback duplicates AG kernels onto unit phase
     # nodes, polluting the ancestry-based classification.
     from bottleneck_detector import _compute_ag_per_layer
-    ag_range = (step_start, step_end) if step_start is not None else None
+    ag_range = (filter_start, filter_end) if filter_start is not None else None
     ag_per_layer = _compute_ag_per_layer(roots, time_range=ag_range)
 
     detector = StandardFSDPDetector(gpu_events=parser.gpu_events)
@@ -145,9 +161,15 @@ def select_profiler_step(roots, parser):
     correlation where GPU events from Step#1 carry ``External id`` values that
     collide with Step#3 CPU events.
 
-    Falls back to ``(None, None)`` when fewer than 2 steps are found (single-step
-    traces like async TP's ProfilerStep#9) — caller should still proceed with
-    full time range.
+    Falls back to ``(None, None, None, None)`` when fewer than 2 steps are found
+    (single-step traces like async TP's ProfilerStep#9) — caller should still
+    proceed with full time range.
+
+    Returns ``(step_start, step_end, filter_start, filter_end)``:
+    * ``step_start`` / ``step_end`` — the strict CPU ProfilerStep boundaries.
+    * ``filter_start`` / ``filter_end`` — the margin-extended bounds used for
+      GPU event filtering.  Pass these to ``_compute_ag_per_layer(time_range=...)``
+      so that all GPU-time comparisons use the same event set.
     """
     step_events = []
     for root in roots:
@@ -158,7 +180,7 @@ def select_profiler_step(roots, parser):
 
     if not step_events:
         print("  No ProfilerStep markers found — analysing full trace time range.")
-        return None, None
+        return None, None, None, None
 
     from collections import defaultdict
     by_name = defaultdict(list)
@@ -174,7 +196,7 @@ def select_profiler_step(roots, parser):
     latest_per_step.sort(key=lambda x: x[2])
     if len(latest_per_step) <= 1:
         print("  Single ProfilerStep only — using full trace time range.")
-        return None, None
+        return None, None, None, None
 
     last_name, last_pid, last_start, last_end, last_node = latest_per_step[-1]
     step_labels = [c[0].replace('ProfilerStep#', '#') for c in latest_per_step]
@@ -184,13 +206,15 @@ def select_profiler_step(roots, parser):
     # that executes ~727ms after the CPU ProfilerStep ends in the 8B trace).
     step_dur = last_end - last_start
     margin = max(step_dur * 0.05, 2000.0)
+    filter_start = last_start - margin
+    filter_end = last_end + margin
     parser.gpu_events = [ev for ev in parser.gpu_events
-                         if ev.get('ts', 0) >= last_start - margin
-                         and ev.get('ts', 0) + ev.get('dur', 0) <= last_end + margin]
+                         if ev.get('ts', 0) >= filter_start
+                         and ev.get('ts', 0) + ev.get('dur', 0) <= filter_end]
     parser.memory_events = [ev for ev in parser.memory_events
-                            if last_start - margin <= ev.get('ts', 0) <= last_end + margin]
+                            if filter_start <= ev.get('ts', 0) <= filter_end]
 
-    return last_start, last_end
+    return last_start, last_end, filter_start, filter_end
 
 
 def sanitize_optimizer(fsdp, step_start=None, step_end=None):

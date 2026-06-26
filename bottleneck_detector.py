@@ -126,11 +126,15 @@ def _phase_gpu_time(nodes: List[LogicalOperation],
 
 def _phase_gpu_time_breakdown(nodes: List[LogicalOperation],
                                seen: Optional[Set[Tuple[float, float]]] = None,
+                               allowed_pg: Optional[Set[str]] = None,
                               ) -> Tuple[float, float, float]:
     """Split GPU time from nodes' subtrees into ReduceScatter, AllReduce, and other.
 
     Same tree walk and dedup logic as :func:`_phase_gpu_time`, but returns
     ``(reduce_scatter_us, all_reduce_us, other_us)`` classified by kernel name.
+
+    *allowed_pg* restricts collection to GPU kernels whose ``_pg_desc`` is in
+    the given set (useful for excluding TP kernels from FSDP phase breakdowns).
     """
     local: Set[Tuple[float, float]] = set()
     local_names: Dict[Tuple[float, float], str] = {}
@@ -138,6 +142,8 @@ def _phase_gpu_time_breakdown(nodes: List[LogicalOperation],
     while stack:
         n = stack.pop()
         for gpu in (n.direct_gpu_kernels or []):
+            if allowed_pg is not None and gpu.get('_pg_desc', '') not in allowed_pg:
+                continue
             dur = gpu.get('dur', 0)
             if dur > 0:
                 key = (gpu.get('ts', 0), dur)
@@ -639,7 +645,8 @@ class Metrics:
         self.bwd_cmp_wall = _phase_wall_time(unit.bwd_compute, unit.bwd_compute_span)
 
         rs_gpu, ar_in_rs_gpu, rs_overhead_gpu = _phase_gpu_time_breakdown(
-            unit.reduce_scatter, rs_global_seen)
+            unit.reduce_scatter, rs_global_seen,
+            allowed_pg=FSDP_PG_DESCS)
         self.rs_gpu = rs_gpu
         self.ar_in_rs_gpu = ar_in_rs_gpu
         self.rs_overhead_gpu = rs_overhead_gpu

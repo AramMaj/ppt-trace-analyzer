@@ -159,9 +159,9 @@ def main():
         roots = parser.build_tree()
         parser.attribute_gpu_kernel_with_logical_operation(roots)
         parser.attribute_memory(roots)
-        step_start, step_end = select_profiler_step(roots, parser)
+        step_start, step_end, filter_start, filter_end = select_profiler_step(roots, parser)
         from bottleneck_detector import _compute_ag_per_layer
-        ag_range = (step_start, step_end) if step_start is not None else None
+        ag_range = (filter_start, filter_end) if filter_start is not None else None
         ag_per_layer = _compute_ag_per_layer(roots, time_range=ag_range)
         detector = StandardFSDPDetector(gpu_events=parser.gpu_events)
         fsdp = detector.extract_fsdp_phases(roots)
@@ -248,9 +248,9 @@ def main():
     # correlation succeeds even after step-level filtering discards the events.
     parser.attribute_gpu_kernel_with_logical_operation(roots)
     parser.attribute_memory(roots)
-    step_start, step_end = select_profiler_step(roots, parser)
+    step_start, step_end, filter_start, filter_end = select_profiler_step(roots, parser)
     from bottleneck_detector import _compute_ag_per_layer
-    ag_range = (step_start, step_end) if step_start is not None else None
+    ag_range = (filter_start, filter_end) if filter_start is not None else None
     ag_per_layer = _compute_ag_per_layer(roots, time_range=ag_range)
 
     detector = StandardFSDPDetector(gpu_events=parser.gpu_events)
